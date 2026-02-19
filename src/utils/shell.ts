@@ -18,19 +18,20 @@ export function buildClaudeCommand(
   workingDir: string,
   prompt: string,
   sessionId?: string,
-  discordContext?: DiscordContext
+  discordContext?: DiscordContext,
+  model: string = "sonnet"
 ): string {
   const escapedPrompt = escapeShellString(prompt);
-  
+
   // Create session-specific MCP config in /tmp
   const sessionMcpConfigPath = createSessionMcpConfig(discordContext);
-  
+
   const commandParts = [
     "claude",
     "--output-format",
     "stream-json",
     "--model",
-    "sonnet",
+    model,
     "-p",
     escapedPrompt,
     "--verbose",

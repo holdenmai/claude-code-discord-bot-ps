@@ -15,6 +15,20 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("kill")
         .setDescription("Kill the currently running Claude Code process"),
+      new SlashCommandBuilder()
+        .setName("model")
+        .setDescription("Set the Claude model for this channel")
+        .addStringOption((option: any) =>
+          option
+            .setName("name")
+            .setDescription("Model to use")
+            .setRequired(true)
+            .addChoices(
+              { name: "Sonnet (default)", value: "sonnet" },
+              { name: "Opus", value: "opus" },
+              { name: "Haiku", value: "haiku" },
+            )
+        ),
     ];
   }
 
@@ -59,6 +73,13 @@ export class CommandHandler {
       } else {
         await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
       }
+    }
+
+    if (interaction.commandName === "model") {
+      const channelId = interaction.channelId;
+      const model = interaction.options.getString("name");
+      this.claudeManager.setModel(channelId, model);
+      await interaction.reply(`Model set to **${model}** for this channel.`);
     }
   }
 }

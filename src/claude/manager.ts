@@ -11,6 +11,7 @@ export class ClaudeManager {
   private channelMessages = new Map<string, any>();
   private channelToolCalls = new Map<string, Map<string, { message: any, toolId: string }>>();
   private channelNames = new Map<string, string>();
+  private channelModels = new Map<string, string>();
   private channelProcesses = new Map<
     string,
     {
@@ -78,6 +79,14 @@ export class ClaudeManager {
     return this.db.getSession(channelId);
   }
 
+  setModel(channelId: string, model: string): void {
+    this.channelModels.set(channelId, model);
+  }
+
+  getModel(channelId: string): string {
+    return this.channelModels.get(channelId) || "sonnet";
+  }
+
   async runClaudeCode(
     channelId: string,
     channelName: string,
@@ -95,7 +104,8 @@ export class ClaudeManager {
       throw new Error(`Working directory does not exist: ${workingDir}`);
     }
 
-    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext);
+    const model = this.getModel(channelId);
+    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model);
     console.log(`Running command: ${commandString}`);
 
     const claude = spawn("powershell.exe", ["-NoProfile", "-Command", commandString], {
