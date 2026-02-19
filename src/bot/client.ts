@@ -46,6 +46,24 @@ export class DiscordBot {
     });
 
     this.client.on("interactionCreate", async (interaction) => {
+      // Handle button and select menu interactions
+      if (interaction.isButton() || interaction.isStringSelectMenu()) {
+        if (this.mcpServer) {
+          const customId = interaction.customId;
+          const pm = this.mcpServer.getPermissionManager();
+
+          // AskUserQuestion buttons/menus
+          if (customId.startsWith('q:') || customId.startsWith('qs:')) {
+            if (pm.handleQuestionInteraction(interaction)) return;
+          }
+
+          // Tool approval buttons (Allow / Deny / Always Allow)
+          if (customId.startsWith('approve:') || customId.startsWith('deny:') || customId.startsWith('always:')) {
+            if (pm.handleApprovalInteraction(interaction)) return;
+          }
+        }
+      }
+
       await this.commandHandler.handleInteraction(interaction);
     });
 

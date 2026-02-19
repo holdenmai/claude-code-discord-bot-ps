@@ -5,6 +5,24 @@ export interface DiscordContext {
   messageId?: string; // The original Discord message that triggered Claude Code
 }
 
+export interface QuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface Question {
+  question: string;
+  header: string;
+  options: QuestionOption[];
+  multiSelect: boolean;
+}
+
+export interface PendingQuestionState {
+  currentQuestionIndex: number;
+  answers: Record<string, string>;
+  questions: Question[];
+}
+
 export interface PendingApproval {
   requestId: string;
   toolName: string;
@@ -15,6 +33,7 @@ export interface PendingApproval {
   timeout: NodeJS.Timeout;
   discordMessage?: any; // The approval message sent to Discord
   createdAt: Date;
+  pendingQuestion?: PendingQuestionState;
 }
 
 export function generateRequestId(): string {

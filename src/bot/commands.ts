@@ -12,6 +12,9 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("clear")
         .setDescription("Clear the current Claude Code session"),
+      new SlashCommandBuilder()
+        .setName("kill")
+        .setDescription("Kill the currently running Claude Code process"),
     ];
   }
 
@@ -46,6 +49,16 @@ export class CommandHandler {
       await interaction.reply(
         "Session cleared! Next message will start a new Claude Code session."
       );
+    }
+
+    if (interaction.commandName === "kill") {
+      const channelId = interaction.channelId;
+      if (this.claudeManager.hasActiveProcess(channelId)) {
+        this.claudeManager.killActiveProcess(channelId);
+        await interaction.reply("Killed the running Claude Code process. Session preserved — next message will resume.");
+      } else {
+        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
+      }
     }
   }
 }

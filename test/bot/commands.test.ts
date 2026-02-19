@@ -4,6 +4,8 @@ import { CommandHandler } from '../../src/bot/commands.js';
 // Mock ClaudeManager
 const mockClaudeManager = {
   clearSession: vi.fn(),
+  hasActiveProcess: vi.fn(),
+  killActiveProcess: vi.fn(),
 };
 
 describe('CommandHandler', () => {
@@ -18,8 +20,9 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(1);
-      expect(commands[0].name).toBe('clear');
+      expect(commands).toHaveLength(2);
+      expect(commands[0]!.name).toBe('clear');
+      expect(commands[1]!.name).toBe('kill');
     });
   });
 
