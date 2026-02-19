@@ -146,11 +146,11 @@ export class CommandHandler {
       return;
     }
 
-    // Verify the folder exists
+    // Create the folder if it doesn't exist
     const folderPath = path.join(this.baseFolder, folderName);
     if (!fs.existsSync(folderPath)) {
-      await interaction.reply({ content: `Folder not found: \`${folderName}\``, ephemeral: true });
-      return;
+      fs.mkdirSync(folderPath, { recursive: true });
+      console.log(`Created project folder: ${folderPath}`);
     }
 
     // Get the category of the channel where command was run
