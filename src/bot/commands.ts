@@ -1,11 +1,17 @@
-import { SlashCommandBuilder, REST, Routes } from "discord.js";
+import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits } from "discord.js";
+import * as fs from "fs";
+import * as path from "path";
 import type { ClaudeManager } from '../claude/manager.js';
 
 export class CommandHandler {
+  private baseFolder: string;
+
   constructor(
     private claudeManager: ClaudeManager,
     private allowedUserId: string
-  ) {}
+  ) {
+    this.baseFolder = process.env.BASE_FOLDER || '';
+  }
 
   getCommands() {
     return [
@@ -29,6 +35,16 @@ export class CommandHandler {
               { name: "Haiku", value: "haiku" },
             )
         ),
+      new SlashCommandBuilder()
+        .setName("add")
+        .setDescription("Create a channel for a project folder")
+        .addStringOption((option: any) =>
+          option
+            .setName("folder")
+            .setDescription("Project folder name")
+            .setRequired(true)
+            .setAutocomplete(true)
+        ),
     ];
   }
 
@@ -46,6 +62,14 @@ export class CommandHandler {
   }
 
   async handleInteraction(interaction: any): Promise<void> {
+    // Handle autocomplete for /add command
+    if (interaction.isAutocomplete?.()) {
+      if (interaction.commandName === "add") {
+        await this.handleAddAutocomplete(interaction);
+      }
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.user.id !== this.allowedUserId) {
@@ -80,6 +104,80 @@ export class CommandHandler {
       const model = interaction.options.getString("name");
       this.claudeManager.setModel(channelId, model);
       await interaction.reply(`Model set to **${model}** for this channel.`);
+    }
+
+    if (interaction.commandName === "add") {
+      await this.handleAddCommand(interaction);
+    }
+  }
+
+  /**
+   * Autocomplete handler for /add - lists folders in BASE_FOLDER
+   */
+  private async handleAddAutocomplete(interaction: any): Promise<void> {
+    const focused = interaction.options.getFocused().toLowerCase();
+
+    try {
+      const entries = fs.readdirSync(this.baseFolder, { withFileTypes: true });
+      const folders = entries
+        .filter((e: fs.Dirent) => e.isDirectory() && !e.name.startsWith('.'))
+        .map((e: fs.Dirent) => e.name)
+        .filter((name: string) => name.toLowerCase().includes(focused))
+        .slice(0, 25); // Discord max 25 autocomplete results
+
+      await interaction.respond(
+        folders.map((name: string) => ({ name, value: name }))
+      );
+    } catch (error) {
+      console.error("Error reading folders for autocomplete:", error);
+      await interaction.respond([]);
+    }
+  }
+
+  /**
+   * Create a Discord channel for the selected project folder
+   */
+  private async handleAddCommand(interaction: any): Promise<void> {
+    const folderName = interaction.options.getString("folder");
+    const guild = interaction.guild;
+
+    if (!guild) {
+      await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+      return;
+    }
+
+    // Verify the folder exists
+    const folderPath = path.join(this.baseFolder, folderName);
+    if (!fs.existsSync(folderPath)) {
+      await interaction.reply({ content: `Folder not found: \`${folderName}\``, ephemeral: true });
+      return;
+    }
+
+    // Get the category of the channel where command was run
+    const sourceChannel = interaction.channel;
+    const categoryId = sourceChannel?.parentId || null;
+
+    // Check if a channel with this name already exists in the category
+    const existing = guild.channels.cache.find(
+      (ch: any) => ch.name === folderName && ch.parentId === categoryId
+    );
+    if (existing) {
+      await interaction.reply({ content: `Channel <#${existing.id}> already exists for \`${folderName}\`.`, ephemeral: true });
+      return;
+    }
+
+    try {
+      const newChannel = await guild.channels.create({
+        name: folderName,
+        type: ChannelType.GuildText,
+        parent: categoryId,
+      });
+
+      await interaction.reply(`Created <#${newChannel.id}> for project \`${folderName}\``);
+    } catch (error) {
+      console.error("Error creating channel:", error);
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
     }
   }
 }

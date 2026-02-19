@@ -22,10 +22,11 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(3);
+      expect(commands).toHaveLength(4);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('model');
+      expect(commands[3]!.name).toBe('add');
     });
   });
 
