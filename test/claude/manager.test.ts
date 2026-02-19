@@ -96,10 +96,10 @@ describe('ClaudeManager', () => {
       manager.setDiscordMessage('channel-1', mockMessage);
       
       const channelMessages = (manager as any).channelMessages;
-      const channelResponses = (manager as any).channelResponses;
-      
+      const channelToolCalls = (manager as any).channelToolCalls;
+
       expect(channelMessages.get('channel-1')).toBe(mockMessage);
-      expect(channelResponses.get('channel-1')).toEqual({ embeds: [], textContent: "" });
+      expect(channelToolCalls.get('channel-1')).toEqual(new Map());
     });
   });
 
@@ -153,7 +153,7 @@ describe('ClaudeManager', () => {
       
       await expect(
         manager.runClaudeCode('channel-1', 'test-channel', 'test prompt')
-      ).rejects.toThrow('Working directory does not exist: /test/base/test-channel');
+      ).rejects.toThrow(`Working directory does not exist: ${path.join(mockBaseFolder, 'test-channel')}`);
     });
 
     it('should set up process when directory exists', async () => {
@@ -181,7 +181,11 @@ describe('ClaudeManager', () => {
         // Expected to fail due to mocking, just checking setup
       }
       
-      expect(spawn).toHaveBeenCalledWith('/bin/bash', ['-c', expect.stringContaining('claude')], expect.any(Object));
+      expect(spawn).toHaveBeenCalledWith(
+        'powershell.exe',
+        ['-NoProfile', '-Command', expect.stringContaining('claude')],
+        expect.objectContaining({ cwd: path.join(mockBaseFolder, 'test-channel') })
+      );
       expect(mockProcess.stdin.end).toHaveBeenCalled();
     });
   });

@@ -1,6 +1,6 @@
 export function escapeShellString(str: string): string {
-  // Replace ' with '\'' and wrap in single quotes
-  return `'${str.replace(/'/g, "'\\''")}'`;
+  // PowerShell: wrap in single quotes, escape ' by doubling it
+  return `'${str.replace(/'/g, "''")}'`;
 }
 
 import * as path from 'path';
@@ -26,8 +26,6 @@ export function buildClaudeCommand(
   const sessionMcpConfigPath = createSessionMcpConfig(discordContext);
   
   const commandParts = [
-    `cd ${workingDir}`,
-    "&&",
     "claude",
     "--output-format",
     "stream-json",

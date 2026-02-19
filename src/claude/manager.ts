@@ -98,12 +98,10 @@ export class ClaudeManager {
     const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext);
     console.log(`Running command: ${commandString}`);
 
-    const claude = spawn("/bin/bash", ["-c", commandString], {
+    const claude = spawn("powershell.exe", ["-NoProfile", "-Command", commandString], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        SHELL: "/bin/bash",
-      },
+      cwd: workingDir,
+      env: { ...process.env },
     });
 
     console.log(`Claude process spawned with PID: ${claude.pid}`);
@@ -310,11 +308,11 @@ export class ClaudeManager {
               // Replace base folder path with relative path
               const channelName = this.channelNames.get(channelId);
               if (channelName) {
-                const basePath = `${this.baseFolder}${channelName}`;
+                const basePath = path.join(this.baseFolder, channelName);
                 if (val === basePath) {
                   val = ".";
-                } else if (val.startsWith(basePath + "/")) {
-                  val = val.replace(basePath + "/", "./");
+                } else if (val.startsWith(basePath + path.sep)) {
+                  val = val.replace(basePath + path.sep, "./");
                 }
               }
               return `${key}=${val}`;
