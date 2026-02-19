@@ -9,6 +9,7 @@ import {
   StringSelectMenuBuilder,
   EmbedBuilder,
 } from 'discord.js';
+import type { SettingsStore } from '../settings/settings-store.js';
 
 export class PermissionManager {
   private pendingApprovals = new Map<string, PendingApproval>();
@@ -17,10 +18,20 @@ export class PermissionManager {
   private defaultOnTimeout: 'allow' | 'deny';
   // Track tools that user chose "Always Allow" for, keyed by channelId
   private alwaysAllowedTools = new Map<string, Set<string>>();
+  private settings?: SettingsStore;
 
-  constructor() {
+  constructor(settings?: SettingsStore) {
     this.approvalTimeout = parseInt(process.env.MCP_APPROVAL_TIMEOUT || '30') * 1000; // Convert to ms
     this.defaultOnTimeout = (process.env.MCP_DEFAULT_ON_TIMEOUT as 'allow' | 'deny') || 'deny';
+    this.settings = settings;
+
+    // Load persisted always-allowed tools from settings
+    if (settings) {
+      const allTools = settings.getAllChannelAllowedTools();
+      for (const [channelId, tools] of Object.entries(allTools)) {
+        this.alwaysAllowedTools.set(channelId, new Set(tools));
+      }
+    }
   }
 
   /**
@@ -177,8 +188,9 @@ export class PermissionManager {
           .setEmoji('🔓'),
       );
 
-      // Send the message with buttons
-      const message = await (channel as any).send({ embeds: [embed], components: [row] });
+      // Send the message with buttons, mentioning the user
+      const mention = `<@${pending.discordContext.userId}>`;
+      const message = await (channel as any).send({ content: mention, embeds: [embed], components: [row] });
 
       // Store the message reference
       const pendingApproval = this.pendingApprovals.get(pending.requestId);
@@ -233,13 +245,14 @@ export class PermissionManager {
 
     const approved = action === 'approve' || action === 'always';
 
-    // If "Always Allow", add to auto-allowed set
+    // If "Always Allow", add to auto-allowed set and persist
     if (action === 'always') {
       const channelId = pendingApproval.discordContext.channelId;
       if (!this.alwaysAllowedTools.has(channelId)) {
         this.alwaysAllowedTools.set(channelId, new Set());
       }
       this.alwaysAllowedTools.get(channelId)!.add(pendingApproval.toolName);
+      this.settings?.addAllowedTool(channelId, pendingApproval.toolName);
       console.log(`PermissionManager: Tool ${pendingApproval.toolName} set to "Always Allow" for channel ${channelId}`);
     }
 
@@ -525,8 +538,9 @@ export class PermissionManager {
       // Update existing message for follow-up questions
       await pending.discordMessage.edit({ embeds: [embed], components });
     } else {
-      // Send new message for first question
-      const message = await (channel as any).send({ embeds: [embed], components });
+      // Send new message for first question, mentioning the user
+      const mention = `<@${pending.discordContext.userId}>`;
+      const message = await (channel as any).send({ content: mention, embeds: [embed], components });
       pending.discordMessage = message;
     }
 
@@ -675,6 +689,7 @@ export class PermissionManager {
    */
   clearAlwaysAllowed(channelId: string): void {
     this.alwaysAllowedTools.delete(channelId);
+    this.settings?.clearAllowedTools(channelId);
     console.log(`PermissionManager: Cleared "Always Allow" rules for channel ${channelId}`);
   }
 

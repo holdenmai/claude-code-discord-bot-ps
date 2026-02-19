@@ -5,6 +5,9 @@ import { EmbedBuilder } from "discord.js";
 import type { SDKMessage } from "../types/index.js";
 import { buildClaudeCommand, type DiscordContext } from "../utils/shell.js";
 import { DatabaseManager } from "../db/database.js";
+import type { SettingsStore } from "../settings/settings-store.js";
+
+export type OnCompleteCallback = (channelId: string, success: boolean, originalMessage: any) => void;
 
 export class ClaudeManager {
   private db: DatabaseManager;
@@ -21,10 +24,39 @@ export class ClaudeManager {
     }
   >();
 
-  constructor(private baseFolder: string) {
+  // Original user messages for reaction updates
+  private originalMessages = new Map<string, any>();
+
+  // Typing indicator intervals per channel
+  private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+
+  // Completion callback
+  private onCompleteCallback?: OnCompleteCallback;
+
+  // Guard: only fire completion once per run
+  private completionNotified = new Set<string>();
+
+  // Task threads: channelId -> Map<toolId, thread>
+  private channelTaskThreads = new Map<string, Map<string, any>>();
+
+  // Discord context per channel (for user mentions)
+  private channelDiscordContexts = new Map<string, DiscordContext>();
+
+  private settings?: SettingsStore;
+
+  constructor(private baseFolder: string, settings?: SettingsStore) {
     this.db = new DatabaseManager();
+    this.settings = settings;
     // Clean up old sessions on startup
     this.db.cleanupOldSessions();
+
+    // Load persisted models from settings
+    if (settings) {
+      const models = settings.getAllChannelModels();
+      for (const [channelId, model] of Object.entries(models)) {
+        this.channelModels.set(channelId, model);
+      }
+    }
   }
 
   hasActiveProcess(channelId: string): boolean {
@@ -35,22 +67,155 @@ export class ClaudeManager {
     const activeProcess = this.channelProcesses.get(channelId);
     if (activeProcess?.process) {
       console.log(`Killing active process for channel ${channelId}`);
+      this.stopTypingIndicator(channelId);
       activeProcess.process.kill("SIGTERM");
     }
   }
 
+  killAllProcesses(): number {
+    let count = 0;
+    for (const [channelId, entry] of this.channelProcesses) {
+      if (entry.process) {
+        console.log(`Killing process for channel ${channelId}`);
+        this.stopTypingIndicator(channelId);
+        entry.process.kill("SIGTERM");
+        count++;
+      }
+    }
+    return count;
+  }
+
   clearSession(channelId: string): void {
     this.killActiveProcess(channelId);
+    this.stopTypingIndicator(channelId);
     this.db.clearSession(channelId);
     this.channelMessages.delete(channelId);
     this.channelToolCalls.delete(channelId);
     this.channelNames.delete(channelId);
     this.channelProcesses.delete(channelId);
+    this.originalMessages.delete(channelId);
+    this.channelDiscordContexts.delete(channelId);
+    this.cleanupTaskThreads(channelId);
   }
 
   setDiscordMessage(channelId: string, message: any): void {
     this.channelMessages.set(channelId, message);
     this.channelToolCalls.set(channelId, new Map());
+  }
+
+  setOriginalMessage(channelId: string, message: any): void {
+    this.originalMessages.set(channelId, message);
+  }
+
+  getOriginalMessage(channelId: string): any {
+    return this.originalMessages.get(channelId);
+  }
+
+  setOnCompleteCallback(callback: OnCompleteCallback): void {
+    this.onCompleteCallback = callback;
+  }
+
+  private notifyComplete(channelId: string, success: boolean): void {
+    if (this.completionNotified.has(channelId)) return;
+    this.completionNotified.add(channelId);
+
+    this.stopTypingIndicator(channelId);
+
+    const originalMessage = this.originalMessages.get(channelId);
+    if (this.onCompleteCallback) {
+      this.onCompleteCallback(channelId, success, originalMessage);
+    }
+  }
+
+  // --- Typing indicator ---
+
+  private startTypingIndicator(channelId: string): void {
+    this.stopTypingIndicator(channelId); // clear any existing
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    // Send typing immediately, then every 8 seconds
+    channel.sendTyping().catch(() => {});
+    const interval = setInterval(() => {
+      channel.sendTyping().catch(() => {});
+    }, 8000);
+    this.typingIntervals.set(channelId, interval);
+  }
+
+  private stopTypingIndicator(channelId: string): void {
+    const interval = this.typingIntervals.get(channelId);
+    if (interval) {
+      clearInterval(interval);
+      this.typingIntervals.delete(channelId);
+    }
+  }
+
+  // --- Task threads ---
+
+  private async createTaskThread(channelId: string, toolId: string, description: string): Promise<void> {
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    try {
+      // Create a short name from the description
+      const threadName = description.length > 90
+        ? description.substring(0, 87) + "..."
+        : description;
+
+      const thread = await channel.threads.create({
+        name: `Task: ${threadName}`,
+        autoArchiveDuration: 60,
+      });
+
+      await thread.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("📋 Task Started")
+            .setDescription(description)
+            .setColor(0x5865F2),
+        ],
+      });
+
+      if (!this.channelTaskThreads.has(channelId)) {
+        this.channelTaskThreads.set(channelId, new Map());
+      }
+      this.channelTaskThreads.get(channelId)!.set(toolId, thread);
+    } catch (error) {
+      console.error("Error creating task thread:", error);
+    }
+  }
+
+  private async postTaskResult(channelId: string, toolId: string, result: string, isError: boolean): Promise<void> {
+    const threads = this.channelTaskThreads.get(channelId);
+    const thread = threads?.get(toolId);
+    if (!thread) return;
+
+    try {
+      const truncated = result.length > 1900
+        ? result.substring(0, 1900) + "..."
+        : result;
+
+      await thread.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(isError ? "❌ Task Failed" : "✅ Task Complete")
+            .setDescription(truncated)
+            .setColor(isError ? 0xFF0000 : 0x00FF00),
+        ],
+      });
+    } catch (error) {
+      console.error("Error posting task result:", error);
+    }
+  }
+
+  private cleanupTaskThreads(channelId: string): void {
+    const threads = this.channelTaskThreads.get(channelId);
+    if (!threads) return;
+
+    for (const [, thread] of threads) {
+      thread.delete().catch(() => {});
+    }
+    this.channelTaskThreads.delete(channelId);
   }
 
   reserveChannel(
@@ -73,6 +238,9 @@ export class ClaudeManager {
       sessionId,
       discordMessage,
     });
+
+    // Reset completion guard for new run
+    this.completionNotified.delete(channelId);
   }
 
   getSessionId(channelId: string): string | undefined {
@@ -81,6 +249,7 @@ export class ClaudeManager {
 
   setModel(channelId: string, model: string): void {
     this.channelModels.set(channelId, model);
+    this.settings?.setModel(channelId, model);
   }
 
   getModel(channelId: string): string {
@@ -96,6 +265,9 @@ export class ClaudeManager {
   ): Promise<void> {
     // Store the channel name for path replacement
     this.channelNames.set(channelId, channelName);
+    if (discordContext) {
+      this.channelDiscordContexts.set(channelId, discordContext);
+    }
     const workingDir = path.join(this.baseFolder, channelName);
     console.log(`Running Claude Code in: ${workingDir}`);
 
@@ -122,6 +294,9 @@ export class ClaudeManager {
       channelProcess.process = claude;
     }
 
+    // Start typing indicator
+    this.startTypingIndicator(channelId);
+
     // Close stdin to signal we're not sending input
     claude.stdin.end();
 
@@ -147,7 +322,7 @@ export class ClaudeManager {
           .setTitle("⏰ Timeout")
           .setDescription("Claude Code took too long to respond (5 minutes)")
           .setColor(0xFFD700); // Yellow for timeout
-        
+
         channel.send({ embeds: [timeoutEmbed] }).catch(console.error);
       }
     }, 5 * 60 * 1000); // 5 minutes
@@ -155,15 +330,15 @@ export class ClaudeManager {
     claude.stdout.on("data", (data) => {
       const rawData = data.toString();
       console.log("Raw stdout data:", rawData);
-      
+
       // Log all streamed output to log.txt
       try {
-        fs.appendFileSync(path.join(process.cwd(), 'log.txt'), 
+        fs.appendFileSync(path.join(process.cwd(), 'log.txt'),
           `[${new Date().toISOString()}] Channel: ${channelId}\n${rawData}\n---\n`);
       } catch (error) {
         console.error("Error writing to log.txt:", error);
       }
-      
+
       buffer += rawData;
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -203,8 +378,12 @@ export class ClaudeManager {
     claude.on("close", (code) => {
       console.log(`Claude process exited with code ${code}`);
       clearTimeout(timeout);
+      this.stopTypingIndicator(channelId);
       // Ensure cleanup on process close
       this.channelProcesses.delete(channelId);
+
+      // Notify completion (close event as fallback — result handler is primary)
+      this.notifyComplete(channelId, code === 0 || code === null);
 
       if (code !== 0 && code !== null) {
         // Process failed - send error embed to Discord
@@ -214,7 +393,7 @@ export class ClaudeManager {
             .setTitle("❌ Claude Code Failed")
             .setDescription(`Process exited with code: ${code}`)
             .setColor(0xFF0000); // Red for error
-          
+
           channel.send({ embeds: [errorEmbed] }).catch(console.error);
         }
       }
@@ -236,7 +415,7 @@ export class ClaudeManager {
             .setTitle("⚠️ Warning")
             .setDescription(stderrOutput.trim())
             .setColor(0xFFA500); // Orange for warnings
-          
+
           channel.send({ embeds: [warningEmbed] }).catch(console.error);
         }
       }
@@ -245,9 +424,13 @@ export class ClaudeManager {
     claude.on("error", (error) => {
       console.error("Claude process error:", error);
       clearTimeout(timeout);
+      this.stopTypingIndicator(channelId);
 
       // Clean up process tracking on error
       this.channelProcesses.delete(channelId);
+
+      // Notify completion on error
+      this.notifyComplete(channelId, false);
 
       // Send error to Discord
       const channel = this.channelMessages.get(channelId)?.channel;
@@ -256,7 +439,7 @@ export class ClaudeManager {
           .setTitle("❌ Process Error")
           .setDescription(error.message)
           .setColor(0xFF0000); // Red for errors
-        
+
         channel.send({ embeds: [processErrorEmbed] }).catch(console.error);
       }
     });
@@ -265,12 +448,12 @@ export class ClaudeManager {
   private async handleInitMessage(channelId: string, parsed: any): Promise<void> {
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
-    
+
     const initEmbed = new EmbedBuilder()
       .setTitle("🚀 Claude Code Session Started")
       .setDescription(`**Working Directory:** ${parsed.cwd}\n**Model:** ${parsed.model}\n**Tools:** ${parsed.tools.length} available`)
       .setColor(0x00FF00); // Green for init
-    
+
     try {
       await channel.send({ embeds: [initEmbed] });
     } catch (error) {
@@ -303,12 +486,18 @@ export class ClaudeManager {
           .setTitle("💬 Claude")
           .setDescription(content)
           .setColor(0x7289DA); // Discord blurple
-        
+
         await channel.send({ embeds: [assistantEmbed] });
       }
-      
+
       // If there are tool uses, send a message for each tool
       for (const tool of toolUses) {
+        // Detect Task tool — create a Discord thread for it
+        if (tool.name === "Task") {
+          const taskDescription = tool.input?.prompt || tool.input?.description || "Running task...";
+          await this.createTaskThread(channelId, tool.id, taskDescription);
+        }
+
         let toolMessage = `🔧 ${tool.name}`;
 
         if (tool.input && Object.keys(tool.input).length > 0) {
@@ -336,7 +525,7 @@ export class ClaudeManager {
           .setColor(0x0099FF); // Blue for tool calls
 
         const sentMessage = await channel.send({ embeds: [toolEmbed] });
-        
+
         // Track this tool call message for later updating
         toolCalls.set(tool.id, {
           message: sentMessage,
@@ -362,22 +551,28 @@ export class ClaudeManager {
     const toolCalls = this.channelToolCalls.get(channelId) || new Map();
 
     for (const result of toolResults) {
+      // Post result to task thread if this was a Task tool
+      const threads = this.channelTaskThreads.get(channelId);
+      if (threads?.has(result.tool_use_id)) {
+        await this.postTaskResult(channelId, result.tool_use_id, result.content, result.is_error === true);
+      }
+
       const toolCall = toolCalls.get(result.tool_use_id);
       if (toolCall && toolCall.message) {
         try {
           // Get the first line of the result
           const firstLine = result.content.split('\n')[0].trim();
-          const resultText = firstLine.length > 100 
+          const resultText = firstLine.length > 100
             ? firstLine.substring(0, 100) + "..."
             : firstLine;
-          
+
           // Get the current embed and update it
           const currentEmbed = toolCall.message.embeds[0];
           const originalDescription = currentEmbed.data.description.replace("⏳", "✅");
           const isError = result.is_error === true;
-          
+
           const updatedEmbed = new EmbedBuilder();
-          
+
           if (isError) {
             updatedEmbed
               .setDescription(`❌ ${originalDescription.substring(2)}\n*${resultText}*`)
@@ -404,16 +599,23 @@ export class ClaudeManager {
     const channelName = this.channelNames.get(channelId) || "default";
     this.db.setSession(channelId, parsed.session_id, channelName);
 
+    this.stopTypingIndicator(channelId);
+
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
 
+    // Build user mention
+    const discordContext = this.channelDiscordContexts.get(channelId);
+    const mention = discordContext ? `<@${discordContext.userId}>` : "";
+
     // Create a final result embed
     const resultEmbed = new EmbedBuilder();
+    const success = parsed.subtype === "success";
 
-    if (parsed.subtype === "success") {
+    if (success) {
       let description = "result" in parsed ? parsed.result : "Task completed";
       description += `\n\n*Completed in ${parsed.num_turns} turns*`;
-      
+
       resultEmbed
         .setTitle("✅ Session Complete")
         .setDescription(description)
@@ -426,23 +628,29 @@ export class ClaudeManager {
     }
 
     try {
-      await channel.send({ embeds: [resultEmbed] });
+      await channel.send({ content: mention || undefined, embeds: [resultEmbed] });
     } catch (error) {
       console.error("Error sending result message:", error);
     }
 
+    // Notify completion
+    this.notifyComplete(channelId, success);
+
     console.log("Got result message, cleaning up process tracking");
   }
 
-
-
   // Clean up resources
   destroy(): void {
+    // Stop all typing indicators
+    for (const [channelId] of this.typingIntervals) {
+      this.stopTypingIndicator(channelId);
+    }
+
     // Close all active processes
     for (const [channelId] of this.channelProcesses) {
       this.killActiveProcess(channelId);
     }
-    
+
     // Close database connection
     this.db.close();
   }

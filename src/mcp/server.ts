@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { PermissionManager } from './permission-manager.js';
+import type { SettingsStore } from '../settings/settings-store.js';
 
 export class MCPPermissionServer {
   private app: express.Application;
@@ -10,12 +11,12 @@ export class MCPPermissionServer {
   private server?: any;
   private permissionManager: PermissionManager;
 
-  constructor(port: number = 3001) {
+  constructor(port: number = 3001, settings?: SettingsStore) {
     this.port = port;
     this.app = express();
     this.app.use(express.json());
-    this.permissionManager = new PermissionManager();
-    
+    this.permissionManager = new PermissionManager(settings);
+
     this.setupRoutes();
   }
 

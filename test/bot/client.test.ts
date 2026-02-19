@@ -21,9 +21,11 @@ const mockClaudeManager = {
   hasActiveProcess: vi.fn(),
   clearSession: vi.fn(),
   setDiscordMessage: vi.fn(),
+  setOriginalMessage: vi.fn(),
   reserveChannel: vi.fn(),
   runClaudeCode: vi.fn(),
   getSessionId: vi.fn(),
+  setOnCompleteCallback: vi.fn(),
 };
 
 describe('DiscordBot', () => {

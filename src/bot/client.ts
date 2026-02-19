@@ -6,11 +6,13 @@ import {
 import type { ClaudeManager } from '../claude/manager.js';
 import { CommandHandler } from './commands.js';
 import type { MCPPermissionServer } from '../mcp/server.js';
+import { MessageQueue } from '../queue/message-queue.js';
 
 export class DiscordBot {
   public client: Client; // Make public so MCP server can access it
   private commandHandler: CommandHandler;
   private mcpServer?: MCPPermissionServer;
+  private messageQueue: MessageQueue;
 
   constructor(
     private claudeManager: ClaudeManager,
@@ -26,7 +28,9 @@ export class DiscordBot {
     });
 
     this.commandHandler = new CommandHandler(claudeManager, allowedUserId);
+    this.messageQueue = new MessageQueue();
     this.setupEventHandlers();
+    this.setupCompletionCallback();
   }
 
   /**
@@ -34,6 +38,22 @@ export class DiscordBot {
    */
   setMCPServer(mcpServer: MCPPermissionServer): void {
     this.mcpServer = mcpServer;
+  }
+
+  /**
+   * Wire up the completion callback so the queue advances after each run.
+   */
+  private setupCompletionCallback(): void {
+    this.claudeManager.setOnCompleteCallback(async (channelId, success, originalMessage) => {
+      // React on the original user message
+      await this.messageQueue.markComplete(originalMessage, success);
+
+      // Dequeue the next message for this channel
+      const next = await this.messageQueue.dequeueNext(channelId);
+      if (next) {
+        await this.processMessage(next.message, channelId, next.channelName, next.prompt);
+      }
+    });
   }
 
   private setupEventHandlers(): void {
@@ -62,6 +82,11 @@ export class DiscordBot {
             if (pm.handleApprovalInteraction(interaction)) return;
           }
         }
+      }
+
+      // Handle /clear — also clear the queue
+      if (interaction.isCommand?.() && interaction.commandName === "clear") {
+        await this.messageQueue.clearChannel(interaction.channelId);
       }
 
       await this.commandHandler.handleInteraction(interaction);
@@ -114,39 +139,48 @@ export class DiscordBot {
     }
 
     const channelId = message.channelId;
-
-    // Atomic check-and-lock: if channel is already processing, skip
-    if (this.claudeManager.hasActiveProcess(channelId)) {
-      console.log(
-        `Channel ${channelId} is already processing, skipping new message`
-      );
-      return;
-    }
-
     const channelName =
       message.channel && "name" in message.channel
         ? message.channel.name
         : "default";
-    
+
     // Don't run in general channel
     if (channelName === "general") {
       return;
     }
-    
+
+    // Try to enqueue — if the channel is busy, the message gets queued
+    const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, message.content);
+    if (wasQueued) {
+      console.log(`Channel ${channelId} is busy, message queued (queue length: ${this.messageQueue.getQueueLength(channelId)})`);
+      return;
+    }
+
+    // Channel is free — process immediately
+    await this.processMessage(message, channelId, channelName, message.content);
+  }
+
+  /**
+   * Shared processing logic for both direct and queued messages.
+   */
+  private async processMessage(message: any, channelId: string, channelName: string, prompt: string): Promise<void> {
     const sessionId = this.claudeManager.getSessionId(channelId);
 
     console.log(`Received message in channel: ${channelName} (${channelId})`);
-    console.log(`Message content: ${message.content}`);
+    console.log(`Message content: ${prompt}`);
     console.log(`Existing session ID: ${sessionId || "none"}`);
 
     try {
+      // Track the original message for reaction updates
+      this.claudeManager.setOriginalMessage(channelId, message);
+
       // Check if we have an existing session
       const isNewSession = !sessionId;
-      
+
       // Create status embed
       const statusEmbed = new EmbedBuilder()
         .setColor(0xFFD700); // Yellow for startup
-      
+
       if (isNewSession) {
         statusEmbed
           .setTitle("🆕 Starting New Session")
@@ -156,7 +190,7 @@ export class DiscordBot {
           .setTitle("🔄 Continuing Session")
           .setDescription(`**Session ID:** ${sessionId}\nResuming Claude Code...`);
       }
-      
+
       // Create initial Discord message
       const reply = await message.channel.send({ embeds: [statusEmbed] });
       console.log("Created Discord message:", reply.id);
@@ -172,13 +206,13 @@ export class DiscordBot {
 
       // Reserve the channel and run Claude Code
       this.claudeManager.reserveChannel(channelId, sessionId, reply);
-      await this.claudeManager.runClaudeCode(channelId, channelName, message.content, sessionId, discordContext);
+      await this.claudeManager.runClaudeCode(channelId, channelName, prompt, sessionId, discordContext);
     } catch (error) {
       console.error("Error running Claude Code:", error);
-      
+
       // Clean up on error
       this.claudeManager.clearSession(channelId);
-      
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       try {
         await message.channel.send(`Error: ${errorMessage}`);

@@ -36,6 +36,9 @@ export class CommandHandler {
             )
         ),
       new SlashCommandBuilder()
+        .setName("killall")
+        .setDescription("Kill all running Claude Code processes"),
+      new SlashCommandBuilder()
         .setName("add")
         .setDescription("Create a channel for a project folder")
         .addStringOption((option: any) =>
@@ -97,6 +100,11 @@ export class CommandHandler {
       } else {
         await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
       }
+    }
+
+    if (interaction.commandName === "killall") {
+      const count = this.claudeManager.killAllProcesses();
+      await interaction.reply(`Killed ${count} running process${count !== 1 ? "es" : ""}.`);
     }
 
     if (interaction.commandName === "model") {

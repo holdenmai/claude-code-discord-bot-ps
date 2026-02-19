@@ -6,6 +6,7 @@ const mockClaudeManager = {
   clearSession: vi.fn(),
   hasActiveProcess: vi.fn(),
   killActiveProcess: vi.fn(),
+  killAllProcesses: vi.fn().mockReturnValue(0),
   setModel: vi.fn(),
   getModel: vi.fn().mockReturnValue('sonnet'),
 };
@@ -22,11 +23,12 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(4);
+      expect(commands).toHaveLength(5);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('model');
-      expect(commands[3]!.name).toBe('add');
+      expect(commands[3]!.name).toBe('killall');
+      expect(commands[4]!.name).toBe('add');
     });
   });
 
