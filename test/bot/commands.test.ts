@@ -135,5 +135,24 @@ describe('CommandHandler', () => {
         expect.objectContaining({ ephemeral: true })
       );
     });
+
+    it('should reject init when not in a guild', async () => {
+      const mockInteraction = {
+        isChatInputCommand: () => true,
+        user: { id: allowedUserId },
+        channelId: 'channel-123',
+        commandName: 'init',
+        channel: { parentId: 'category-456', parent: { name: 'My Projects' } },
+        guild: null,
+        reply: vi.fn(),
+      };
+
+      await commandHandler.handleInteraction(mockInteraction);
+
+      expect(mockSettings.setHomeCategory).not.toHaveBeenCalled();
+      expect(mockInteraction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({ ephemeral: true })
+      );
+    });
   });
 });
