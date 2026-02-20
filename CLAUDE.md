@@ -7,34 +7,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This project uses **Bun** as the JavaScript runtime instead of Node.js. Always use Bun commands:
 
 - `bun install` - Install dependencies
-- `bun run index.ts` - Run the main application
-- `bun --hot ./index.ts` - Run with hot reload for development
-- `bun run test` - Run tests (instead of jest/vitest)
-- `bun build <file>` - Build files (instead of webpack/esbuild)
+- `bun run test:run` - Run tests
 
 ## Architecture
 
-This is a TypeScript project with strict type checking enabled. The project structure is minimal:
-- `src/index.ts` - Main entry point
-- TypeScript configuration uses modern ES features (ESNext) with bundler module resolution
+This is a TypeScript project with strict type checking enabled.
 
-## Bun-Specific APIs
-
-When adding functionality, prefer Bun's built-in APIs:
-- `Bun.serve()` for HTTP servers with WebSocket support (instead of Express)
-- `bun:sqlite` for SQLite (instead of better-sqlite3)
-- `Bun.redis` for Redis (instead of ioredis)  
-- `Bun.sql` for Postgres (instead of pg)
-- Built-in `WebSocket` (instead of ws library)
-- `Bun.$`command`` for shell commands (instead of execa)
-
-## Frontend Development
-
-If adding frontend features, use HTML imports with `Bun.serve()`:
-- HTML files can directly import .tsx/.jsx/.js files
-- CSS files can be imported directly in components
-- Bun handles transpilation and bundling automatically
-- Use `development: { hmr: true }` for hot module replacement
+- `src/index.ts` - Entry point, wires up all subsystems
+- `src/bot/client.ts` - Discord bot client, event handlers, message routing
+- `src/bot/commands.ts` - Slash command definitions and handlers
+- `src/claude/manager.ts` - Claude Code process lifecycle and streaming
+- `src/mcp/server.ts` - MCP permission server for tool approvals
+- `src/mcp/permission-manager.ts` - Interactive approval/denial via Discord
+- `src/queue/message-queue.ts` - Per-channel message queue (one Claude process at a time)
+- `src/settings/settings-store.ts` - Persistent settings (models, allowed tools, home category)
+- `src/utils/shell.ts` - Claude CLI command builder and MCP config
+- `src/utils/config.ts` - Environment variable validation
 
 ## Discord Bot Functionality
 
@@ -50,6 +38,12 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 ### Commands
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)
+- `/kill` - Kill the running Claude Code process in this channel
+- `/killall` - Kill all running Claude Code processes
+- `/model` - Set the Claude model for this channel (sonnet/opus/haiku)
+- `/add` - Create a channel for a project folder (with autocomplete)
+- `/update` - Pull latest changes and restart the bot
+- `/init` - Set this channel's category as the home for startup links
 
 ## Environment Variables
 
@@ -57,6 +51,7 @@ Required environment variables:
 - `DISCORD_TOKEN` - Bot token from Discord Developer Portal
 - `ALLOWED_USER_ID` - Discord user ID who can use the bot
 - `BASE_FOLDER` - Base path where Claude Code operates (e.g., `/Users/tim/repos`)
+- `MCP_SERVER_PORT` - Port for MCP permission server (default: 3001)
 
 ## Environment
 
@@ -71,4 +66,4 @@ Required environment variables:
 
 ## Testing Notes
 
-- Use `bun run test:run` to run tests. Never use just `bun test`
+- Use `bun run test:run` to run tests. Never use just `bun test`.
