@@ -69,6 +69,19 @@ export class DiscordBot {
       // Send startup announcement to allowed user
       try {
         const user = await this.client.users.fetch(this.allowedUserId);
+
+        // Clean up old bot messages in DMs
+        try {
+          const dmChannel = await user.createDM();
+          const messages = await dmChannel.messages.fetch({ limit: 100 });
+          const botMessages = messages.filter(m => m.author.id === this.client.user!.id);
+          for (const msg of botMessages.values()) {
+            await msg.delete().catch(() => {});
+          }
+        } catch (error) {
+          console.error("Failed to clean up DM messages:", error);
+        }
+
         let startupMsg = `🚀 **Bot is online!**\nLogged in as ${this.client.user?.tag}`;
 
         // Add channel links if home category is configured
