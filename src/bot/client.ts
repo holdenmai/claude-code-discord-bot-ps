@@ -66,6 +66,9 @@ export class DiscordBot {
         this.client.user!.id
       );
 
+      // Clean up threads in home category on startup
+      await this.cleanupAllThreadsInHomeCategory();
+
       // Send startup announcement to allowed user
       try {
         const user = await this.client.users.fetch(this.allowedUserId);
@@ -131,9 +134,15 @@ export class DiscordBot {
         }
       }
 
-      // Handle /clear — also clear the queue
+      // Handle /clear — also clear the queue and threads
       if (interaction.isCommand?.() && interaction.commandName === "clear") {
         await this.messageQueue.clearChannel(interaction.channelId);
+        // Clean up threads in background (don't await to avoid slowing down response)
+        this.cleanupThreads(interaction.channelId).then(count => {
+          if (count > 0) {
+            console.log(`Cleaned up ${count} thread(s) in channel ${interaction.channelId}`);
+          }
+        });
       }
 
       await this.commandHandler.handleInteraction(interaction);
@@ -275,6 +284,85 @@ export class DiscordBot {
       } catch (sendError) {
         console.error("Failed to send error message:", sendError);
       }
+    }
+  }
+
+  /**
+   * Clean up all threads in a channel (delete bot-created threads)
+   */
+  async cleanupThreads(channelId: string): Promise<number> {
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !('threads' in channel)) return 0;
+
+      const threads = await (channel as any).threads.fetchActive();
+      let deleted = 0;
+
+      for (const thread of threads.threads.values()) {
+        // Only delete threads created by the bot
+        if (thread.ownerId === this.client.user?.id) {
+          try {
+            await thread.delete();
+            deleted++;
+          } catch (error) {
+            console.error(`Failed to delete thread ${thread.id}:`, error);
+          }
+        }
+      }
+
+      // Also fetch archived threads
+      try {
+        const archivedThreads = await (channel as any).threads.fetchArchived();
+        for (const thread of archivedThreads.threads.values()) {
+          if (thread.ownerId === this.client.user?.id) {
+            try {
+              await thread.delete();
+              deleted++;
+            } catch (error) {
+              console.error(`Failed to delete archived thread ${thread.id}:`, error);
+            }
+          }
+        }
+      } catch (error) {
+        // Archived threads fetch might fail, ignore
+      }
+
+      return deleted;
+    } catch (error) {
+      console.error(`Failed to cleanup threads in channel ${channelId}:`, error);
+      return 0;
+    }
+  }
+
+  /**
+   * Clean up threads in all channels in the home category
+   */
+  async cleanupAllThreadsInHomeCategory(): Promise<void> {
+    const home = this.settings?.getHomeCategory();
+    if (!home) return;
+
+    try {
+      const guild = await this.client.guilds.fetch(home.guildId);
+      const channels = await guild.channels.fetch();
+      const categoryChannels = channels.filter(
+        (ch): ch is NonNullable<typeof ch> =>
+          ch !== null && ch.parentId === home.categoryId && ch.isTextBased() && !ch.isThread()
+      );
+
+      let totalDeleted = 0;
+      for (const channel of categoryChannels.values()) {
+        const deleted = await this.cleanupThreads(channel.id);
+        if (deleted > 0) {
+          console.log(`Cleaned up ${deleted} thread(s) in #${channel.name}`);
+          totalDeleted += deleted;
+        }
+      }
+
+      if (totalDeleted > 0) {
+        console.log(`Total threads cleaned up on startup: ${totalDeleted}`);
+      }
+    } catch (error) {
+      console.error("Failed to cleanup threads in home category:", error);
     }
   }
 
