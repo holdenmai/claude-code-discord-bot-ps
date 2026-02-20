@@ -4,6 +4,7 @@ import * as path from "path";
 interface SettingsData {
   models: Record<string, string>;
   allowedTools: Record<string, string[]>;
+  homeCategory?: { guildId: string; categoryId: string };
 }
 
 export class SettingsStore {
@@ -73,5 +74,16 @@ export class SettingsStore {
 
   getAllChannelAllowedTools(): Record<string, string[]> {
     return { ...this.data.allowedTools };
+  }
+
+  // --- Home category settings ---
+
+  getHomeCategory(): { guildId: string; categoryId: string } | undefined {
+    return this.data.homeCategory;
+  }
+
+  setHomeCategory(guildId: string, categoryId: string): void {
+    this.data.homeCategory = { guildId, categoryId };
+    this.save();
   }
 }
