@@ -84,7 +84,7 @@ export class DiscordBot {
               .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 
             if (categoryChannels.size > 0) {
-              const links = categoryChannels.map(ch => `<#${ch.id}>`).join('  ');
+              const links = categoryChannels.map(ch => `<#${ch.id}>`).join('\n');
               startupMsg += `\n\n📂 **Projects:**\n${links}`;
             }
           } catch (error) {
