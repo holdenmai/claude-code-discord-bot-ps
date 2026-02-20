@@ -7,6 +7,7 @@ import type { ClaudeManager } from '../claude/manager.js';
 import { CommandHandler } from './commands.js';
 import type { MCPPermissionServer } from '../mcp/server.js';
 import { MessageQueue } from '../queue/message-queue.js';
+import type { SettingsStore } from '../settings/settings-store.js';
 
 export class DiscordBot {
   public client: Client; // Make public so MCP server can access it
@@ -16,7 +17,8 @@ export class DiscordBot {
 
   constructor(
     private claudeManager: ClaudeManager,
-    private allowedUserId: string
+    private allowedUserId: string,
+    private settings?: SettingsStore,
   ) {
     this.client = new Client({
       intents: [
@@ -27,7 +29,7 @@ export class DiscordBot {
       ],
     });
 
-    this.commandHandler = new CommandHandler(claudeManager, allowedUserId);
+    this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings);
     this.messageQueue = new MessageQueue();
     this.setupEventHandlers();
     this.setupCompletionCallback();

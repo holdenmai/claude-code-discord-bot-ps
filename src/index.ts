@@ -19,7 +19,7 @@ async function main() {
 
   // Start Discord Bot and Claude Manager
   const claudeManager = new ClaudeManager(config.baseFolder, settings);
-  const bot = new DiscordBot(claudeManager, config.allowedUserId);
+  const bot = new DiscordBot(claudeManager, config.allowedUserId, settings);
 
   // Connect MCP server to Discord bot for interactive approvals
   mcpServer.setDiscordBot(bot);

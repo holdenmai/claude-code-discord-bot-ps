@@ -3,13 +3,15 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawn } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
+import type { SettingsStore } from '../settings/settings-store.js';
 
 export class CommandHandler {
   private baseFolder: string;
 
   constructor(
     private claudeManager: ClaudeManager,
-    private allowedUserId: string
+    private allowedUserId: string,
+    private settings?: SettingsStore,
   ) {
     this.baseFolder = process.env.BASE_FOLDER || '';
   }
@@ -52,6 +54,9 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("update")
         .setDescription("Update the bot by pulling latest changes and restarting"),
+      new SlashCommandBuilder()
+        .setName("init")
+        .setDescription("Set this channel's category as the home for startup links"),
     ];
   }
 
@@ -124,6 +129,22 @@ export class CommandHandler {
 
     if (interaction.commandName === "update") {
       await this.handleUpdateCommand(interaction);
+    }
+
+    if (interaction.commandName === "init") {
+      const categoryId = interaction.channel?.parentId;
+      if (!categoryId) {
+        await interaction.reply({ content: "This channel is not in a category.", ephemeral: true });
+        return;
+      }
+      const guildId = interaction.guild?.id;
+      if (!guildId) {
+        await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+        return;
+      }
+      this.settings?.setHomeCategory(guildId, categoryId);
+      const categoryName = interaction.channel?.parent?.name || 'Unknown';
+      await interaction.reply(`Home category set to **${categoryName}**. Startup messages will now include channel links from this category.`);
     }
   }
 

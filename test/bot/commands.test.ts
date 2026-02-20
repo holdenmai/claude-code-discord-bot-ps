@@ -11,24 +11,30 @@ const mockClaudeManager = {
   getModel: vi.fn().mockReturnValue('sonnet'),
 };
 
+const mockSettings = {
+  setHomeCategory: vi.fn(),
+};
+
 describe('CommandHandler', () => {
   let commandHandler: CommandHandler;
   const allowedUserId = 'user-123';
 
   beforeEach(() => {
-    commandHandler = new CommandHandler(mockClaudeManager as any, allowedUserId);
+    commandHandler = new CommandHandler(mockClaudeManager as any, allowedUserId, mockSettings as any);
     vi.clearAllMocks();
   });
 
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(5);
+      expect(commands).toHaveLength(7);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('model');
       expect(commands[3]!.name).toBe('killall');
       expect(commands[4]!.name).toBe('add');
+      expect(commands[5]!.name).toBe('update');
+      expect(commands[6]!.name).toBe('init');
     });
   });
 
@@ -90,6 +96,44 @@ describe('CommandHandler', () => {
 
       expect(mockClaudeManager.clearSession).not.toHaveBeenCalled();
       expect(mockInteraction.reply).not.toHaveBeenCalled();
+    });
+
+    it('should handle init command for authorized user', async () => {
+      const mockInteraction = {
+        isChatInputCommand: () => true,
+        user: { id: allowedUserId },
+        channelId: 'channel-123',
+        commandName: 'init',
+        channel: { parentId: 'category-456', parent: { name: 'My Projects' } },
+        guild: { id: 'guild-789' },
+        reply: vi.fn(),
+      };
+
+      await commandHandler.handleInteraction(mockInteraction);
+
+      expect(mockSettings.setHomeCategory).toHaveBeenCalledWith('guild-789', 'category-456');
+      expect(mockInteraction.reply).toHaveBeenCalledWith(
+        expect.stringContaining('My Projects')
+      );
+    });
+
+    it('should reject init when channel has no category', async () => {
+      const mockInteraction = {
+        isChatInputCommand: () => true,
+        user: { id: allowedUserId },
+        channelId: 'channel-123',
+        commandName: 'init',
+        channel: { parentId: null, parent: null },
+        guild: { id: 'guild-789' },
+        reply: vi.fn(),
+      };
+
+      await commandHandler.handleInteraction(mockInteraction);
+
+      expect(mockSettings.setHomeCategory).not.toHaveBeenCalled();
+      expect(mockInteraction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({ ephemeral: true })
+      );
     });
   });
 });
