@@ -69,7 +69,31 @@ export class DiscordBot {
       // Send startup announcement to allowed user
       try {
         const user = await this.client.users.fetch(this.allowedUserId);
-        await user.send(`🚀 **Bot is online!**\nLogged in as ${this.client.user?.tag}\n\nReady to assist with Claude Code sessions.`);
+        let startupMsg = `🚀 **Bot is online!**\nLogged in as ${this.client.user?.tag}`;
+
+        // Add channel links if home category is configured
+        const home = this.settings?.getHomeCategory();
+        if (home) {
+          try {
+            const guild = await this.client.guilds.fetch(home.guildId);
+            const channels = await guild.channels.fetch();
+            const categoryChannels = channels
+              .filter((ch): ch is NonNullable<typeof ch> =>
+                ch !== null && ch.parentId === home.categoryId && ch.isTextBased() && !ch.isThread()
+              )
+              .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+
+            if (categoryChannels.size > 0) {
+              const links = categoryChannels.map(ch => `<#${ch.id}>`).join('  ');
+              startupMsg += `\n\n📂 **Projects:**\n${links}`;
+            }
+          } catch (error) {
+            console.error("Failed to fetch home category channels:", error);
+          }
+        }
+
+        startupMsg += `\n\nReady to assist with Claude Code sessions.`;
+        await user.send(startupMsg);
       } catch (error) {
         console.error("Failed to send startup DM:", error);
       }
