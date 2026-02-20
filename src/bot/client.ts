@@ -51,7 +51,7 @@ export class DiscordBot {
       // Dequeue the next message for this channel
       const next = await this.messageQueue.dequeueNext(channelId);
       if (next) {
-        await this.processMessage(next.message, channelId, next.channelName, next.prompt);
+        await this.processMessage(next.message, channelId, next.channelName, next.prompt, next.imageUrls);
       }
     });
   }
@@ -63,6 +63,14 @@ export class DiscordBot {
         process.env.DISCORD_TOKEN!,
         this.client.user!.id
       );
+
+      // Send startup announcement to allowed user
+      try {
+        const user = await this.client.users.fetch(this.allowedUserId);
+        await user.send(`🚀 **Bot is online!**\nLogged in as ${this.client.user?.tag}\n\nReady to assist with Claude Code sessions.`);
+      } catch (error) {
+        console.error("Failed to send startup DM:", error);
+      }
     });
 
     this.client.on("interactionCreate", async (interaction) => {
@@ -149,21 +157,26 @@ export class DiscordBot {
       return;
     }
 
+    // Extract image attachments if any
+    const imageAttachments = message.attachments
+      ?.filter((att: any) => att.contentType?.startsWith("image/"))
+      .map((att: any) => att.url) || [];
+
     // Try to enqueue — if the channel is busy, the message gets queued
-    const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, message.content);
+    const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, message.content, imageAttachments);
     if (wasQueued) {
       console.log(`Channel ${channelId} is busy, message queued (queue length: ${this.messageQueue.getQueueLength(channelId)})`);
       return;
     }
 
     // Channel is free — process immediately
-    await this.processMessage(message, channelId, channelName, message.content);
+    await this.processMessage(message, channelId, channelName, message.content, imageAttachments);
   }
 
   /**
    * Shared processing logic for both direct and queued messages.
    */
-  private async processMessage(message: any, channelId: string, channelName: string, prompt: string): Promise<void> {
+  private async processMessage(message: any, channelId: string, channelName: string, prompt: string, imageUrls: string[] = []): Promise<void> {
     const sessionId = this.claudeManager.getSessionId(channelId);
 
     console.log(`Received message in channel: ${channelName} (${channelId})`);
@@ -206,7 +219,7 @@ export class DiscordBot {
 
       // Reserve the channel and run Claude Code
       this.claudeManager.reserveChannel(channelId, sessionId, reply);
-      await this.claudeManager.runClaudeCode(channelId, channelName, prompt, sessionId, discordContext);
+      await this.claudeManager.runClaudeCode(channelId, channelName, prompt, sessionId, discordContext, imageUrls);
     } catch (error) {
       console.error("Error running Claude Code:", error);
 

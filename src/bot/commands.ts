@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits } from "discord.js";
 import * as fs from "fs";
 import * as path from "path";
+import { spawn } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
 
 export class CommandHandler {
@@ -48,6 +49,9 @@ export class CommandHandler {
             .setRequired(true)
             .setAutocomplete(true)
         ),
+      new SlashCommandBuilder()
+        .setName("update")
+        .setDescription("Update the bot by pulling latest changes and restarting"),
     ];
   }
 
@@ -116,6 +120,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "add") {
       await this.handleAddCommand(interaction);
+    }
+
+    if (interaction.commandName === "update") {
+      await this.handleUpdateCommand(interaction);
     }
   }
 
@@ -186,6 +194,70 @@ export class CommandHandler {
       console.error("Error creating channel:", error);
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
+    }
+  }
+
+  /**
+   * Handle /update command - git pull and restart the bot
+   */
+  private async handleUpdateCommand(interaction: any): Promise<void> {
+    await interaction.reply("🔄 Pulling latest changes...");
+
+    try {
+      // Run git pull
+      const gitPull = spawn("git", ["pull"], {
+        cwd: process.cwd(),
+        shell: true,
+      });
+
+      let output = "";
+      let errorOutput = "";
+
+      gitPull.stdout.on("data", (data) => {
+        output += data.toString();
+      });
+
+      gitPull.stderr.on("data", (data) => {
+        errorOutput += data.toString();
+      });
+
+      gitPull.on("close", async (code) => {
+        if (code !== 0) {
+          await interaction.editReply(`❌ Git pull failed:\n\`\`\`\n${errorOutput}\n\`\`\``);
+          return;
+        }
+
+        await interaction.editReply(`✅ Updated successfully!\n\`\`\`\n${output}\n\`\`\`\n🔄 Restarting bot...`);
+
+        // Give Discord time to send the message, then restart
+        setTimeout(async () => {
+          console.log("Restarting bot after update...");
+
+          const cwd = process.cwd();
+          const vbsPath = path.join(cwd, "restart.vbs");
+
+          // Create a VBS script that launches cmd in a visible window
+          const vbsContent = `
+Set WshShell = CreateObject("WScript.Shell")
+WScript.Sleep 2000
+WshShell.CurrentDirectory = "${cwd.replace(/\\/g, "\\\\")}"
+WshShell.Run "cmd /k bun run start", 1, False
+`;
+          fs.writeFileSync(vbsPath, vbsContent.trim());
+
+          // Run the VBS script with wscript (doesn't block, creates independent process)
+          spawn("wscript.exe", [vbsPath], {
+            detached: true,
+            stdio: "ignore",
+          }).unref();
+
+          console.log("Restart VBS script launched, exiting...");
+          process.exit(0);
+        }, 1000);
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`❌ Update failed: ${msg}`);
     }
   }
 }

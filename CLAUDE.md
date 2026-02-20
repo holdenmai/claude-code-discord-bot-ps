@@ -64,11 +64,6 @@ Required environment variables:
 - TypeScript is configured with strict mode and modern features
 - No emit compilation (bundler handles this)
 
-## Important Restrictions
-
-- Never run the bot. You are not allowed to use the `bun run src/index.ts` command. 
-- You can run tests, but never run the main application.
-
 ## Testing Notes
 
 - Use `bun run test:run` to run tests. Never use just `bun test`

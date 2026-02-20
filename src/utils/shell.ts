@@ -19,9 +19,10 @@ export function buildClaudeCommand(
   prompt: string,
   sessionId?: string,
   discordContext?: DiscordContext,
-  model: string = "sonnet"
+  model: string = "sonnet",
+  imageUrls?: string[]
 ): string {
-  const escapedPrompt = escapeShellString(prompt);
+  let escapedPrompt = escapeShellString(prompt);
 
   // Create session-specific MCP config in /tmp
   const sessionMcpConfigPath = createSessionMcpConfig(discordContext);
@@ -32,10 +33,16 @@ export function buildClaudeCommand(
     "stream-json",
     "--model",
     model,
-    "-p",
-    escapedPrompt,
-    "--verbose",
   ];
+
+  // Add images if provided
+  if (imageUrls && imageUrls.length > 0) {
+    for (const imageUrl of imageUrls) {
+      commandParts.push("--image", imageUrl);
+    }
+  }
+
+  commandParts.push("-p", escapedPrompt, "--verbose");
 
   // Add session-specific MCP configuration
   commandParts.push("--mcp-config", sessionMcpConfigPath);

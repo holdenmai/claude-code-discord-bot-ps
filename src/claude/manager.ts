@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
-import { EmbedBuilder } from "discord.js";
+import { EmbedBuilder, AttachmentBuilder } from "discord.js";
 import type { SDKMessage } from "../types/index.js";
 import { buildClaudeCommand, type DiscordContext } from "../utils/shell.js";
 import { DatabaseManager } from "../db/database.js";
@@ -261,7 +261,8 @@ export class ClaudeManager {
     channelName: string,
     prompt: string,
     sessionId?: string,
-    discordContext?: DiscordContext
+    discordContext?: DiscordContext,
+    imageUrls?: string[]
   ): Promise<void> {
     // Store the channel name for path replacement
     this.channelNames.set(channelId, channelName);
@@ -277,7 +278,7 @@ export class ClaudeManager {
     }
 
     const model = this.getModel(channelId);
-    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model);
+    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls);
     console.log(`Running command: ${commandString}`);
 
     const claude = spawn("powershell.exe", ["-NoProfile", "-Command", commandString], {
@@ -472,6 +473,11 @@ export class ClaudeManager {
       ? parsed.message.content.find((c: any) => c.type === "text")?.text || ""
       : parsed.message.content;
 
+    // Check for images in the message
+    const images = Array.isArray(parsed.message.content)
+      ? parsed.message.content.filter((c: any) => c.type === "image")
+      : [];
+
     // Check for tool use in the message
     const toolUses = Array.isArray(parsed.message.content)
       ? parsed.message.content.filter((c: any) => c.type === "tool_use")
@@ -488,6 +494,14 @@ export class ClaudeManager {
           .setColor(0x7289DA); // Discord blurple
 
         await channel.send({ embeds: [assistantEmbed] });
+
+        // Detect and send any image file paths mentioned in the text
+        await this.detectAndSendImagePaths(channelId, content);
+      }
+
+      // Send images if present
+      for (const image of images) {
+        await this.sendImageToDiscord(channelId, image);
       }
 
       // If there are tool uses, send a message for each tool
@@ -637,6 +651,92 @@ export class ClaudeManager {
     this.notifyComplete(channelId, success);
 
     console.log("Got result message, cleaning up process tracking");
+  }
+
+  /**
+   * Send an image to Discord channel
+   */
+  private async sendImageToDiscord(channelId: string, imageContent: any): Promise<void> {
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    try {
+      // Handle different image types
+      if (imageContent.source?.type === "base64") {
+        // Base64 encoded image
+        const buffer = Buffer.from(imageContent.source.data, "base64");
+        const ext = imageContent.source.media_type?.split("/")[1] || "png";
+        const attachment = new AttachmentBuilder(buffer, { name: `image.${ext}` });
+
+        await channel.send({
+          content: "🖼️ **Image:**",
+          files: [attachment]
+        });
+      } else if (imageContent.source?.type === "url") {
+        // URL image
+        await channel.send({
+          content: "🖼️ **Image:**",
+          embeds: [new EmbedBuilder().setImage(imageContent.source.url)]
+        });
+      }
+    } catch (error) {
+      console.error("Error sending image to Discord:", error);
+    }
+  }
+
+  /**
+   * Detect and send image file paths mentioned in text
+   */
+  private async detectAndSendImagePaths(channelId: string, text: string): Promise<void> {
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    const channelName = this.channelNames.get(channelId);
+    if (!channelName) return;
+
+    const workingDir = path.join(this.baseFolder, channelName);
+
+    // Common image extensions
+    const imageExtensions = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"];
+
+    // Pattern to match file paths (both absolute and relative)
+    const pathPattern = /(?:\.\/|\.\.\/|[A-Za-z]:[\\\/])?[\w\-\.\/\\]+\.(?:png|jpg|jpeg|gif|webp|svg)/gi;
+    const matches = text.match(pathPattern);
+
+    if (!matches) return;
+
+    const sentPaths = new Set<string>();
+
+    for (const match of matches) {
+      // Resolve to absolute path
+      let imagePath = path.isAbsolute(match)
+        ? match
+        : path.join(workingDir, match);
+
+      // Normalize path
+      imagePath = path.normalize(imagePath);
+
+      // Skip if already sent
+      if (sentPaths.has(imagePath)) continue;
+
+      // Check if file exists
+      if (!fs.existsSync(imagePath)) continue;
+
+      // Check if it's actually an image file
+      const ext = path.extname(imagePath).toLowerCase();
+      if (!imageExtensions.includes(ext)) continue;
+
+      try {
+        const attachment = new AttachmentBuilder(imagePath);
+        await channel.send({
+          content: `🖼️ **${path.basename(imagePath)}**`,
+          files: [attachment]
+        });
+        sentPaths.add(imagePath);
+      } catch (error) {
+        console.error(`Error sending image ${imagePath}:`, error);
+      }
+    }
   }
 
   // Clean up resources
