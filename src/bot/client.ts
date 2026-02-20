@@ -197,9 +197,13 @@ export class DiscordBot {
     }
 
     // Extract image attachments if any
-    const imageAttachments = message.attachments
-      ?.filter((att: any) => att.contentType?.startsWith("image/"))
-      .map((att: any) => att.url) || [];
+    const imageAttachments = Array.from(message.attachments?.values() || [])
+      .filter((att: any) => att.contentType?.startsWith("image/"))
+      .map((att: any) => att.url);
+
+    if (imageAttachments.length > 0) {
+      console.log(`Found ${imageAttachments.length} image(s):`, imageAttachments);
+    }
 
     // Try to enqueue — if the channel is busy, the message gets queued
     const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, message.content, imageAttachments);
