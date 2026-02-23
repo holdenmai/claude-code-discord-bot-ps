@@ -44,6 +44,9 @@ export function buildClaudeCommand(
 
   commandParts.push("-p", escapedPrompt, "--verbose");
 
+  // Always use Accept Edits permission mode
+  commandParts.push("--permission-mode", "acceptEdits");
+
   // Add session-specific MCP configuration
   commandParts.push("--mcp-config", sessionMcpConfigPath);
   commandParts.push("--permission-prompt-tool", "mcp__discord-permissions__approve_tool");
