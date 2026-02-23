@@ -571,11 +571,29 @@ export class ClaudeManager {
         await this.postTaskResult(channelId, result.tool_use_id, result.content, result.is_error === true);
       }
 
+      // Tool result content can be a string or an array of content blocks
+      const resultContent = result.content;
+      let textContent = "";
+      let imageBlocks: any[] = [];
+
+      if (typeof resultContent === "string") {
+        textContent = resultContent;
+      } else if (Array.isArray(resultContent)) {
+        // Extract text and image blocks from array content
+        for (const block of resultContent) {
+          if (block.type === "text") {
+            textContent += (textContent ? "\n" : "") + block.text;
+          } else if (block.type === "image") {
+            imageBlocks.push(block);
+          }
+        }
+      }
+
       const toolCall = toolCalls.get(result.tool_use_id);
       if (toolCall && toolCall.message) {
         try {
           // Get the first line of the result
-          const firstLine = result.content.split('\n')[0].trim();
+          const firstLine = textContent.split('\n')[0].trim();
           const resultText = firstLine.length > 100
             ? firstLine.substring(0, 100) + "..."
             : firstLine;
@@ -601,6 +619,16 @@ export class ClaudeManager {
         } catch (error) {
           console.error("Error updating tool result message:", error);
         }
+      }
+
+      // Send any image content blocks from the tool result (e.g. screenshots)
+      for (const image of imageBlocks) {
+        await this.sendImageToDiscord(channelId, image);
+      }
+
+      // Detect and send any image file paths mentioned in the text result
+      if (textContent) {
+        await this.detectAndSendImagePaths(channelId, textContent);
       }
     }
   }
