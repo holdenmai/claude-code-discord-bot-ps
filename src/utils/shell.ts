@@ -19,7 +19,7 @@ export function buildClaudeCommand(
   prompt: string,
   sessionId?: string,
   discordContext?: DiscordContext,
-  model: string = "sonnet",
+  model: string = "opus",
   imageUrls?: string[]
 ): string {
   let escapedPrompt = escapeShellString(prompt);

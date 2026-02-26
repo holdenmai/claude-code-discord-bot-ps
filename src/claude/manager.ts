@@ -253,7 +253,7 @@ export class ClaudeManager {
   }
 
   getModel(channelId: string): string {
-    return this.channelModels.get(channelId) || "sonnet";
+    return this.channelModels.get(channelId) || "opus";
   }
 
   async runClaudeCode(
@@ -593,7 +593,7 @@ export class ClaudeManager {
       if (toolCall && toolCall.message) {
         try {
           // Get the first line of the result
-          const firstLine = textContent.split('\n')[0].trim();
+          const firstLine = (textContent.split('\n')[0] || "").trim();
           const resultText = firstLine.length > 100
             ? firstLine.substring(0, 100) + "..."
             : firstLine;

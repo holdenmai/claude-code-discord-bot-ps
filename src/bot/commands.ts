@@ -33,8 +33,8 @@ export class CommandHandler {
             .setDescription("Model to use")
             .setRequired(true)
             .addChoices(
-              { name: "Sonnet (default)", value: "sonnet" },
-              { name: "Opus", value: "opus" },
+              { name: "Sonnet", value: "sonnet" },
+              { name: "Opus (default)", value: "opus" },
               { name: "Haiku", value: "haiku" },
             )
         ),
