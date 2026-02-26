@@ -2,6 +2,7 @@ import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import { execSync } from 'child_process';
 import { PermissionManager } from './permission-manager.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 
@@ -9,6 +10,7 @@ export class MCPPermissionServer {
   private app: express.Application;
   private port: number;
   private server?: any;
+  private connections: Set<any> = new Set();
   private permissionManager: PermissionManager;
 
   constructor(port: number = 3001, settings?: SettingsStore) {
@@ -200,7 +202,52 @@ export class MCPPermissionServer {
     });
   }
 
+  /**
+   * Kill any process currently using our port (stale from a previous crash/kill)
+   */
+  private async forceReleasePort(): Promise<void> {
+    try {
+      // On Windows, find the PID using the port and kill it
+      const result = execSync(
+        `netstat -ano | findstr :${this.port} | findstr LISTENING`,
+        { encoding: 'utf-8', timeout: 5000 }
+      ).trim();
+
+      if (result) {
+        // Extract PIDs from netstat output (last column)
+        const pids = new Set<string>();
+        for (const line of result.split('\n')) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parts[parts.length - 1];
+          if (pid && pid !== '0') {
+            pids.add(pid);
+          }
+        }
+
+        for (const pid of pids) {
+          // Don't kill ourselves
+          if (pid === String(process.pid)) continue;
+          try {
+            execSync(`taskkill /F /PID ${pid}`, { encoding: 'utf-8', timeout: 5000 });
+            console.log(`Killed stale process ${pid} that was holding port ${this.port}`);
+          } catch {
+            // Process may already be gone
+            console.log(`Could not kill PID ${pid} (may already be gone)`);
+          }
+        }
+
+        // Brief pause to let the OS release the port
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    } catch {
+      // No process found on port — that's fine
+    }
+  }
+
   async start(): Promise<void> {
+    // Force-release the port if a stale process is holding it
+    await this.forceReleasePort();
+
     return new Promise((resolve, reject) => {
       this.server = this.app.listen(this.port, (err?: Error) => {
         if (err) {
@@ -212,20 +259,76 @@ export class MCPPermissionServer {
           resolve();
         }
       });
+
+      // Track open connections so we can force-close them on shutdown
+      this.connections = new Set();
+      this.server.on('connection', (conn: any) => {
+        this.connections.add(conn);
+        conn.on('close', () => this.connections.delete(conn));
+      });
+
+      this.server.on('error', (err: any) => {
+        if (err.code === 'EADDRINUSE') {
+          console.error(`Port ${this.port} is still in use after cleanup attempt. Will retry once...`);
+          // One more attempt after a longer delay
+          setTimeout(async () => {
+            await this.forceReleasePort();
+            this.server = this.app.listen(this.port, (retryErr?: Error) => {
+              if (retryErr) {
+                reject(retryErr);
+              } else {
+                console.log(`MCP Permission Server listening on port ${this.port} (after retry)`);
+                resolve();
+              }
+            });
+          }, 2000);
+        }
+      });
     });
   }
 
   async stop(): Promise<void> {
     // Clean up permission manager first
     this.permissionManager.cleanup();
-    
+
     if (this.server) {
+      // Destroy all open connections so the server can close immediately
+      for (const conn of this.connections) {
+        conn.destroy();
+      }
+      this.connections.clear();
+
       return new Promise((resolve) => {
         this.server.close(() => {
           console.log('MCP Permission Server stopped');
+          this.server = undefined;
           resolve();
         });
+
+        // Safety timeout — if close hangs for more than 3s, resolve anyway
+        setTimeout(() => {
+          console.log('MCP server close timed out, forcing...');
+          this.server = undefined;
+          resolve();
+        }, 3000);
       });
+    }
+  }
+
+  /**
+   * Synchronous cleanup for use in process 'exit' handler.
+   * Cannot do async work here, but we can destroy connections
+   * and close the server to free the port.
+   */
+  stopSync(): void {
+    for (const conn of this.connections) {
+      try { conn.destroy(); } catch {}
+    }
+    this.connections.clear();
+
+    if (this.server) {
+      try { this.server.close(); } catch {}
+      this.server = undefined;
     }
   }
 }

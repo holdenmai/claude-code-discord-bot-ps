@@ -25,7 +25,10 @@ async function main() {
   mcpServer.setDiscordBot(bot);
 
   // Handle graceful shutdown
+  let isShuttingDown = false;
   const shutdown = async () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     console.log('Shutting down gracefully...');
 
     // Stop MCP server first
@@ -47,6 +50,18 @@ async function main() {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // On Windows, process.exit() doesn't trigger SIGINT/SIGTERM.
+  // This ensures the MCP server is cleaned up even on abrupt exits
+  // (e.g. from /update command calling process.exit(0) directly).
+  process.on('exit', () => {
+    // Synchronous cleanup — destroy all connections so the port is freed
+    try {
+      mcpServer.stopSync();
+    } catch {
+      // Best effort
+    }
+  });
 
   console.log('Starting Discord Bot...');
   await bot.login(config.discordToken);
