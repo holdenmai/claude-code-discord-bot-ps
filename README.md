@@ -158,10 +158,34 @@ Bot: 🔧 LS (path: .)
      ✅ Completed (3 turns)
 ```
 
+## Threads as Git Worktrees
+
+Discord threads can be used to work on feature branches within a project using [git worktrees](https://git-scm.com/docs/git-worktree). The thread name maps to a worktree inside the parent channel's repo:
+
+```
+#my-project                          → /repos/my-project  (main branch)
+  └─ Thread: "add-login-page"       → /repos/my-project/.worktrees/add-login-page
+  └─ Thread: "fix-header-bug"       → /repos/my-project/.worktrees/fix-header-bug
+```
+
+### How it works
+
+1. **Create a thread** in any project channel
+2. **Send a message** in the thread — the bot prompts you to confirm worktree creation
+3. **Confirm or override** the branch name (defaults to the thread name, branching from `main`)
+4. The worktree is created and all subsequent messages in the thread run Claude Code in that worktree
+
+If the worktree already exists (e.g., you created it locally with `git worktree add`), the bot picks it up automatically with no confirmation needed.
+
+### Raw CLI commands
+
+Messages starting with `/` or `--` are passed directly to Claude Code as CLI arguments instead of as a prompt. This lets you run interactive commands like `/compact` or `/cost` directly from Discord.
+
 ## How It Works
 
 - Each Discord channel maps to a folder: `#my-project` → `/path/to/repos/my-project`
-- Sessions persist per channel and automatically resume
+- Discord threads map to git worktrees within that folder
+- Sessions persist per channel/thread and automatically resume
 - Shows real-time tool usage and responses
 - Only responds to the configured `ALLOWED_USER_ID`
 
