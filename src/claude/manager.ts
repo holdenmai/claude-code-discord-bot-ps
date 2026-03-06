@@ -42,6 +42,9 @@ export class ClaudeManager {
   // Discord context per channel (for user mentions)
   private channelDiscordContexts = new Map<string, DiscordContext>();
 
+  // Working directory overrides (for worktree threads)
+  private workingDirOverrides = new Map<string, string>();
+
   private settings?: SettingsStore;
 
   constructor(private baseFolder: string, settings?: SettingsStore) {
@@ -95,6 +98,7 @@ export class ClaudeManager {
     this.channelProcesses.delete(channelId);
     this.originalMessages.delete(channelId);
     this.channelDiscordContexts.delete(channelId);
+    this.workingDirOverrides.delete(channelId);
     this.cleanupTaskThreads(channelId);
   }
 
@@ -109,6 +113,10 @@ export class ClaudeManager {
 
   getOriginalMessage(channelId: string): any {
     return this.originalMessages.get(channelId);
+  }
+
+  setWorkingDirOverride(channelId: string, workingDir: string): void {
+    this.workingDirOverrides.set(channelId, workingDir);
   }
 
   setOnCompleteCallback(callback: OnCompleteCallback): void {
@@ -256,6 +264,14 @@ export class ClaudeManager {
     return this.channelModels.get(channelId) || "opus";
   }
 
+  private getWorkingDir(channelId: string): string | undefined {
+    const override = this.workingDirOverrides.get(channelId);
+    if (override) return override;
+    const channelName = this.channelNames.get(channelId);
+    if (channelName) return path.join(this.baseFolder, channelName);
+    return undefined;
+  }
+
   async runClaudeCode(
     channelId: string,
     channelName: string,
@@ -269,7 +285,7 @@ export class ClaudeManager {
     if (discordContext) {
       this.channelDiscordContexts.set(channelId, discordContext);
     }
-    const workingDir = path.join(this.baseFolder, channelName);
+    const workingDir = this.workingDirOverrides.get(channelId) || path.join(this.baseFolder, channelName);
     console.log(`Running Claude Code in: ${workingDir}`);
 
     // Check if working directory exists
@@ -519,9 +535,8 @@ export class ClaudeManager {
             .map(([key, value]) => {
               let val = String(value);
               // Replace base folder path with relative path
-              const channelName = this.channelNames.get(channelId);
-              if (channelName) {
-                const basePath = path.join(this.baseFolder, channelName);
+              const basePath = this.getWorkingDir(channelId);
+              if (basePath) {
                 if (val === basePath) {
                   val = ".";
                 } else if (val.startsWith(basePath + path.sep)) {
@@ -654,9 +669,20 @@ export class ClaudeManager {
     const resultEmbed = new EmbedBuilder();
     const success = parsed.subtype === "success";
 
+    const EMBED_LIMIT = 4096;
+    let fileAttachment: AttachmentBuilder | undefined;
+
     if (success) {
       let description = "result" in parsed ? parsed.result : "Task completed";
-      description += `\n\n*Completed in ${parsed.num_turns} turns*`;
+      const suffix = `\n\n*Completed in ${parsed.num_turns} turns*`;
+
+      if (description.length + suffix.length > EMBED_LIMIT) {
+        // Attach full response as a file and truncate embed description
+        fileAttachment = new AttachmentBuilder(Buffer.from(description, "utf-8"), { name: "response.md" });
+        description = description.slice(0, EMBED_LIMIT - suffix.length - 40) + "\n\n*(truncated — see attached file)*";
+      }
+
+      description += suffix;
 
       resultEmbed
         .setTitle("✅ Session Complete")
@@ -670,7 +696,11 @@ export class ClaudeManager {
     }
 
     try {
-      await channel.send({ content: mention || undefined, embeds: [resultEmbed] });
+      await channel.send({
+        content: mention || undefined,
+        embeds: [resultEmbed],
+        files: fileAttachment ? [fileAttachment] : [],
+      });
     } catch (error) {
       console.error("Error sending result message:", error);
     }
@@ -719,10 +749,8 @@ export class ClaudeManager {
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
 
-    const channelName = this.channelNames.get(channelId);
-    if (!channelName) return;
-
-    const workingDir = path.join(this.baseFolder, channelName);
+    const workingDir = this.getWorkingDir(channelId);
+    if (!workingDir) return;
 
     // Common image extensions
     const imageExtensions = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"];

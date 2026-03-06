@@ -2,18 +2,34 @@ import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } from "discord.js";
 import type { ClaudeManager } from '../claude/manager.js';
 import { CommandHandler } from './commands.js';
 import type { MCPPermissionServer } from '../mcp/server.js';
 import { MessageQueue } from '../queue/message-queue.js';
 import type { SettingsStore } from '../settings/settings-store.js';
+import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath } from '../utils/worktree.js';
+
+interface PendingWorktreeConfirmation {
+  message: any;
+  parentChannelName: string;
+  threadName: string;
+  branchName: string;
+  sourceBranch: string;
+  prompt: string;
+  imageUrls: string[];
+}
 
 export class DiscordBot {
   public client: Client; // Make public so MCP server can access it
   private commandHandler: CommandHandler;
   private mcpServer?: MCPPermissionServer;
   private messageQueue: MessageQueue;
+  private pendingWorktreeConfirmations = new Map<string, PendingWorktreeConfirmation>();
+  private baseFolder: string;
 
   constructor(
     private claudeManager: ClaudeManager,
@@ -29,6 +45,7 @@ export class DiscordBot {
       ],
     });
 
+    this.baseFolder = process.env.BASE_FOLDER || "";
     this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings);
     this.messageQueue = new MessageQueue();
     this.setupEventHandlers();
@@ -132,6 +149,15 @@ export class DiscordBot {
             if (pm.handleApprovalInteraction(interaction)) return;
           }
         }
+
+        // Worktree confirmation buttons
+        if (interaction.isButton()) {
+          const customId = interaction.customId;
+          if (customId.startsWith('wt-confirm:') || customId.startsWith('wt-cancel:')) {
+            await this.handleWorktreeConfirmation(interaction);
+            return;
+          }
+        }
       }
 
       // Handle /clear — also clear the queue and threads
@@ -195,10 +221,32 @@ export class DiscordBot {
     }
 
     const channelId = message.channelId;
-    const channelName =
-      message.channel && "name" in message.channel
+    const isThread = message.channel?.isThread?.();
+
+    // For threads: check if this is a reply to a worktree confirmation prompt
+    if (isThread) {
+      const pending = this.pendingWorktreeConfirmations.get(channelId);
+      if (pending) {
+        // User replied with a custom branch name
+        pending.branchName = message.content.trim();
+        await this.executeWorktreeCreation(channelId, pending);
+        return;
+      }
+    }
+
+    let channelName: string;
+    let threadName: string | undefined;
+
+    if (isThread) {
+      // Thread: parent channel = repo, thread name = worktree
+      const parentChannel = message.channel.parent;
+      channelName = parentChannel?.name || "default";
+      threadName = message.channel.name;
+    } else {
+      channelName = message.channel && "name" in message.channel
         ? message.channel.name
         : "default";
+    }
 
     // Don't run in general channel
     if (channelName === "general") {
@@ -212,6 +260,18 @@ export class DiscordBot {
 
     if (imageAttachments.length > 0) {
       console.log(`Found ${imageAttachments.length} image(s):`, imageAttachments);
+    }
+
+    // If this is a thread, handle worktree setup
+    if (threadName) {
+      const existing = getExistingWorktree(this.baseFolder, channelName, threadName);
+      if (!existing) {
+        // Need to create worktree — prompt for confirmation
+        await this.promptWorktreeConfirmation(message, channelName, threadName, message.content, imageAttachments);
+        return;
+      }
+      // Worktree exists — set the working directory override and continue
+      this.claudeManager.setWorkingDirOverride(channelId, existing.path);
     }
 
     // Try to enqueue — if the channel is busy, the message gets queued
@@ -288,6 +348,135 @@ export class DiscordBot {
   }
 
   /**
+   * Prompt user to confirm worktree creation with branch name override option.
+   */
+  private async promptWorktreeConfirmation(
+    message: any,
+    parentChannelName: string,
+    threadName: string,
+    prompt: string,
+    imageUrls: string[]
+  ): Promise<void> {
+    const branchName = threadName;
+    const sourceBranch = "main";
+    const channelId = message.channelId;
+
+    this.pendingWorktreeConfirmations.set(channelId, {
+      message,
+      parentChannelName,
+      threadName,
+      branchName,
+      sourceBranch,
+      prompt,
+      imageUrls,
+    });
+
+    const wtPath = getWorktreePath(this.baseFolder, parentChannelName, threadName);
+    const embed = new EmbedBuilder()
+      .setTitle("🌿 Create Worktree?")
+      .setDescription(
+        `**Worktree:** \`${threadName}\`\n` +
+        `**Branch:** \`${branchName}\`\n` +
+        `**From:** \`${sourceBranch}\`\n` +
+        `**Path:** \`${wtPath}\`\n\n` +
+        `Reply with a different branch name to override, or click Confirm.`
+      )
+      .setColor(0xFFD700);
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`wt-confirm:${channelId}`)
+        .setLabel("Confirm")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`wt-cancel:${channelId}`)
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    await message.channel.send({ embeds: [embed], components: [row] });
+  }
+
+  /**
+   * Handle worktree confirmation button clicks.
+   */
+  private async handleWorktreeConfirmation(interaction: any): Promise<void> {
+    const customId = interaction.customId as string;
+    const channelId = customId.split(":")[1];
+    const pending = this.pendingWorktreeConfirmations.get(channelId);
+
+    if (!pending) {
+      await interaction.reply({ content: "No pending worktree confirmation.", ephemeral: true });
+      return;
+    }
+
+    if (customId.startsWith("wt-cancel:")) {
+      this.pendingWorktreeConfirmations.delete(channelId);
+      await interaction.update({
+        embeds: [new EmbedBuilder().setTitle("❌ Worktree creation cancelled").setColor(0xFF0000)],
+        components: [],
+      });
+      return;
+    }
+
+    // wt-confirm
+    await interaction.update({
+      embeds: [new EmbedBuilder().setTitle("⏳ Creating worktree...").setColor(0xFFD700)],
+      components: [],
+    });
+
+    await this.executeWorktreeCreation(channelId, pending);
+  }
+
+  /**
+   * Execute worktree creation and then process the original message.
+   */
+  private async executeWorktreeCreation(channelId: string, pending: PendingWorktreeConfirmation): Promise<void> {
+    this.pendingWorktreeConfirmations.delete(channelId);
+
+    try {
+      const wtInfo = createWorktree(
+        this.baseFolder,
+        pending.parentChannelName,
+        pending.threadName,
+        pending.branchName,
+        pending.sourceBranch
+      );
+
+      await pending.message.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("✅ Worktree Created")
+            .setDescription(`**Branch:** \`${wtInfo.branch}\`\n**Path:** \`${wtInfo.path}\``)
+            .setColor(0x00FF00),
+        ],
+      });
+
+      // Set working directory override and process the message
+      this.claudeManager.setWorkingDirOverride(channelId, wtInfo.path);
+
+      const wasQueued = await this.messageQueue.enqueue(
+        channelId, pending.message, pending.parentChannelName, pending.prompt, pending.imageUrls
+      );
+      if (!wasQueued) {
+        await this.processMessage(
+          pending.message, channelId, pending.parentChannelName, pending.prompt, pending.imageUrls
+        );
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      await pending.message.channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("❌ Worktree Creation Failed")
+            .setDescription(errorMsg)
+            .setColor(0xFF0000),
+        ],
+      });
+    }
+  }
+
+  /**
    * Clean up all threads in a channel (delete bot-created threads)
    */
   async cleanupThreads(channelId: string): Promise<number> {
@@ -299,8 +488,8 @@ export class DiscordBot {
       let deleted = 0;
 
       for (const thread of threads.threads.values()) {
-        // Only delete threads created by the bot
-        if (thread.ownerId === this.client.user?.id) {
+        // Only delete Task threads created by the bot (skip worktree threads)
+        if (thread.ownerId === this.client.user?.id && thread.name.startsWith("Task: ")) {
           try {
             await thread.delete();
             deleted++;
@@ -314,7 +503,7 @@ export class DiscordBot {
       try {
         const archivedThreads = await (channel as any).threads.fetchArchived();
         for (const thread of archivedThreads.threads.values()) {
-          if (thread.ownerId === this.client.user?.id) {
+          if (thread.ownerId === this.client.user?.id && thread.name.startsWith("Task: ")) {
             try {
               await thread.delete();
               deleted++;
