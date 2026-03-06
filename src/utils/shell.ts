@@ -14,6 +14,10 @@ export interface DiscordContext {
   messageId?: string;
 }
 
+export function isRawCommand(prompt: string): boolean {
+  return prompt.startsWith("/") || prompt.startsWith("--");
+}
+
 export function buildClaudeCommand(
   workingDir: string,
   prompt: string,
@@ -22,7 +26,7 @@ export function buildClaudeCommand(
   model: string = "opus",
   imageUrls?: string[]
 ): string {
-  let escapedPrompt = escapeShellString(prompt);
+  const raw = isRawCommand(prompt);
 
   // Create session-specific MCP config in /tmp
   const sessionMcpConfigPath = createSessionMcpConfig(discordContext);
@@ -35,14 +39,21 @@ export function buildClaudeCommand(
     model,
   ];
 
-  // Add images if provided
-  if (imageUrls && imageUrls.length > 0) {
-    for (const imageUrl of imageUrls) {
-      commandParts.push("--image", imageUrl);
+  if (raw) {
+    // Raw CLI command: pass arguments directly without -p wrapper
+    commandParts.push(...prompt.split(/\s+/));
+  } else {
+    // Normal prompt mode
+    if (imageUrls && imageUrls.length > 0) {
+      for (const imageUrl of imageUrls) {
+        commandParts.push("--image", imageUrl);
+      }
     }
+
+    commandParts.push("-p", escapeShellString(prompt));
   }
 
-  commandParts.push("-p", escapedPrompt, "--verbose");
+  commandParts.push("--verbose");
 
   // Always use Accept Edits permission mode
   commandParts.push("--permission-mode", "acceptEdits");
@@ -50,7 +61,7 @@ export function buildClaudeCommand(
   // Add session-specific MCP configuration
   commandParts.push("--mcp-config", sessionMcpConfigPath);
   commandParts.push("--permission-prompt-tool", "mcp__discord-permissions__approve_tool");
-  
+
   // Add allowed tools - we'll let the MCP server handle permissions
   commandParts.push("--allowedTools", "mcp__discord-permissions");
 

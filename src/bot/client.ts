@@ -12,6 +12,7 @@ import type { MCPPermissionServer } from '../mcp/server.js';
 import { MessageQueue } from '../queue/message-queue.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath } from '../utils/worktree.js';
+import { isRawCommand } from '../utils/shell.js';
 
 interface PendingWorktreeConfirmation {
   message: any;
@@ -306,7 +307,11 @@ export class DiscordBot {
       const statusEmbed = new EmbedBuilder()
         .setColor(0xFFD700); // Yellow for startup
 
-      if (isNewSession) {
+      if (isRawCommand(prompt)) {
+        statusEmbed
+          .setTitle("⚡ Running Command")
+          .setDescription(`\`${prompt}\``);
+      } else if (isNewSession) {
         statusEmbed
           .setTitle("🆕 Starting New Session")
           .setDescription("Initializing Claude Code...");
