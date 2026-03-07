@@ -13,6 +13,8 @@ import { MessageQueue } from '../queue/message-queue.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath } from '../utils/worktree.js';
 import { isRawCommand } from '../utils/shell.js';
+import { exec } from 'child_process';
+import * as path from 'path';
 
 interface PendingWorktreeConfirmation {
   message: any;
@@ -254,6 +256,22 @@ export class DiscordBot {
       return;
     }
 
+    // Shell command: messages starting with - (but not --) run directly in the shell
+    if (message.content.startsWith("-") && !message.content.startsWith("--")) {
+      const shellCmd = message.content.slice(1).trim();
+      if (shellCmd) {
+        let workingDir: string;
+        if (threadName) {
+          const existing = getExistingWorktree(this.baseFolder, channelName, threadName);
+          workingDir = existing?.path || path.join(this.baseFolder, channelName);
+        } else {
+          workingDir = path.join(this.baseFolder, channelName);
+        }
+        await this.runShellCommand(message, shellCmd, workingDir);
+        return;
+      }
+    }
+
     // Extract image attachments if any
     const imageAttachments = Array.from(message.attachments?.values() || [])
       .filter((att: any) => att.contentType?.startsWith("image/"))
@@ -350,6 +368,41 @@ export class DiscordBot {
         console.error("Failed to send error message:", sendError);
       }
     }
+  }
+
+  /**
+   * Run a shell command in the given working directory and post output to Discord.
+   */
+  private async runShellCommand(message: any, command: string, cwd: string): Promise<void> {
+    const statusEmbed = new EmbedBuilder()
+      .setTitle("⚡ Running Shell Command")
+      .setDescription(`\`${command}\``)
+      .setColor(0xFFD700);
+
+    const reply = await message.channel.send({ embeds: [statusEmbed] });
+
+    exec(command, { cwd, timeout: 120_000 }, async (error, stdout, stderr) => {
+      const output = (stdout || "") + (stderr || "");
+      const truncated = output.length > 1900
+        ? output.slice(0, 1900) + "\n...(truncated)"
+        : output;
+
+      const resultEmbed = new EmbedBuilder()
+        .setTitle(error ? "❌ Command Failed" : "✅ Command Complete")
+        .setColor(error ? 0xFF0000 : 0x00FF00);
+
+      if (truncated.trim()) {
+        resultEmbed.setDescription(`\`\`\`\n${truncated}\n\`\`\``);
+      } else {
+        resultEmbed.setDescription("*(no output)*");
+      }
+
+      try {
+        await reply.edit({ embeds: [resultEmbed] });
+      } catch (e) {
+        console.error("Failed to update shell command result:", e);
+      }
+    });
   }
 
   /**
