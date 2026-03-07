@@ -258,7 +258,7 @@ export class DiscordBot {
 
     // Shell command: messages starting with - (but not --) run directly in the shell
     if (message.content.startsWith("-") && !message.content.startsWith("--")) {
-      const shellCmd = message.content.slice(1).trim();
+      let shellCmd = message.content.slice(1).trim();
       if (shellCmd) {
         let workingDir: string;
         if (threadName) {
@@ -266,6 +266,13 @@ export class DiscordBot {
           workingDir = existing?.path || path.join(this.baseFolder, channelName);
         } else {
           workingDir = path.join(this.baseFolder, channelName);
+        }
+        // Auto-inject --resume for claude commands so they target the current session
+        if (shellCmd.startsWith("claude ")) {
+          const sessionId = this.claudeManager.getSessionId(channelId);
+          if (sessionId) {
+            shellCmd = shellCmd.replace("claude ", `claude --resume ${sessionId} `);
+          }
         }
         await this.runShellCommand(message, shellCmd, workingDir);
         return;

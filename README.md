@@ -179,7 +179,9 @@ If the worktree already exists (e.g., you created it locally with `git worktree 
 
 ### Raw CLI commands
 
-Messages starting with `/` or `--` are passed directly to Claude Code as CLI arguments instead of as a prompt. This lets you run interactive commands like `/compact` or `/cost` directly from Discord.
+Messages starting with `--` are passed directly to Claude Code as CLI arguments instead of as a prompt.
+
+Messages starting with `-` (single dash) execute shell commands in the project directory. For Claude CLI interactive commands, use the shell prefix: `-claude /usage`, `-claude /compact`, etc. The bot auto-injects `--resume` so these target the current session.
 
 ## How It Works
 

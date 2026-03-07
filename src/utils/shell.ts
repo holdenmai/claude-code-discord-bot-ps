@@ -15,7 +15,7 @@ export interface DiscordContext {
 }
 
 export function isRawCommand(prompt: string): boolean {
-  return prompt.startsWith("/") || prompt.startsWith("--");
+  return prompt.startsWith("--");
 }
 
 export function buildClaudeCommand(
