@@ -1,15 +1,18 @@
 {
   "permissions": {
+	"acceptEdits": "acceptEdits",
     "allow": [
+      "Bash(find:*)",
+	  "Bash(npm run *)",
+      "Bash(git commit *)",
+      "Bash(git * main)",
+      "Bash(* --version)",
+      "Bash(* --help *)",
       "Bash(bun add:*)",
       "Bash(mkdir:*)",
       "Bash(bun install:*)",
       "Bash(bun run:*)",
-      "Bash(git commit:*)",
-      "Bash(git push:*)",
-      "Bash(git add:*)",
       "Bash(find:*)"
-    ],
-    "deny": []
+    ]
   }
 }
