@@ -146,7 +146,15 @@ Type any message in a channel that corresponds to a repository folder. The bot w
 ### Commands
 
 - **Any message**: Runs Claude Code with your message as the prompt
+- **`-command`**: Runs a shell command in the project directory (e.g., `-git status`, `-ls -la`)
+- **`--flag`**: Passes raw CLI arguments to Claude Code (e.g., `--model sonnet`)
 - **/clear**: Resets the current channel's session (starts fresh next time)
+- **/kill**: Kill the running Claude Code process in this channel
+- **/killall**: Kill all running Claude Code processes
+- **/model**: Set the Claude model for this channel (sonnet/opus/haiku)
+- **/add**: Create a channel for a project folder (with autocomplete)
+- **/update**: Pull latest changes and restart the bot
+- **/init**: Set this channel's category as the home for startup links
 
 ### Example
 
@@ -177,11 +185,22 @@ Discord threads can be used to work on feature branches within a project using [
 
 If the worktree already exists (e.g., you created it locally with `git worktree add`), the bot picks it up automatically with no confirmation needed.
 
-### Raw CLI commands
+### Message prefixes
 
-Messages starting with `--` are passed directly to Claude Code as CLI arguments instead of as a prompt.
+| Prefix | Behavior | Example |
+|--------|----------|---------|
+| *(none)* | Send as a prompt to Claude Code | `fix the login bug` |
+| `-` | Run as a shell command | `-git status` |
+| `--` | Pass as raw CLI args to Claude Code | `--model sonnet` |
 
-Messages starting with `-` (single dash) execute shell commands in the project directory. For Claude CLI interactive commands, use the shell prefix: `-claude /usage`, `-claude /compact`, etc. The bot auto-injects `--resume` so these target the current session.
+Shell commands run in the channel's project directory (or worktree for threads). For Claude CLI interactive commands like `/usage` or `/compact`, use the shell prefix:
+
+```
+-claude /usage
+-claude /compact
+```
+
+The bot auto-injects `--resume` into `claude` shell commands so they target the current session.
 
 ## How It Works
 
