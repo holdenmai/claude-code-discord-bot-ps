@@ -2,12 +2,12 @@ import { spawn } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import { EmbedBuilder, AttachmentBuilder } from "discord.js";
-import type { SDKMessage } from "../types/index.js";
+import type { SDKMessage, CompletionStatus } from "../types/index.js";
 import { buildClaudeCommand, type DiscordContext } from "../utils/shell.js";
 import { DatabaseManager } from "../db/database.js";
 import type { SettingsStore } from "../settings/settings-store.js";
 
-export type OnCompleteCallback = (channelId: string, success: boolean, originalMessage: any) => void;
+export type OnCompleteCallback = (channelId: string, status: CompletionStatus, originalMessage: any) => void;
 
 export class ClaudeManager {
   private db: DatabaseManager;
@@ -123,7 +123,7 @@ export class ClaudeManager {
     this.onCompleteCallback = callback;
   }
 
-  private notifyComplete(channelId: string, success: boolean): void {
+  private notifyComplete(channelId: string, status: CompletionStatus): void {
     if (this.completionNotified.has(channelId)) return;
     this.completionNotified.add(channelId);
 
@@ -131,7 +131,7 @@ export class ClaudeManager {
 
     const originalMessage = this.originalMessages.get(channelId);
     if (this.onCompleteCallback) {
-      this.onCompleteCallback(channelId, success, originalMessage);
+      this.onCompleteCallback(channelId, status, originalMessage);
     }
   }
 
@@ -400,7 +400,7 @@ export class ClaudeManager {
       this.channelProcesses.delete(channelId);
 
       // Notify completion (close event as fallback — result handler is primary)
-      this.notifyComplete(channelId, code === 0 || code === null);
+      this.notifyComplete(channelId, "failed");
 
       if (code !== 0 && code !== null) {
         // Process failed - send error embed to Discord
@@ -447,7 +447,7 @@ export class ClaudeManager {
       this.channelProcesses.delete(channelId);
 
       // Notify completion on error
-      this.notifyComplete(channelId, false);
+      this.notifyComplete(channelId, "failed");
 
       // Send error to Discord
       const channel = this.channelMessages.get(channelId)?.channel;
@@ -706,7 +706,7 @@ export class ClaudeManager {
     }
 
     // Notify completion
-    this.notifyComplete(channelId, success);
+    this.notifyComplete(channelId, success ? "success" : "partial");
 
     console.log("Got result message, cleaning up process tracking");
   }

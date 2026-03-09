@@ -56,3 +56,23 @@ export interface Config {
   allowedUserId: string;
   baseFolder: string;
 }
+
+export type CompletionStatus = "success" | "partial" | "failed";
+
+export interface ReactionConfig {
+  enabled: boolean;
+  processing: string;
+  success: string;
+  partial: string;
+  failed: string;
+}
+
+export function getReactionConfig(): ReactionConfig {
+  return {
+    enabled: process.env.ENABLE_REACTIONS === "true",
+    processing: process.env.REACTION_PROCESSING || "🤝",
+    success: process.env.REACTION_SUCCESS || "👍",
+    partial: process.env.REACTION_PARTIAL || "🤞",
+    failed: process.env.REACTION_FAILED || "👎",
+  };
+}

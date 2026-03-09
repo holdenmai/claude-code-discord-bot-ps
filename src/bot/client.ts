@@ -11,10 +11,11 @@ import { CommandHandler } from './commands.js';
 import type { MCPPermissionServer } from '../mcp/server.js';
 import { MessageQueue } from '../queue/message-queue.js';
 import type { SettingsStore } from '../settings/settings-store.js';
-import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath } from '../utils/worktree.js';
+import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath, sanitizeWorktreeName } from '../utils/worktree.js';
 import { isRawCommand } from '../utils/shell.js';
 import { exec } from 'child_process';
 import * as path from 'path';
+import { getReactionConfig, type ReactionConfig, type CompletionStatus } from '../types/index.js';
 
 interface PendingWorktreeConfirmation {
   message: any;
@@ -33,6 +34,7 @@ export class DiscordBot {
   private messageQueue: MessageQueue;
   private pendingWorktreeConfirmations = new Map<string, PendingWorktreeConfirmation>();
   private baseFolder: string;
+  private reactionConfig: ReactionConfig;
 
   constructor(
     private claudeManager: ClaudeManager,
@@ -49,6 +51,7 @@ export class DiscordBot {
     });
 
     this.baseFolder = process.env.BASE_FOLDER || "";
+    this.reactionConfig = getReactionConfig();
     this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings);
     this.messageQueue = new MessageQueue();
     this.setupEventHandlers();
@@ -66,9 +69,22 @@ export class DiscordBot {
    * Wire up the completion callback so the queue advances after each run.
    */
   private setupCompletionCallback(): void {
-    this.claudeManager.setOnCompleteCallback(async (channelId, success, originalMessage) => {
-      // React on the original user message
-      await this.messageQueue.markComplete(originalMessage, success);
+    this.claudeManager.setOnCompleteCallback(async (channelId, status, originalMessage) => {
+      // Swap reactions on the original user message
+      if (this.reactionConfig.enabled && originalMessage) {
+        try {
+          // Remove processing reaction
+          const processingReactions = originalMessage.reactions?.cache?.get(this.reactionConfig.processing);
+          if (processingReactions) {
+            await processingReactions.users.remove(originalMessage.client?.user?.id).catch(() => {});
+          }
+          // Add result reaction
+          const emoji = this.reactionConfig[status];
+          await originalMessage.react(emoji);
+        } catch (error) {
+          console.error("Failed to update reactions:", error);
+        }
+      }
 
       // Dequeue the next message for this channel
       const next = await this.messageQueue.dequeueNext(channelId);
@@ -325,6 +341,11 @@ export class DiscordBot {
       // Track the original message for reaction updates
       this.claudeManager.setOriginalMessage(channelId, message);
 
+      // Add processing reaction
+      if (this.reactionConfig.enabled) {
+        try { await message.react(this.reactionConfig.processing); } catch {}
+      }
+
       // Check if we have an existing session
       const isNewSession = !sessionId;
 
@@ -422,7 +443,7 @@ export class DiscordBot {
     prompt: string,
     imageUrls: string[]
   ): Promise<void> {
-    const branchName = threadName;
+    const branchName = sanitizeWorktreeName(threadName);
     const sourceBranch = "main";
     const channelId = message.channelId;
 

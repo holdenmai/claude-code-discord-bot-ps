@@ -64,15 +64,9 @@ export class MessageQueue {
   }
 
   /**
-   * React with ✅ or ❌ on the original user message to indicate completion.
+   * No-op kept for interface compatibility. Reactions are now handled by client.ts.
    */
-  async markComplete(message: any, success: boolean): Promise<void> {
-    if (!message) return;
-    try {
-      await message.react(success ? "✅" : "❌");
-    } catch (error) {
-      console.error("MessageQueue: Failed to react completion:", error);
-    }
+  async markComplete(_message: any, _success: boolean): Promise<void> {
   }
 
   /**

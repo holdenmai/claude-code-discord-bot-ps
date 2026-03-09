@@ -2,6 +2,23 @@ import * as path from "path";
 import * as fs from "fs";
 import { execSync } from "child_process";
 
+/**
+ * Sanitize a Discord thread name into a valid git branch / directory name.
+ * Mirrors Discord's channel-name convention: lowercase, hyphens for spaces,
+ * strip characters that are invalid in git refs or filesystem paths.
+ */
+export function sanitizeWorktreeName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/\s+/g, "-")           // spaces → hyphens
+    .replace(/[~^:?*\[\]\\@{}.]+/g, "") // strip git-invalid chars
+    .replace(/\.{2,}/g, "-")        // collapse .. sequences
+    .replace(/-{2,}/g, "-")         // collapse multiple hyphens
+    .replace(/^-+|-+$/g, "")        // trim leading/trailing hyphens
+    .replace(/\.lock$/i, "")        // strip trailing .lock
+    || "worktree";                   // fallback if everything was stripped
+}
+
 export interface WorktreeInfo {
   path: string;
   branch: string;
@@ -13,7 +30,7 @@ export interface WorktreeInfo {
  * Worktrees live at: BASE_FOLDER/channel-name/.worktrees/thread-name
  */
 export function getWorktreePath(baseFolder: string, channelName: string, threadName: string): string {
-  return path.join(baseFolder, channelName, ".worktrees", threadName);
+  return path.join(baseFolder, channelName, ".worktrees", sanitizeWorktreeName(threadName));
 }
 
 /**
