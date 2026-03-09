@@ -246,6 +246,10 @@ export class DiscordBot {
   private async handleMessage(message: any): Promise<void> {
     if (message.author.bot) return;
 
+    // Ignore system messages (thread created, pin notifications, etc.)
+    // MessageType.Default = 0, MessageType.Reply = 19
+    if (message.type !== 0 && message.type !== 19) return;
+
     console.log("MESSAGE CREATED", message.id);
 
     if (message.author.id !== this.allowedUserId) {
