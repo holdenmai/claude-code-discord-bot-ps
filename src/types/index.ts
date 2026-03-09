@@ -74,6 +74,21 @@ export interface ActivityLinkConfig {
   style: ActivityPostStyle;
 }
 
+export type PromptLinkStyle = "none" | "link" | "plaintext" | "embed";
+
+export interface PromptLinkConfig {
+  enabled: boolean;
+  style: PromptLinkStyle;
+}
+
+export function getPromptLinkConfig(): PromptLinkConfig {
+  const style = (process.env.PROMPT_LINK_STYLE as PromptLinkStyle) || "link";
+  return {
+    enabled: style !== "none",
+    style,
+  };
+}
+
 export function getActivityLinkConfig(): ActivityLinkConfig {
   return {
     enabled: process.env.ACTIVITY_LINKS === "true",

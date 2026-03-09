@@ -2,7 +2,8 @@ import { spawn } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 import { EmbedBuilder, AttachmentBuilder } from "discord.js";
-import type { SDKMessage, CompletionStatus } from "../types/index.js";
+import type { SDKMessage, CompletionStatus, PromptLinkConfig } from "../types/index.js";
+import { getPromptLinkConfig } from "../types/index.js";
 import { buildClaudeCommand, type DiscordContext } from "../utils/shell.js";
 import { DatabaseManager } from "../db/database.js";
 import type { SettingsStore } from "../settings/settings-store.js";
@@ -46,10 +47,12 @@ export class ClaudeManager {
   private workingDirOverrides = new Map<string, string>();
 
   private settings?: SettingsStore;
+  private promptLinkConfig: PromptLinkConfig;
 
   constructor(private baseFolder: string, settings?: SettingsStore) {
     this.db = new DatabaseManager();
     this.settings = settings;
+    this.promptLinkConfig = getPromptLinkConfig();
     // Clean up old sessions on startup
     this.db.cleanupOldSessions();
 
@@ -693,6 +696,13 @@ export class ClaudeManager {
         .setTitle("❌ Session Failed")
         .setDescription(`Task failed: ${parsed.subtype}`)
         .setColor(0xFF0000); // Red for failure
+    }
+
+    // Add prompt link to result embed
+    const originalMsg = this.originalMessages.get(channelId);
+    if (this.promptLinkConfig.enabled && originalMsg) {
+      const promptUrl = `https://discord.com/channels/${originalMsg.guildId}/${originalMsg.channelId}/${originalMsg.id}`;
+      resultEmbed.addFields({ name: "Prompt", value: `[Jump to prompt](${promptUrl})` });
     }
 
     try {

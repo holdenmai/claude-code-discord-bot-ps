@@ -28,7 +28,7 @@ describe('buildClaudeCommand', () => {
     const command = buildClaudeCommand('/test/dir', 'hello world');
     expect(command).toContain("claude");
     expect(command).toContain("--output-format stream-json");
-    expect(command).toContain("--model sonnet");
+    expect(command).toContain("--model opus");
     expect(command).toContain("-p 'hello world'");
     expect(command).toContain("--verbose");
     expect(command).not.toContain("cd /test/dir");
