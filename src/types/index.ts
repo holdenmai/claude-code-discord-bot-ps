@@ -67,6 +67,20 @@ export interface ReactionConfig {
   failed: string;
 }
 
+export type ActivityPostStyle = "plaintext" | "embed" | "link";
+
+export interface ActivityLinkConfig {
+  enabled: boolean;
+  style: ActivityPostStyle;
+}
+
+export function getActivityLinkConfig(): ActivityLinkConfig {
+  return {
+    enabled: process.env.ACTIVITY_LINKS === "true",
+    style: (process.env.ACTIVITY_LINK_STYLE as ActivityPostStyle) || "plaintext",
+  };
+}
+
 export function getReactionConfig(): ReactionConfig {
   return {
     enabled: process.env.ENABLE_REACTIONS === "true",

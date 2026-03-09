@@ -15,7 +15,7 @@ import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath, s
 import { isRawCommand } from '../utils/shell.js';
 import { exec } from 'child_process';
 import * as path from 'path';
-import { getReactionConfig, type ReactionConfig, type CompletionStatus } from '../types/index.js';
+import { getReactionConfig, getActivityLinkConfig, type ReactionConfig, type ActivityLinkConfig, type CompletionStatus } from '../types/index.js';
 
 interface PendingWorktreeConfirmation {
   message: any;
@@ -35,6 +35,7 @@ export class DiscordBot {
   private pendingWorktreeConfirmations = new Map<string, PendingWorktreeConfirmation>();
   private baseFolder: string;
   private reactionConfig: ReactionConfig;
+  private activityLinkConfig: ActivityLinkConfig;
 
   constructor(
     private claudeManager: ClaudeManager,
@@ -52,6 +53,7 @@ export class DiscordBot {
 
     this.baseFolder = process.env.BASE_FOLDER || "";
     this.reactionConfig = getReactionConfig();
+    this.activityLinkConfig = getActivityLinkConfig();
     this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings);
     this.messageQueue = new MessageQueue();
     this.setupEventHandlers();
@@ -84,6 +86,17 @@ export class DiscordBot {
         } catch (error) {
           console.error("Failed to update reactions:", error);
         }
+      }
+
+      // Post activity link for completion
+      if (originalMessage) {
+        const isThread = originalMessage.channel?.isThread?.();
+        const chName = isThread
+          ? originalMessage.channel.parent?.name || "default"
+          : originalMessage.channel?.name || "default";
+        this.postActivityLink(originalMessage, "complete", chName).catch(err =>
+          console.error("Failed to post complete activity link:", err)
+        );
       }
 
       // Dequeue the next message for this channel
@@ -271,6 +284,11 @@ export class DiscordBot {
     if (channelName === "general") {
       return;
     }
+
+    // Post activity link for user prompt (fire and forget)
+    this.postActivityLink(message, "prompt", channelName).catch(err =>
+      console.error("Failed to post prompt activity link:", err)
+    );
 
     // Shell command: messages starting with - (but not --) run directly in the shell
     if (message.content.startsWith("-") && !message.content.startsWith("--")) {
@@ -559,6 +577,97 @@ export class DiscordBot {
             .setColor(0xFF0000),
         ],
       });
+    }
+  }
+
+  /**
+   * Post an activity link to the "general" channel in the home category,
+   * and to the parent channel if the source message is in a thread.
+   */
+  private async postActivityLink(
+    message: any,
+    event: "prompt" | "complete",
+    channelName: string,
+  ): Promise<void> {
+    if (!this.activityLinkConfig.enabled) return;
+
+    const home = this.settings?.getHomeCategory();
+    if (!home) return;
+
+    const messageUrl = `https://discord.com/channels/${message.guildId}/${message.channelId}/${message.id}`;
+    const isThread = message.channel?.isThread?.();
+
+    // Build the content based on style
+    const content = this.formatActivityLink(event, channelName, messageUrl, isThread ? message.channel.name : undefined);
+    if (!content) return;
+
+    const targets: string[] = [];
+
+    // Find "general" channel in home category
+    try {
+      const guild = await this.client.guilds.fetch(home.guildId);
+      const channels = await guild.channels.fetch();
+      const generalChannel = channels.find(
+        (ch): ch is NonNullable<typeof ch> =>
+          ch !== null && ch.parentId === home.categoryId && ch.name === "general"
+      );
+      if (generalChannel) {
+        targets.push(generalChannel.id);
+      }
+    } catch (error) {
+      console.error("Failed to find general channel:", error);
+    }
+
+    // If in a thread, also post to the parent channel
+    if (isThread && message.channel.parentId) {
+      const parentId = message.channel.parentId;
+      // Don't double-post if parent IS general
+      if (!targets.includes(parentId)) {
+        targets.push(parentId);
+      }
+    }
+
+    // Post to all targets
+    for (const targetId of targets) {
+      try {
+        const channel = await this.client.channels.fetch(targetId);
+        if (channel && 'send' in channel) {
+          if (this.activityLinkConfig.style === "embed") {
+            const embed = new EmbedBuilder()
+              .setDescription(content)
+              .setColor(event === "prompt" ? 0x5865F2 : 0x57F287)
+              .setTimestamp();
+            await (channel as any).send({ embeds: [embed] });
+          } else {
+            await (channel as any).send(content);
+          }
+        }
+      } catch (error) {
+        console.error(`Failed to post activity link to ${targetId}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Format an activity link message based on the configured style.
+   */
+  private formatActivityLink(
+    event: "prompt" | "complete",
+    channelName: string,
+    messageUrl: string,
+    threadName?: string,
+  ): string | null {
+    const icon = event === "prompt" ? "📨" : "✅";
+    const action = event === "prompt" ? "Prompt" : "Complete";
+    const location = threadName ? `#${channelName}/${threadName}` : `#${channelName}`;
+
+    switch (this.activityLinkConfig.style) {
+      case "link":
+        return messageUrl;
+      case "embed":
+      case "plaintext":
+      default:
+        return `${icon} **${action}** in ${location} — [Jump](${messageUrl})`;
     }
   }
 
