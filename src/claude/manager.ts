@@ -698,6 +698,9 @@ export class ClaudeManager {
         .setColor(0xFF0000); // Red for failure
     }
 
+    // Notify completion early so the close handler doesn't race and mark it as failed
+    this.notifyComplete(channelId, success ? "success" : "partial");
+
     // Add prompt link to result embed
     const originalMsg = this.originalMessages.get(channelId);
     if (this.promptLinkConfig.enabled && originalMsg) {
@@ -714,9 +717,6 @@ export class ClaudeManager {
     } catch (error) {
       console.error("Error sending result message:", error);
     }
-
-    // Notify completion
-    this.notifyComplete(channelId, success ? "success" : "partial");
 
     console.log("Got result message, cleaning up process tracking");
   }
