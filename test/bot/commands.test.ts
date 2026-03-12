@@ -27,14 +27,15 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(7);
+      expect(commands).toHaveLength(8);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('model');
       expect(commands[3]!.name).toBe('killall');
       expect(commands[4]!.name).toBe('add');
-      expect(commands[5]!.name).toBe('update');
-      expect(commands[6]!.name).toBe('init');
+      expect(commands[5]!.name).toBe('plan');
+      expect(commands[6]!.name).toBe('update');
+      expect(commands[7]!.name).toBe('init');
     });
   });
 

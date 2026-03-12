@@ -4,6 +4,7 @@ import * as path from "path";
 interface SettingsData {
   models: Record<string, string>;
   allowedTools: Record<string, string[]>;
+  planMode: Record<string, boolean>;
   homeCategory?: { guildId: string; categoryId: string };
 }
 
@@ -25,7 +26,7 @@ export class SettingsStore {
     } catch (error) {
       console.error("SettingsStore: Error loading settings, using defaults:", error);
     }
-    return { models: {}, allowedTools: {} };
+    return { models: {}, allowedTools: {}, planMode: {} };
   }
 
   private save(): void {
@@ -74,6 +75,22 @@ export class SettingsStore {
 
   getAllChannelAllowedTools(): Record<string, string[]> {
     return { ...this.data.allowedTools };
+  }
+
+  // --- Plan mode settings ---
+
+  getPlanMode(channelId: string): boolean {
+    return this.data.planMode?.[channelId] || false;
+  }
+
+  setPlanMode(channelId: string, enabled: boolean): void {
+    if (!this.data.planMode) this.data.planMode = {};
+    this.data.planMode[channelId] = enabled;
+    this.save();
+  }
+
+  getAllPlanModes(): Record<string, boolean> {
+    return { ...(this.data.planMode || {}) };
   }
 
   // --- Home category settings ---

@@ -46,6 +46,9 @@ export class ClaudeManager {
   // Working directory overrides (for worktree threads)
   private workingDirOverrides = new Map<string, string>();
 
+  // Plan mode per channel
+  private channelPlanMode = new Map<string, boolean>();
+
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
 
@@ -56,11 +59,15 @@ export class ClaudeManager {
     // Clean up old sessions on startup
     this.db.cleanupOldSessions();
 
-    // Load persisted models from settings
+    // Load persisted settings
     if (settings) {
       const models = settings.getAllChannelModels();
       for (const [channelId, model] of Object.entries(models)) {
         this.channelModels.set(channelId, model);
+      }
+      const planModes = settings.getAllPlanModes();
+      for (const [channelId, enabled] of Object.entries(planModes)) {
+        this.channelPlanMode.set(channelId, enabled);
       }
     }
   }
@@ -267,6 +274,21 @@ export class ClaudeManager {
     return this.channelModels.get(channelId) || "opus";
   }
 
+  setPlanMode(channelId: string, enabled: boolean): void {
+    this.channelPlanMode.set(channelId, enabled);
+    this.settings?.setPlanMode(channelId, enabled);
+  }
+
+  isPlanMode(channelId: string): boolean {
+    return this.channelPlanMode.get(channelId) || false;
+  }
+
+  togglePlanMode(channelId: string): boolean {
+    const current = this.isPlanMode(channelId);
+    this.setPlanMode(channelId, !current);
+    return !current;
+  }
+
   private getWorkingDir(channelId: string): string | undefined {
     const override = this.workingDirOverrides.get(channelId);
     if (override) return override;
@@ -297,7 +319,8 @@ export class ClaudeManager {
     }
 
     const model = this.getModel(channelId);
-    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls);
+    const planMode = this.isPlanMode(channelId);
+    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls, planMode);
     console.log(`Running command: ${commandString}`);
 
     const claude = spawn("powershell.exe", ["-NoProfile", "-Command", commandString], {
@@ -510,7 +533,7 @@ export class ClaudeManager {
         const assistantEmbed = new EmbedBuilder()
           .setTitle("💬 Claude")
           .setDescription(content)
-          .setColor(0x7289DA); // Discord blurple
+          .setColor(this.isPlanMode(channelId) ? 0xE67E22 : 0x7289DA); // Orange for plan, blurple otherwise
 
         await channel.send({ embeds: [assistantEmbed] });
 
@@ -554,7 +577,7 @@ export class ClaudeManager {
 
         const toolEmbed = new EmbedBuilder()
           .setDescription(`⏳ ${toolMessage}`)
-          .setColor(0x0099FF); // Blue for tool calls
+          .setColor(this.isPlanMode(channelId) ? 0xE67E22 : 0x0099FF); // Orange for plan, blue otherwise
 
         const sentMessage = await channel.send({ embeds: [toolEmbed] });
 
@@ -671,6 +694,7 @@ export class ClaudeManager {
     // Create a final result embed
     const resultEmbed = new EmbedBuilder();
     const success = parsed.subtype === "success";
+    const planMode = this.isPlanMode(channelId);
 
     const EMBED_LIMIT = 4096;
     let fileAttachment: AttachmentBuilder | undefined;
@@ -688,9 +712,9 @@ export class ClaudeManager {
       description += suffix;
 
       resultEmbed
-        .setTitle("✅ Session Complete")
+        .setTitle(planMode ? "📋 Plan Complete" : "✅ Session Complete")
         .setDescription(description)
-        .setColor(0x00FF00); // Green for success
+        .setColor(planMode ? 0x9B59B6 : 0x00FF00); // Purple for plan, green for success
     } else {
       resultEmbed
         .setTitle("❌ Session Failed")

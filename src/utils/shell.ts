@@ -24,7 +24,8 @@ export function buildClaudeCommand(
   sessionId?: string,
   discordContext?: DiscordContext,
   model: string = "opus",
-  imageUrls?: string[]
+  imageUrls?: string[],
+  planMode: boolean = false
 ): string {
   const raw = isRawCommand(prompt);
 
@@ -55,8 +56,7 @@ export function buildClaudeCommand(
 
   commandParts.push("--verbose");
 
-  // Always use Accept Edits permission mode
-  commandParts.push("--permission-mode", "acceptEdits");
+  commandParts.push("--permission-mode", planMode ? "plan" : "acceptEdits");
 
   // Add session-specific MCP configuration
   commandParts.push("--mcp-config", sessionMcpConfigPath);

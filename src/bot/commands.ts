@@ -52,6 +52,9 @@ export class CommandHandler {
             .setAutocomplete(true)
         ),
       new SlashCommandBuilder()
+        .setName("plan")
+        .setDescription("Toggle plan mode for this channel (read-only, no edits)"),
+      new SlashCommandBuilder()
         .setName("update")
         .setDescription("Update the bot by pulling latest changes and restarting"),
       new SlashCommandBuilder()
@@ -121,6 +124,16 @@ export class CommandHandler {
       const model = interaction.options.getString("name");
       this.claudeManager.setModel(channelId, model);
       await interaction.reply(`Model set to **${model}** for this channel.`);
+    }
+
+    if (interaction.commandName === "plan") {
+      const channelId = interaction.channelId;
+      const enabled = this.claudeManager.togglePlanMode(channelId);
+      const icon = enabled ? "📋" : "✏️";
+      const msg = enabled
+        ? " Claude can explore and propose changes but won't edit files."
+        : " Claude can now edit files. Tell Claude to implement the plan to apply changes.";
+      await interaction.reply(`${icon} Plan mode **${enabled ? "enabled" : "disabled"}** for this channel.${msg}`);
     }
 
     if (interaction.commandName === "add") {

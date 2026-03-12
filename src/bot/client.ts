@@ -370,10 +370,12 @@ export class DiscordBot {
 
       // Check if we have an existing session
       const isNewSession = !sessionId;
+      const planMode = this.claudeManager.isPlanMode(channelId);
+      const planTag = planMode ? " 📋" : "";
 
       // Create status embed
       const statusEmbed = new EmbedBuilder()
-        .setColor(0xFFD700); // Yellow for startup
+        .setColor(planMode ? 0xE67E22 : 0xFFD700); // Orange for plan mode, yellow otherwise
 
       if (isRawCommand(prompt)) {
         statusEmbed
@@ -381,12 +383,12 @@ export class DiscordBot {
           .setDescription(`\`${prompt}\``);
       } else if (isNewSession) {
         statusEmbed
-          .setTitle("🆕 Starting New Session")
-          .setDescription("Initializing Claude Code...");
+          .setTitle(`🆕 Starting New Session${planTag}`)
+          .setDescription(planMode ? "Initializing Claude Code in **plan mode**..." : "Initializing Claude Code...");
       } else {
         statusEmbed
-          .setTitle("🔄 Continuing Session")
-          .setDescription(`**Session ID:** ${sessionId}\nResuming Claude Code...`);
+          .setTitle(`🔄 Continuing Session${planTag}`)
+          .setDescription(`**Session ID:** ${sessionId}\n${planMode ? "Resuming in **plan mode**..." : "Resuming Claude Code..."}`);
       }
 
       // Create initial Discord message
