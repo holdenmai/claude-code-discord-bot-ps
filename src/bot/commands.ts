@@ -60,6 +60,15 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("init")
         .setDescription("Set this channel's category as the home for startup links"),
+      new SlashCommandBuilder()
+        .setName("file")
+        .setDescription("Send a file from the project or Claude directory to chat")
+        .addStringOption((option: any) =>
+          option
+            .setName("path")
+            .setDescription("File path (relative to project folder or absolute)")
+            .setRequired(true)
+        ),
     ];
   }
 
@@ -142,6 +151,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "update") {
       await this.handleUpdateCommand(interaction);
+    }
+
+    if (interaction.commandName === "file") {
+      await this.handleFileCommand(interaction);
     }
 
     if (interaction.commandName === "init") {
@@ -228,6 +241,161 @@ export class CommandHandler {
       console.error("Error creating channel:", error);
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
+    }
+  }
+
+  /**
+   * Handle /file command - send a file's contents to Discord.
+   * Supports full paths, relative paths, and bare filenames.
+   * Bare filenames search .claude/ first, then the project directory.
+   */
+  private async handleFileCommand(interaction: any): Promise<void> {
+    const filePath = interaction.options.getString("path");
+    const channel = interaction.channel;
+
+    // Determine the project folder for this channel
+    const isThread = channel?.isThread?.();
+    const channelName = isThread
+      ? channel.parent?.name || "default"
+      : channel?.name || "default";
+    const projectDir = path.resolve(path.join(this.baseFolder, channelName));
+
+    // Determine if this is a bare filename (no directory separators)
+    const isBareFilename = !filePath.includes("/") && !filePath.includes("\\") && !path.isAbsolute(filePath);
+
+    let resolvedPath: string;
+
+    if (isBareFilename) {
+      // Search for the file: .claude/ first, then project directory
+      const matches = this.findFileByName(projectDir, filePath);
+
+      if (matches.length === 0) {
+        await interaction.reply({
+          content: `❌ File not found: \`${filePath}\`\nSearched in \`${projectDir}\``,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (matches.length > 1) {
+        const list = matches
+          .map((m, i) => `${i + 1}. \`${path.relative(projectDir, m)}\``)
+          .join("\n");
+        await interaction.reply({
+          content: `Multiple matches for \`${filePath}\`:\n${list}\n\nPlease use a more specific path.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      resolvedPath = matches[0]!;
+    } else {
+      // Resolve relative or absolute path
+      resolvedPath = path.isAbsolute(filePath)
+        ? path.resolve(filePath)
+        : path.resolve(path.join(projectDir, filePath));
+    }
+
+    // Security: file must be within the project directory
+    if (!resolvedPath.startsWith(projectDir + path.sep) && resolvedPath !== projectDir) {
+      await interaction.reply({
+        content: `❌ Access denied. File must be within \`${projectDir}\``,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Check file exists
+    if (!fs.existsSync(resolvedPath)) {
+      await interaction.reply({
+        content: `❌ File not found: \`${resolvedPath}\``,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Check it's a file, not a directory
+    const stats = fs.statSync(resolvedPath);
+    if (!stats.isFile()) {
+      await interaction.reply({
+        content: `❌ Not a file: \`${resolvedPath}\``,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Size limit: 500KB
+    const MAX_SIZE = 500 * 1024;
+    if (stats.size > MAX_SIZE) {
+      const sizeKB = Math.round(stats.size / 1024);
+      await interaction.reply({
+        content: `❌ File too large: ${sizeKB}KB (limit: 500KB)\n\`${resolvedPath}\``,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Send as attachment
+    try {
+      const fileName = path.basename(resolvedPath);
+      const relativePath = path.relative(projectDir, resolvedPath);
+      await interaction.reply({
+        content: `📄 \`${relativePath}\``,
+        files: [{ attachment: resolvedPath, name: fileName }],
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.reply({
+        content: `❌ Failed to send file: ${msg}`,
+        ephemeral: true,
+      });
+    }
+  }
+
+  /**
+   * Recursively search for files matching a given filename.
+   * Searches .claude/ directory first, then the rest of the project.
+   * Skips node_modules and .git directories.
+   */
+  private findFileByName(projectDir: string, fileName: string): string[] {
+    const matches: string[] = [];
+    const claudeDir = path.join(projectDir, ".claude");
+
+    // Search .claude/ first
+    if (fs.existsSync(claudeDir)) {
+      this.walkDir(claudeDir, fileName, matches);
+    }
+
+    // Then search the rest of the project
+    this.walkDir(projectDir, fileName, matches, new Set([".claude"]));
+
+    return matches;
+  }
+
+  /**
+   * Walk a directory tree collecting files that match the target filename.
+   */
+  private walkDir(dir: string, targetName: string, results: string[], skipDirs?: Set<string>): void {
+    const SKIP_ALWAYS = new Set(["node_modules", ".git", ".hg"]);
+    const MAX_RESULTS = 20;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (results.length >= MAX_RESULTS) return;
+
+      if (entry.isDirectory()) {
+        if (SKIP_ALWAYS.has(entry.name)) continue;
+        if (skipDirs?.has(entry.name)) continue;
+        this.walkDir(path.join(dir, entry.name), targetName, results);
+      } else if (entry.isFile() && entry.name === targetName) {
+        results.push(path.join(dir, entry.name));
+      }
     }
   }
 
