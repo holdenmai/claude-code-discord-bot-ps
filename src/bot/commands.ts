@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits } from "discord.js";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { spawn } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
@@ -247,7 +248,7 @@ export class CommandHandler {
   /**
    * Handle /file command - send a file's contents to Discord.
    * Supports full paths, relative paths, and bare filenames.
-   * Bare filenames search .claude/ first, then the project directory.
+   * Bare filenames search ~/.claude/ first, then the project directory.
    */
   private async handleFileCommand(interaction: any): Promise<void> {
     const filePath = interaction.options.getString("path");
@@ -260,18 +261,22 @@ export class CommandHandler {
       : channel?.name || "default";
     const projectDir = path.resolve(path.join(this.baseFolder, channelName));
 
+    // Allowed directories: project dir + global ~/.claude/
+    const claudeHomeDir = path.resolve(path.join(os.homedir(), ".claude"));
+    const allowedDirs = [projectDir, claudeHomeDir];
+
     // Determine if this is a bare filename (no directory separators)
     const isBareFilename = !filePath.includes("/") && !filePath.includes("\\") && !path.isAbsolute(filePath);
 
     let resolvedPath: string;
 
     if (isBareFilename) {
-      // Search for the file: .claude/ first, then project directory
-      const matches = this.findFileByName(projectDir, filePath);
+      // Search for the file: ~/.claude/ first, then project directory
+      const matches = this.findFileByName(claudeHomeDir, projectDir, filePath);
 
       if (matches.length === 0) {
         await interaction.reply({
-          content: `❌ File not found: \`${filePath}\`\nSearched in \`${projectDir}\``,
+          content: `❌ File not found: \`${filePath}\`\nSearched in \`${claudeHomeDir}\` and \`${projectDir}\``,
           ephemeral: true,
         });
         return;
@@ -279,7 +284,7 @@ export class CommandHandler {
 
       if (matches.length > 1) {
         const list = matches
-          .map((m, i) => `${i + 1}. \`${path.relative(projectDir, m)}\``)
+          .map((m, i) => `${i + 1}. \`${this.displayPath(m, allowedDirs)}\``)
           .join("\n");
         await interaction.reply({
           content: `Multiple matches for \`${filePath}\`:\n${list}\n\nPlease use a more specific path.`,
@@ -296,10 +301,13 @@ export class CommandHandler {
         : path.resolve(path.join(projectDir, filePath));
     }
 
-    // Security: file must be within the project directory
-    if (!resolvedPath.startsWith(projectDir + path.sep) && resolvedPath !== projectDir) {
+    // Security: file must be within an allowed directory
+    const isAllowed = allowedDirs.some(dir =>
+      resolvedPath.startsWith(dir + path.sep) || resolvedPath === dir
+    );
+    if (!isAllowed) {
       await interaction.reply({
-        content: `❌ Access denied. File must be within \`${projectDir}\``,
+        content: `❌ Access denied. File must be within the project or \`~/.claude/\``,
         ephemeral: true,
       });
       return;
@@ -338,9 +346,9 @@ export class CommandHandler {
     // Send as attachment
     try {
       const fileName = path.basename(resolvedPath);
-      const relativePath = path.relative(projectDir, resolvedPath);
+      const displayRelPath = this.displayPath(resolvedPath, allowedDirs);
       await interaction.reply({
-        content: `📄 \`${relativePath}\``,
+        content: `📄 \`${displayRelPath}\``,
         files: [{ attachment: resolvedPath, name: fileName }],
       });
     } catch (error) {
@@ -353,17 +361,39 @@ export class CommandHandler {
   }
 
   /**
+   * Build a readable display path relative to the best matching allowed directory.
+   */
+  private displayPath(filePath: string, allowedDirs: string[]): string {
+    for (const dir of allowedDirs) {
+      if (filePath.startsWith(dir + path.sep)) {
+        const rel = path.relative(dir, filePath);
+        // For ~/.claude/ files, prefix with ~/.claude/ for clarity
+        if (dir.endsWith(".claude")) {
+          return `~/.claude/${rel.replace(/\\/g, "/")}`;
+        }
+        return rel.replace(/\\/g, "/");
+      }
+    }
+    return filePath;
+  }
+
+  /**
    * Recursively search for files matching a given filename.
-   * Searches .claude/ directory first, then the rest of the project.
+   * Searches ~/.claude/ first, then the project directory.
    * Skips node_modules and .git directories.
    */
-  private findFileByName(projectDir: string, fileName: string): string[] {
+  private findFileByName(claudeHomeDir: string, projectDir: string, fileName: string): string[] {
     const matches: string[] = [];
-    const claudeDir = path.join(projectDir, ".claude");
 
-    // Search .claude/ first
-    if (fs.existsSync(claudeDir)) {
-      this.walkDir(claudeDir, fileName, matches);
+    // Search ~/.claude/ first (plans, settings, etc.)
+    if (fs.existsSync(claudeHomeDir)) {
+      this.walkDir(claudeHomeDir, fileName, matches);
+    }
+
+    // Then search project's .claude/ directory
+    const projectClaudeDir = path.join(projectDir, ".claude");
+    if (fs.existsSync(projectClaudeDir)) {
+      this.walkDir(projectClaudeDir, fileName, matches);
     }
 
     // Then search the rest of the project
