@@ -49,6 +49,9 @@ export class ClaudeManager {
   // Plan mode per channel
   private channelPlanMode = new Map<string, boolean>();
 
+  // Thread -> parent channel mapping (for plan mode inheritance)
+  private parentChannelMap = new Map<string, string>();
+
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
 
@@ -280,7 +283,20 @@ export class ClaudeManager {
   }
 
   isPlanMode(channelId: string): boolean {
-    return this.channelPlanMode.get(channelId) || false;
+    // Check if this channel has an explicit plan mode setting
+    if (this.channelPlanMode.has(channelId)) {
+      return this.channelPlanMode.get(channelId)!;
+    }
+    // Fall back to parent channel's plan mode (thread inheritance)
+    const parentId = this.parentChannelMap.get(channelId);
+    if (parentId) {
+      return this.channelPlanMode.get(parentId) || false;
+    }
+    return false;
+  }
+
+  setParentChannel(threadId: string, parentId: string): void {
+    this.parentChannelMap.set(threadId, parentId);
   }
 
   togglePlanMode(channelId: string): boolean {

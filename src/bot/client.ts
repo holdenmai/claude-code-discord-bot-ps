@@ -278,6 +278,10 @@ export class DiscordBot {
       const parentChannel = message.channel.parent;
       channelName = parentChannel?.name || "default";
       threadName = message.channel.name;
+      // Register parent mapping so threads inherit plan mode
+      if (parentChannel?.id) {
+        this.claudeManager.setParentChannel(channelId, parentChannel.id);
+      }
     } else {
       channelName = message.channel && "name" in message.channel
         ? message.channel.name
