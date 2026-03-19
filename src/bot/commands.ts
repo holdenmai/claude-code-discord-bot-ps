@@ -62,6 +62,30 @@ export class CommandHandler {
         .setName("init")
         .setDescription("Set this channel's category as the home for startup links"),
       new SlashCommandBuilder()
+        .setName("shortcut")
+        .setDescription("Manage custom !command shortcuts")
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("add")
+            .setDescription("Add a custom shortcut")
+            .addStringOption((o: any) => o.setName("name").setDescription("Command name (used as !name)").setRequired(true))
+            .addStringOption((o: any) => o.setName("prompt").setDescription("Prompt when used without extra text").setRequired(true))
+            .addStringOption((o: any) => o.setName("prompt_with_message").setDescription("Prompt when extra text given (use {message} for the text)").setRequired(false))
+            .addBooleanOption((o: any) => o.setName("global").setDescription("Global shortcut (default: repo-specific)").setRequired(false))
+        )
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("remove")
+            .setDescription("Remove a custom shortcut")
+            .addStringOption((o: any) => o.setName("name").setDescription("Command name to remove").setRequired(true))
+            .addBooleanOption((o: any) => o.setName("global").setDescription("Remove from global (default: repo-specific)").setRequired(false))
+        )
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("list")
+            .setDescription("List all shortcuts for this channel")
+        ),
+      new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
         .addStringOption((option: any) =>
@@ -154,6 +178,10 @@ export class CommandHandler {
       await this.handleUpdateCommand(interaction);
     }
 
+    if (interaction.commandName === "shortcut") {
+      await this.handleShortcutCommand(interaction);
+    }
+
     if (interaction.commandName === "file") {
       await this.handleFileCommand(interaction);
     }
@@ -242,6 +270,67 @@ export class CommandHandler {
       console.error("Error creating channel:", error);
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
+    }
+  }
+
+  /**
+   * Handle /shortcut command - manage custom !command shortcuts.
+   */
+  private async handleShortcutCommand(interaction: any): Promise<void> {
+    if (!this.settings) {
+      await interaction.reply({ content: "Settings not available.", ephemeral: true });
+      return;
+    }
+
+    const channel = interaction.channel;
+    const isThread = channel?.isThread?.();
+    const channelName = isThread
+      ? channel.parent?.name || "default"
+      : channel?.name || "default";
+
+    const sub = interaction.options.getSubcommand();
+
+    if (sub === "add") {
+      const name = interaction.options.getString("name");
+      const prompt = interaction.options.getString("prompt");
+      const promptWithMessage = interaction.options.getString("prompt_with_message");
+      const isGlobal = interaction.options.getBoolean("global") ?? false;
+      this.settings.addCustomCommand(name, prompt, isGlobal ? undefined : channelName, promptWithMessage);
+      const scope = isGlobal ? "global" : `**${channelName}**`;
+      let desc = `Added shortcut \`!${name}\` → \`${prompt}\``;
+      if (promptWithMessage) desc += `\nWith message: \`${promptWithMessage}\``;
+      desc += ` (${scope})`;
+      await interaction.reply(desc);
+    } else if (sub === "remove") {
+      const name = interaction.options.getString("name");
+      const isGlobal = interaction.options.getBoolean("global") ?? false;
+      const removed = this.settings.removeCustomCommand(name, isGlobal ? undefined : channelName);
+      if (removed) {
+        await interaction.reply(`Removed shortcut \`!${name}\``);
+      } else {
+        await interaction.reply({ content: `Shortcut \`!${name}\` not found.`, ephemeral: true });
+      }
+    } else if (sub === "list") {
+      const { global, repo } = this.settings.listCustomCommands(channelName);
+      const lines: string[] = [];
+      if (global.length > 0) {
+        lines.push("**Global:**");
+        for (const c of global) {
+          let line = `  \`!${c.name}\` → \`${c.prompt}\``;
+          if (c.promptWithMessage) line += ` | with msg: \`${c.promptWithMessage}\``;
+          lines.push(line);
+        }
+      }
+      if (repo.length > 0) {
+        lines.push(`**${channelName}:**`);
+        for (const c of repo) {
+          let line = `  \`!${c.name}\` → \`${c.prompt}\``;
+          if (c.promptWithMessage) line += ` | with msg: \`${c.promptWithMessage}\``;
+          lines.push(line);
+        }
+      }
+      if (lines.length === 0) lines.push("No shortcuts configured.");
+      await interaction.reply(lines.join("\n"));
     }
   }
 

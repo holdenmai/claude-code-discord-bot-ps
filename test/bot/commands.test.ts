@@ -27,7 +27,7 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(8);
+      expect(commands).toHaveLength(10);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('model');
@@ -36,6 +36,8 @@ describe('CommandHandler', () => {
       expect(commands[5]!.name).toBe('plan');
       expect(commands[6]!.name).toBe('update');
       expect(commands[7]!.name).toBe('init');
+      expect(commands[8]!.name).toBe('shortcut');
+      expect(commands[9]!.name).toBe('file');
     });
   });
 

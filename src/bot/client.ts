@@ -298,6 +298,48 @@ export class DiscordBot {
       console.error("Failed to post prompt activity link:", err)
     );
 
+    // Custom command shorthand: messages starting with !
+    if (message.content.startsWith("!") && this.settings) {
+      const rest = message.content.slice(1);
+      const spaceIdx = rest.indexOf(" ");
+      const cmdName = spaceIdx >= 0 ? rest.slice(0, spaceIdx) : rest;
+      const extra = spaceIdx >= 0 ? rest.slice(spaceIdx + 1).trim() : "";
+
+      const cmd = this.settings.resolveCustomCommand(cmdName, channelName);
+      if (cmd) {
+        let prompt: string;
+        if (extra) {
+          const tpl = cmd.promptWithMessage || cmd.prompt;
+          if (tpl.includes("{message}")) {
+            prompt = tpl.replace("{message}", extra);
+          } else {
+            prompt = `${tpl} ${extra}`;
+          }
+        } else {
+          prompt = cmd.prompt.replace(" {message}", "").replace("{message}", "");
+        }
+
+        // Fall through to normal message processing with resolved prompt
+        const imageAttachments = Array.from(message.attachments?.values() || [])
+          .filter((att: any) => att.contentType?.startsWith("image/"))
+          .map((att: any) => att.url);
+
+        if (threadName) {
+          const existing = getExistingWorktree(this.baseFolder, channelName, threadName);
+          if (existing) {
+            this.claudeManager.setWorkingDirOverride(channelId, existing.path);
+          }
+        }
+
+        const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, prompt, imageAttachments);
+        if (!wasQueued) {
+          await this.processMessage(message, channelId, channelName, prompt, imageAttachments);
+        }
+        return;
+      }
+      // If no matching command, fall through to normal processing
+    }
+
     // Shell command: messages starting with - (but not --) run directly in the shell
     if (message.content.startsWith("-") && !message.content.startsWith("--")) {
       let shellCmd = message.content.slice(1).trim();

@@ -154,6 +154,7 @@ Type any message in a channel that corresponds to a repository folder. The bot w
 - **/model**: Set the Claude model for this channel (sonnet/opus/haiku)
 - **/add**: Create a channel for a project folder (with autocomplete)
 - **/update**: Pull latest changes and restart the bot
+- **/shortcut**: Manage custom `!command` shortcuts (add/remove/list)
 - **/init**: Set this channel's category as the home for startup links
 
 ### Example
@@ -190,8 +191,25 @@ If the worktree already exists (e.g., you created it locally with `git worktree 
 | Prefix | Behavior | Example |
 |--------|----------|---------|
 | *(none)* | Send as a prompt to Claude Code | `fix the login bug` |
+| `!` | Run a custom shortcut | `!imp`, `!imp auth module` |
 | `-` | Run as a shell command | `-git status` |
 | `--` | Pass as raw CLI args to Claude Code | `--model sonnet` |
+
+### Custom shortcuts
+
+Define reusable prompt shortcuts with the `!` prefix. Shortcuts can be **global** (available in all channels) or **per-repo** (specific to a channel/project). Per-repo shortcuts take priority over global ones with the same name.
+
+```
+/shortcut add name:imp prompt:implement the plan global:true
+/shortcut add name:imp prompt:implement the plan prompt_with_message:implement {message} from the plan global:true
+```
+
+- `!imp` → "implement the plan"
+- `!imp the auth module` → "implement the auth module from the plan"
+
+The optional `prompt_with_message` parameter defines an alternate template used when extra text is provided. Use `{message}` as a placeholder for the extra text. If `prompt_with_message` is not set, extra text is appended to the base prompt.
+
+Use `/shortcut list` to see all shortcuts for the current channel, and `/shortcut remove` to delete one.
 
 Shell commands run in the channel's project directory (or worktree for threads). For Claude CLI interactive commands like `/usage` or `/compact`, use the shell prefix:
 

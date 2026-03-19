@@ -43,6 +43,7 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - `/model` - Set the Claude model for this channel (sonnet/opus/haiku)
 - `/add` - Create a channel for a project folder (with autocomplete)
 - `/update` - Pull latest changes and restart the bot
+- `/shortcut` - Manage custom `!command` prompt shortcuts (global or per-repo)
 - `/init` - Set this channel's category as the home for startup links
 
 ## Environment Variables
