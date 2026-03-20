@@ -336,10 +336,10 @@ export class ClaudeManager {
 
     const model = this.getModel(channelId);
     const planMode = this.isPlanMode(channelId);
-    const commandString = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls, planMode);
-    console.log(`Running command: ${commandString}`);
+    const { command, args } = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls, planMode);
+    console.log(`Running command: ${command} ${args.join(" ")}`);
 
-    const claude = spawn("powershell.exe", ["-NoProfile", "-Command", commandString], {
+    const claude = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: workingDir,
       env: { ...process.env },

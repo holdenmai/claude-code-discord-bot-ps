@@ -26,14 +26,13 @@ export function buildClaudeCommand(
   model: string = "opus",
   imageUrls?: string[],
   planMode: boolean = false
-): string {
+): { command: string; args: string[] } {
   const raw = isRawCommand(prompt);
 
   // Create session-specific MCP config in /tmp
   const sessionMcpConfigPath = createSessionMcpConfig(discordContext);
 
-  const commandParts = [
-    "claude",
+  const args = [
     "--output-format",
     "stream-json",
     "--model",
@@ -42,34 +41,34 @@ export function buildClaudeCommand(
 
   if (raw) {
     // Raw CLI command: pass arguments directly without -p wrapper
-    commandParts.push(...prompt.split(/\s+/));
+    args.push(...prompt.split(/\s+/));
   } else {
     // Normal prompt mode
     if (imageUrls && imageUrls.length > 0) {
       for (const imageUrl of imageUrls) {
-        commandParts.push("--image", imageUrl);
+        args.push("--image", imageUrl);
       }
     }
 
-    commandParts.push("-p", escapeShellString(prompt));
+    args.push("-p", prompt);
   }
 
-  commandParts.push("--verbose");
+  args.push("--verbose");
 
-  commandParts.push("--permission-mode", planMode ? "plan" : "acceptEdits");
+  args.push("--permission-mode", planMode ? "plan" : "acceptEdits");
 
   // Add session-specific MCP configuration
-  commandParts.push("--mcp-config", sessionMcpConfigPath);
-  commandParts.push("--permission-prompt-tool", "mcp__discord-permissions__approve_tool");
+  args.push("--mcp-config", sessionMcpConfigPath);
+  args.push("--permission-prompt-tool", "mcp__discord-permissions__approve_tool");
 
   // Add allowed tools - we'll let the MCP server handle permissions
-  commandParts.push("--allowedTools", "mcp__discord-permissions");
+  args.push("--allowedTools", "mcp__discord-permissions");
 
   if (sessionId) {
-    commandParts.splice(3, 0, "--resume", sessionId);
+    args.splice(2, 0, "--resume", sessionId);
   }
 
-  return commandParts.join(" ");
+  return { command: "claude", args };
 }
 
 /**

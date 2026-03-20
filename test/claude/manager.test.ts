@@ -182,8 +182,8 @@ describe('ClaudeManager', () => {
       }
       
       expect(spawn).toHaveBeenCalledWith(
-        'powershell.exe',
-        ['-NoProfile', '-Command', expect.stringContaining('claude')],
+        'claude',
+        expect.arrayContaining(['--output-format', 'stream-json']),
         expect.objectContaining({ cwd: path.join(mockBaseFolder, 'test-channel') })
       );
       expect(mockProcess.stdin.end).toHaveBeenCalled();

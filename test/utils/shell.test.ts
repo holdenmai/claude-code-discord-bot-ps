@@ -25,31 +25,43 @@ describe('escapeShellString', () => {
 
 describe('buildClaudeCommand', () => {
   it('should build basic command without session ID', () => {
-    const command = buildClaudeCommand('/test/dir', 'hello world');
-    expect(command).toContain("claude");
-    expect(command).toContain("--output-format stream-json");
-    expect(command).toContain("--model opus");
-    expect(command).toContain("-p 'hello world'");
-    expect(command).toContain("--verbose");
-    expect(command).not.toContain("cd /test/dir");
+    const { command, args } = buildClaudeCommand('/test/dir', 'hello world');
+    expect(command).toBe("claude");
+    expect(args).toContain("--output-format");
+    expect(args).toContain("stream-json");
+    expect(args).toContain("--model");
+    expect(args).toContain("opus");
+    expect(args).toContain("-p");
+    expect(args).toContain("hello world");
+    expect(args).toContain("--verbose");
   });
 
   it('should build command with session ID', () => {
-    const command = buildClaudeCommand('/test/dir', 'hello world', 'session-123');
-    expect(command).toContain("--resume session-123");
-    expect(command).toContain("-p 'hello world'");
-    expect(command).not.toContain("cd /test/dir");
+    const { args } = buildClaudeCommand('/test/dir', 'hello world', 'session-123');
+    expect(args).toContain("--resume");
+    expect(args).toContain("session-123");
+    expect(args).toContain("-p");
+    expect(args).toContain("hello world");
   });
 
-  it('should properly escape prompt with special characters', () => {
-    const command = buildClaudeCommand('/test/dir', "don't use this");
-    expect(command).toContain("-p 'don''t use this'");
+  it('should pass prompt with special characters as-is (no shell escaping needed)', () => {
+    const { args } = buildClaudeCommand('/test/dir', "don't use this");
+    expect(args).toContain("-p");
+    expect(args).toContain("don't use this");
+  });
+
+  it('should preserve double quotes in prompts', () => {
+    const { args } = buildClaudeCommand('/test/dir', 'Status code "does not exist"');
+    expect(args).toContain("-p");
+    expect(args).toContain('Status code "does not exist"');
   });
 
   it('should handle complex prompts', () => {
     const prompt = "Fix the bug in 'config.js' and don't break anything";
-    const command = buildClaudeCommand('/project/path', prompt, 'abc-123');
-    expect(command).toContain("--resume abc-123");
-    expect(command).toContain("-p 'Fix the bug in ''config.js'' and don''t break anything'");
+    const { args } = buildClaudeCommand('/project/path', prompt, 'abc-123');
+    expect(args).toContain("--resume");
+    expect(args).toContain("abc-123");
+    expect(args).toContain("-p");
+    expect(args).toContain(prompt);
   });
 });
