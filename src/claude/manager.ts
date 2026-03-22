@@ -52,6 +52,9 @@ export class ClaudeManager {
   // Thread -> parent channel mapping (for plan mode inheritance)
   private parentChannelMap = new Map<string, string>();
 
+  // Context usage tracking: channels that have already been warned
+  private contextWarned = new Set<string>();
+
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
 
@@ -112,6 +115,7 @@ export class ClaudeManager {
     this.originalMessages.delete(channelId);
     this.channelDiscordContexts.delete(channelId);
     this.workingDirOverrides.delete(channelId);
+    this.contextWarned.delete(channelId);
     this.cleanupTaskThreads(channelId);
   }
 
@@ -607,8 +611,47 @@ export class ClaudeManager {
       const channelName = this.channelNames.get(channelId) || "default";
       this.db.setSession(channelId, parsed.session_id, channelName);
       this.channelToolCalls.set(channelId, toolCalls);
+
+      // Check context window usage and warn if getting full
+      await this.checkContextUsage(channelId, parsed.message);
     } catch (error) {
       console.error("Error sending assistant message:", error);
+    }
+  }
+
+  private static readonly CONTEXT_WINDOW_TOKENS = 200_000;
+  private static readonly CONTEXT_WARNING_THRESHOLD = 0.80;
+
+  private async checkContextUsage(channelId: string, message: any): Promise<void> {
+    if (this.contextWarned.has(channelId)) return;
+
+    const inputTokens = message?.usage?.input_tokens;
+    if (!inputTokens) return;
+
+    const pct = inputTokens / ClaudeManager.CONTEXT_WINDOW_TOKENS;
+    if (pct < ClaudeManager.CONTEXT_WARNING_THRESHOLD) return;
+
+    this.contextWarned.add(channelId);
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    const used = Math.round(inputTokens / 1000);
+    const total = Math.round(ClaudeManager.CONTEXT_WINDOW_TOKENS / 1000);
+    const pctDisplay = Math.round(pct * 100);
+
+    const embed = new EmbedBuilder()
+      .setTitle("⚠️ Context window filling up")
+      .setDescription(
+        `**${pctDisplay}%** used (${used}k / ${total}k tokens)\n\n` +
+        `Run \`-claude /compact\` to free up space, or \`/clear\` to start fresh.`
+      )
+      .setColor(0xFFA500);
+
+    try {
+      await channel.send({ embeds: [embed] });
+    } catch (error) {
+      console.error("Failed to send context warning:", error);
     }
   }
 
