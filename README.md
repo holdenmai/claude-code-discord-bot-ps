@@ -155,6 +155,7 @@ Type any message in a channel that corresponds to a repository folder. The bot w
 - **/add**: Create a channel for a project folder (with autocomplete)
 - **/update**: Pull latest changes and restart the bot
 - **/shortcut**: Manage custom `!command` shortcuts (add/remove/list)
+- **/sync**: Merge main into all active worktrees for this project
 - **/init**: Set this channel's category as the home for startup links
 
 ### Example

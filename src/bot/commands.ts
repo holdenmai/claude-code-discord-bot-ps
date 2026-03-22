@@ -2,7 +2,7 @@ import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits } f
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
@@ -87,6 +87,9 @@ export class CommandHandler {
             .setName("list")
             .setDescription("List all shortcuts for this channel")
         ),
+      new SlashCommandBuilder()
+        .setName("sync")
+        .setDescription("Merge main into all active worktrees for this project"),
       new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
@@ -199,6 +202,10 @@ export class CommandHandler {
       await this.handleShortcutCommand(interaction);
     }
 
+    if (interaction.commandName === "sync") {
+      await this.handleSyncCommand(interaction);
+    }
+
     if (interaction.commandName === "file") {
       await this.handleFileCommand(interaction);
     }
@@ -288,6 +295,83 @@ export class CommandHandler {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
     }
+  }
+
+  /**
+   * Handle /sync command - merge main into all active worktrees for this project.
+   */
+  private async handleSyncCommand(interaction: any): Promise<void> {
+    const channel = interaction.channel;
+    const isThread = channel?.isThread?.();
+    const channelName = isThread
+      ? channel.parent?.name || "default"
+      : channel?.name || "default";
+
+    const repoDir = path.join(this.baseFolder, channelName);
+    if (!fs.existsSync(repoDir)) {
+      await interaction.reply({ content: `Project folder not found: \`${channelName}\``, ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    // First, fetch latest main in the main repo
+    try {
+      execSync("git fetch origin main", { cwd: repoDir, stdio: "pipe" });
+    } catch {
+      // fetch might fail if no remote, continue anyway
+    }
+
+    // List active worktrees
+    let worktreeOutput: string;
+    try {
+      worktreeOutput = execSync("git worktree list --porcelain", { cwd: repoDir, stdio: "pipe" }).toString();
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`❌ Failed to list worktrees: ${msg}`);
+      return;
+    }
+
+    // Parse worktree list — each entry starts with "worktree <path>"
+    const worktrees: { path: string; branch: string }[] = [];
+    const blocks = worktreeOutput.split("\n\n").filter(b => b.trim());
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      const wtLine = lines.find(l => l.startsWith("worktree "));
+      const branchLine = lines.find(l => l.startsWith("branch "));
+      if (wtLine && branchLine) {
+        const wtPath = wtLine.slice("worktree ".length).trim();
+        const branch = branchLine.slice("branch refs/heads/".length).trim();
+        // Skip the main worktree (the repo itself)
+        if (wtPath === repoDir || wtPath === repoDir.replace(/\//g, "\\")) continue;
+        worktrees.push({ path: wtPath, branch });
+      }
+    }
+
+    if (worktrees.length === 0) {
+      await interaction.editReply("No active worktrees found for this project.");
+      return;
+    }
+
+    const results: string[] = [];
+    for (const wt of worktrees) {
+      const name = path.basename(wt.path);
+      try {
+        const output = execSync("git merge main --no-edit", { cwd: wt.path, stdio: "pipe" }).toString().trim();
+        if (output.includes("Already up to date")) {
+          results.push(`✅ **${name}** (\`${wt.branch}\`) — already up to date`);
+        } else {
+          results.push(`✅ **${name}** (\`${wt.branch}\`) — merged`);
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        // Abort the failed merge so the worktree isn't left in a conflict state
+        try { execSync("git merge --abort", { cwd: wt.path, stdio: "pipe" }); } catch {}
+        results.push(`❌ **${name}** (\`${wt.branch}\`) — merge conflict\n\`\`\`\n${msg.slice(0, 200)}\n\`\`\``);
+      }
+    }
+
+    await interaction.editReply(`🔄 **Sync main → worktrees** (${channelName})\n\n${results.join("\n")}`);
   }
 
   /**
