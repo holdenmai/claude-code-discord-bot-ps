@@ -3,6 +3,7 @@ import { ClaudeManager } from './claude/manager.js';
 import { validateConfig } from './utils/config.js';
 import { MCPPermissionServer } from './mcp/server.js';
 import { SettingsStore } from './settings/settings-store.js';
+import { InstanceRouter } from './routing/instance-router.js';
 
 async function main() {
   const config = validateConfig();
@@ -17,9 +18,18 @@ async function main() {
   console.log('Starting MCP Permission Server...');
   await mcpServer.start();
 
+  // Set up multi-instance routing if configured
+  let instanceRouter: InstanceRouter | undefined;
+  const botInstanceId = process.env.BOT_INSTANCE_ID;
+  if (botInstanceId) {
+    const priority = parseInt(process.env.BOT_PRIORITY || '1');
+    instanceRouter = new InstanceRouter(botInstanceId, priority, settings);
+    console.log(`Multi-instance mode: ${botInstanceId} (priority ${priority})`);
+  }
+
   // Start Discord Bot and Claude Manager
   const claudeManager = new ClaudeManager(config.baseFolder, settings);
-  const bot = new DiscordBot(claudeManager, config.allowedUserId, settings);
+  const bot = new DiscordBot(claudeManager, config.allowedUserId, settings, instanceRouter);
 
   // Connect MCP server to Discord bot for interactive approvals
   mcpServer.setDiscordBot(bot);

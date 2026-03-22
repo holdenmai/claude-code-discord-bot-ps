@@ -11,6 +11,7 @@ import { CommandHandler } from './commands.js';
 import type { MCPPermissionServer } from '../mcp/server.js';
 import { MessageQueue } from '../queue/message-queue.js';
 import type { SettingsStore } from '../settings/settings-store.js';
+import type { InstanceRouter } from '../routing/instance-router.js';
 import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath, sanitizeWorktreeName } from '../utils/worktree.js';
 import { isRawCommand } from '../utils/shell.js';
 import { exec } from 'child_process';
@@ -41,6 +42,7 @@ export class DiscordBot {
     private claudeManager: ClaudeManager,
     private allowedUserId: string,
     private settings?: SettingsStore,
+    private instanceRouter?: InstanceRouter,
   ) {
     this.client = new Client({
       intents: [
@@ -54,7 +56,7 @@ export class DiscordBot {
     this.baseFolder = process.env.BASE_FOLDER || "";
     this.reactionConfig = getReactionConfig();
     this.activityLinkConfig = getActivityLinkConfig();
-    this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings);
+    this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings, instanceRouter);
     this.messageQueue = new MessageQueue();
     this.setupEventHandlers();
     this.setupCompletionCallback();
@@ -135,6 +137,9 @@ export class DiscordBot {
         }
 
         let startupMsg = `🚀 **Bot is online!**\nLogged in as ${this.client.user?.tag}`;
+        if (this.instanceRouter) {
+          startupMsg += `\nInstance: **${this.instanceRouter.id}** (priority ${this.instanceRouter.priority})`;
+        }
 
         // Add channel links if home category is configured
         const home = this.settings?.getHomeCategory();
@@ -291,6 +296,67 @@ export class DiscordBot {
     // Don't run in general channel
     if (channelName === "general") {
       return;
+    }
+
+    // Multi-instance routing
+    if (this.instanceRouter) {
+      // Use parent channel for thread routing
+      const routingId = isThread ? (message.channel.parent?.id || channelId) : channelId;
+
+      // !teleport @Bot — both instances process this
+      if (message.content.startsWith("!teleport")) {
+        const mentioned = message.mentions.users?.first();
+        if (!mentioned) {
+          // Status query — only the owning or default instance replies
+          const owner = this.instanceRouter.getOwner(routingId);
+          const delay = this.instanceRouter.getDelay(routingId);
+          if (delay === 0 || (delay !== Infinity && !owner)) {
+            const status = owner
+              ? `📡 Channel owned by **${owner}**`
+              : `📡 Channel unclaimed (priority routing active)`;
+            await message.reply(status);
+          }
+        } else if (mentioned.id === this.client.user?.id) {
+          // Teleporting TO this bot
+          this.instanceRouter.claimChannel(routingId);
+          await message.reply(`📡 Teleported to **${this.instanceRouter.id}**`);
+        } else {
+          // Teleporting to another bot — release and kill
+          this.instanceRouter.releaseChannel(routingId);
+          this.claudeManager.killActiveProcess(channelId);
+        }
+        return;
+      }
+
+      // !abandon — clear ownership, all bots process this
+      if (message.content === "!abandon") {
+        const wasOwner = this.instanceRouter.ownsChannel(routingId);
+        this.instanceRouter.releaseChannel(routingId);
+        this.claudeManager.killActiveProcess(channelId);
+        if (wasOwner) {
+          await message.reply("🔓 Channel released — next message uses priority routing");
+        }
+        return;
+      }
+
+      // Priority-based routing for regular messages
+      const delay = this.instanceRouter.getDelay(routingId);
+      if (delay === Infinity) return; // owned by another instance
+      if (delay > 0) {
+        await new Promise(r => setTimeout(r, delay));
+        // Check if a higher-priority bot already reacted (processing reaction)
+        try {
+          const refreshed = await message.fetch();
+          const processingReaction = refreshed.reactions.cache.get(this.reactionConfig.processing);
+          if (processingReaction && processingReaction.count > 0) {
+            return; // another bot is handling it
+          }
+        } catch {
+          // If fetch fails, proceed anyway
+        }
+      }
+      // We're processing — claim the channel (sticky)
+      this.instanceRouter.claimChannel(routingId);
     }
 
     // Post activity link for user prompt (fire and forget)

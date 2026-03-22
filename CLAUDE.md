@@ -54,6 +54,10 @@ Required environment variables:
 - `BASE_FOLDER` - Base path where Claude Code operates (e.g., `/Users/tim/repos`)
 - `MCP_SERVER_PORT` - Port for MCP permission server (default: 3001)
 
+Optional (multi-instance):
+- `BOT_INSTANCE_ID` - Instance name (e.g., "linux", "windows"). Enables multi-instance routing
+- `BOT_PRIORITY` - Integer priority (1 = highest, default: 1). Lower priority bots wait before processing
+
 ## Environment
 
 - Bun automatically loads .env files (no need for dotenv)

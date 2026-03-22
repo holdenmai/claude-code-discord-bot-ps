@@ -16,6 +16,7 @@ interface SettingsData {
     global: CustomCommand[];
     perRepo: Record<string, CustomCommand[]>;
   };
+  teleportOverrides?: Record<string, string>;
 }
 
 export class SettingsStore {
@@ -112,6 +113,25 @@ export class SettingsStore {
   setHomeCategory(guildId: string, categoryId: string): void {
     this.data.homeCategory = { guildId, categoryId };
     this.save();
+  }
+
+  // --- Teleport / instance routing ---
+
+  getTeleportOwner(channelId: string): string | undefined {
+    return this.data.teleportOverrides?.[channelId];
+  }
+
+  setTeleportOwner(channelId: string, instanceId: string): void {
+    if (!this.data.teleportOverrides) this.data.teleportOverrides = {};
+    this.data.teleportOverrides[channelId] = instanceId;
+    this.save();
+  }
+
+  clearTeleportOwner(channelId: string): void {
+    if (this.data.teleportOverrides) {
+      delete this.data.teleportOverrides[channelId];
+      this.save();
+    }
   }
 
   // --- Custom commands ---

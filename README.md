@@ -220,6 +220,45 @@ Shell commands run in the channel's project directory (or worktree for threads).
 
 The bot auto-injects `--resume` into `claude` shell commands so they target the current session.
 
+## Multi-Instance (Teleport)
+
+Run multiple bot instances on different machines (e.g., Linux and Windows) in the same Discord server. Each instance handles channels based on priority, with automatic failover.
+
+### Setup
+
+1. Create **two Discord bot applications** and invite both to your server
+2. On each machine, set the instance env vars:
+
+```env
+# Machine 1 (primary)
+BOT_INSTANCE_ID=linux
+BOT_PRIORITY=1
+
+# Machine 2 (fallback)
+BOT_INSTANCE_ID=windows
+BOT_PRIORITY=2
+```
+
+`ENABLE_REACTIONS=true` is required for multi-instance mode (the processing reaction acts as a distributed lock).
+
+### How routing works
+
+- **Priority 1** processes messages immediately
+- **Priority 2** waits 5 seconds, then checks if priority 1 already reacted — if not, it takes over (failover)
+- Once a bot handles a message, it **owns** that channel until explicitly transferred
+
+### Commands
+
+| Command | Behavior |
+|---------|----------|
+| `!teleport @BotName` | Transfer channel to the mentioned bot |
+| `!teleport` | Show which instance owns this channel |
+| `!abandon` | Release channel ownership — next message uses priority routing |
+
+### Failover
+
+If the primary machine goes offline, the fallback instance automatically picks up new messages after a brief delay. No manual intervention needed.
+
 ## How It Works
 
 - Each Discord channel maps to a folder: `#my-project` → `/path/to/repos/my-project`

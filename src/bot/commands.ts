@@ -5,6 +5,7 @@ import * as path from "path";
 import { spawn } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
 import type { SettingsStore } from '../settings/settings-store.js';
+import type { InstanceRouter } from '../routing/instance-router.js';
 
 export class CommandHandler {
   private baseFolder: string;
@@ -13,6 +14,7 @@ export class CommandHandler {
     private claudeManager: ClaudeManager,
     private allowedUserId: string,
     private settings?: SettingsStore,
+    private instanceRouter?: InstanceRouter,
   ) {
     this.baseFolder = process.env.BASE_FOLDER || '';
   }
@@ -127,6 +129,21 @@ export class CommandHandler {
         ephemeral: true,
       });
       return;
+    }
+
+    // Multi-instance guard: skip if another instance owns this channel
+    if (this.instanceRouter) {
+      const channel = interaction.channel;
+      const isThread = channel?.isThread?.();
+      const routingId = isThread ? (channel.parent?.id || interaction.channelId) : interaction.channelId;
+      const delay = this.instanceRouter.getDelay(routingId);
+      if (delay === Infinity) {
+        await interaction.reply({
+          content: `This channel is handled by another instance.`,
+          ephemeral: true,
+        });
+        return;
+      }
     }
 
     if (interaction.commandName === "clear") {
