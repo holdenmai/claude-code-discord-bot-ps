@@ -91,6 +91,9 @@ export class CommandHandler {
         .setName("sync")
         .setDescription("Merge main into all active worktrees for this project"),
       new SlashCommandBuilder()
+        .setName("end")
+        .setDescription("End a worktree session: push branch, remove worktree, lock thread"),
+      new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
         .addStringOption((option: any) =>
@@ -204,6 +207,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "sync") {
       await this.handleSyncCommand(interaction);
+    }
+
+    if (interaction.commandName === "end") {
+      await this.handleEndCommand(interaction);
     }
 
     if (interaction.commandName === "file") {
@@ -372,6 +379,90 @@ export class CommandHandler {
     }
 
     await interaction.editReply(`🔄 **Sync main → worktrees** (${channelName})\n\n${results.join("\n")}`);
+  }
+
+  /**
+   * Handle /end command - push branch, remove worktree, lock thread.
+   * Only works in threads that have an associated worktree.
+   */
+  private async handleEndCommand(interaction: any): Promise<void> {
+    const channel = interaction.channel;
+
+    if (!channel?.isThread?.()) {
+      await interaction.reply({ content: "This command can only be used in a worktree thread.", ephemeral: true });
+      return;
+    }
+
+    const parentName = channel.parent?.name || "default";
+    const threadName = channel.name;
+    const channelId = interaction.channelId;
+    const repoDir = path.join(this.baseFolder, parentName);
+
+    // Find the worktree
+    const { getExistingWorktree } = await import("../utils/worktree.js");
+    const wt = getExistingWorktree(this.baseFolder, parentName, threadName);
+    if (!wt) {
+      await interaction.reply({ content: "No worktree found for this thread.", ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply();
+    const steps: string[] = [];
+
+    // Kill any active Claude process in this thread
+    if (this.claudeManager.hasActiveProcess(channelId)) {
+      this.claudeManager.killActiveProcess(channelId);
+      steps.push("⏹️ Killed active Claude process");
+    }
+
+    // Check for uncommitted changes — abort if dirty
+    try {
+      const status = execSync("git status --porcelain", { cwd: wt.path, stdio: "pipe" }).toString().trim();
+      if (status) {
+        await interaction.editReply(
+          `⚠️ **Outstanding changes in \`${wt.branch}\`** — please commit or discard before ending.\n\`\`\`\n${status.slice(0, 1500)}\n\`\`\``
+        );
+        return;
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`❌ Could not check worktree status: ${msg.slice(0, 200)}`);
+      return;
+    }
+
+    // Push branch to origin
+    try {
+      execSync(`git push -u origin "${wt.branch}"`, { cwd: wt.path, stdio: "pipe" });
+      steps.push(`📤 Pushed \`${wt.branch}\` to origin`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      steps.push(`⚠️ Push failed: ${msg.slice(0, 150)}`);
+    }
+
+    // Clear session data before removing the worktree
+    this.claudeManager.clearSession(channelId);
+    steps.push("🧹 Cleared session");
+
+    // Remove the worktree
+    try {
+      execSync(`git worktree remove "${wt.path}" --force`, { cwd: repoDir, stdio: "pipe" });
+      steps.push(`🗑️ Removed worktree at \`${path.basename(wt.path)}\``);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      steps.push(`⚠️ Worktree removal failed: ${msg.slice(0, 150)}`);
+    }
+
+    // Post summary before locking (can't send messages after lock)
+    await interaction.editReply(`🏁 **Ending worktree session** (\`${wt.branch}\`)\n\n${steps.join("\n")}\n\n🔒 Locking thread...`);
+
+    // Lock the thread
+    try {
+      await channel.setLocked(true, "Worktree session ended via /end");
+      await channel.setArchived(true, "Worktree session ended via /end");
+    } catch (error) {
+      // May lack permissions — not critical
+      console.error("Failed to lock/archive thread:", error);
+    }
   }
 
   /**

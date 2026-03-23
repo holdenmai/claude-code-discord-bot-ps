@@ -156,6 +156,7 @@ Type any message in a channel that corresponds to a repository folder. The bot w
 - **/update**: Pull latest changes and restart the bot
 - **/shortcut**: Manage custom `!command` shortcuts (add/remove/list)
 - **/sync**: Merge main into all active worktrees for this project
+- **/end**: End a worktree session — pushes branch to origin, removes the worktree, and locks/archives the thread
 - **/init**: Set this channel's category as the home for startup links
 
 ### Example

@@ -45,6 +45,7 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - `/update` - Pull latest changes and restart the bot
 - `/shortcut` - Manage custom `!command` prompt shortcuts (global or per-repo)
 - `/sync` - Merge main into all active worktrees for this project
+- `/end` - End a worktree session: push branch to origin, remove worktree, lock thread
 - `/init` - Set this channel's category as the home for startup links
 
 ## Environment Variables
