@@ -101,6 +101,12 @@ export class CommandHandler {
             .setName("path")
             .setDescription("File path (relative to project folder or absolute)")
             .setRequired(true)
+        )
+        .addBooleanOption((option: any) =>
+          option
+            .setName("include_worktrees")
+            .setDescription("Include .worktrees/ directory in search (default: false)")
+            .setRequired(false)
         ),
     ];
   }
@@ -533,6 +539,7 @@ export class CommandHandler {
    */
   private async handleFileCommand(interaction: any): Promise<void> {
     const filePath = interaction.options.getString("path");
+    const includeWorktrees = interaction.options.getBoolean("include_worktrees") ?? false;
     const channel = interaction.channel;
 
     // Determine the project folder for this channel
@@ -553,7 +560,7 @@ export class CommandHandler {
 
     if (isBareFilename) {
       // Search for the file: ~/.claude/ first, then project directory
-      const matches = this.findFileByName(claudeHomeDir, projectDir, filePath);
+      const matches = this.findFileByName(claudeHomeDir, projectDir, filePath, includeWorktrees);
 
       if (matches.length === 0) {
         await interaction.reply({
@@ -663,7 +670,7 @@ export class CommandHandler {
    * Searches ~/.claude/ first, then the project directory.
    * Skips node_modules and .git directories.
    */
-  private findFileByName(claudeHomeDir: string, projectDir: string, fileName: string): string[] {
+  private findFileByName(claudeHomeDir: string, projectDir: string, fileName: string, includeWorktrees: boolean = false): string[] {
     const matches: string[] = [];
 
     // Search ~/.claude/ first (plans, settings, etc.)
@@ -677,8 +684,10 @@ export class CommandHandler {
       this.walkDir(projectClaudeDir, fileName, matches);
     }
 
-    // Then search the rest of the project
-    this.walkDir(projectDir, fileName, matches, new Set([".claude"]));
+    // Then search the rest of the project — skip .worktrees unless explicitly included
+    const skipDirs = new Set([".claude"]);
+    if (!includeWorktrees) skipDirs.add(".worktrees");
+    this.walkDir(projectDir, fileName, matches, skipDirs);
 
     return matches;
   }
