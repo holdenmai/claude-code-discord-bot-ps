@@ -213,6 +213,16 @@ The optional `prompt_with_message` parameter defines an alternate template used 
 
 Use `/shortcut list` to see all shortcuts for the current channel, and `/shortcut remove` to delete one.
 
+### Crash Recovery
+
+If the bot crashes while processing, it tracks which channels had active runs. On restart, it checks for an `!oncrash` shortcut and automatically sends that prompt to each interrupted channel:
+
+```
+/shortcut add name:oncrash prompt:check git status, verify nothing is broken, and summarize what you were working on global:true
+```
+
+The `!oncrash` shortcut can be global or per-repo like any other shortcut.
+
 Shell commands run in the channel's project directory (or worktree for threads). For Claude CLI interactive commands like `/usage` or `/compact`, use the shell prefix:
 
 ```

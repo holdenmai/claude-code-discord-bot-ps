@@ -167,6 +167,9 @@ export class DiscordBot {
       } catch (error) {
         console.error("Failed to send startup DM:", error);
       }
+
+      // Crash recovery: re-run !oncrash prompt for interrupted sessions
+      await this.handleCrashRecovery();
     });
 
     this.client.on("interactionCreate", async (interaction) => {
@@ -865,6 +868,68 @@ export class DiscordBot {
       }
     } catch (error) {
       console.error("Failed to cleanup threads in home category:", error);
+    }
+  }
+
+  /**
+   * On startup, check for sessions that were interrupted by a crash.
+   * If the !oncrash shortcut is configured, send its prompt to each interrupted channel.
+   */
+  private async handleCrashRecovery(): Promise<void> {
+    const interrupted = this.claudeManager.getInterruptedRuns();
+    // Always clear the table — even if no shortcut is set, these runs are stale
+    this.claudeManager.clearAllActiveRuns();
+
+    if (interrupted.length === 0) return;
+
+    console.log(`Found ${interrupted.length} interrupted run(s) from previous session`);
+
+    if (!this.settings) return;
+
+    for (const run of interrupted) {
+      // Resolve !oncrash — check repo-specific first, then global
+      const cmd = this.settings.resolveCustomCommand("oncrash", run.channelName);
+      if (!cmd) {
+        console.log(`No !oncrash shortcut configured, skipping recovery for ${run.channelName} (${run.channelId})`);
+        continue;
+      }
+
+      try {
+        const channel = await this.client.channels.fetch(run.channelId) as any;
+        if (!channel?.isTextBased?.()) continue;
+
+        // Determine the channel name for routing
+        const isThread = channel.isThread?.();
+        const channelName = isThread
+          ? (channel.parent?.name || run.channelName)
+          : (channel.name || run.channelName);
+
+        // Multi-instance check: skip if another bot owns this channel
+        if (this.instanceRouter) {
+          const routingId = isThread ? (channel.parent?.id || run.channelId) : run.channelId;
+          const delay = this.instanceRouter.getDelay(routingId);
+          if (delay === Infinity) continue;
+        }
+
+        const prompt = cmd.prompt.replace(" {message}", "").replace("{message}", "");
+
+        // Send a notification message so the user knows this is crash recovery
+        const notice = await channel.send(`🔄 **Crash recovery** — resuming interrupted session with \`!oncrash\``);
+
+        // Set up worktree override if this is a thread
+        if (isThread) {
+          const threadName = channel.name;
+          const parentName = channel.parent?.name || run.channelName;
+          const existing = getExistingWorktree(this.baseFolder, parentName, threadName);
+          if (existing) {
+            this.claudeManager.setWorkingDirOverride(run.channelId, existing.path);
+          }
+        }
+
+        await this.processMessage(notice, run.channelId, channelName, prompt);
+      } catch (error) {
+        console.error(`Failed crash recovery for channel ${run.channelId}:`, error);
+      }
     }
   }
 
