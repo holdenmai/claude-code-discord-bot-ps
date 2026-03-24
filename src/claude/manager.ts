@@ -144,6 +144,9 @@ export class ClaudeManager {
     if (this.completionNotified.has(channelId)) return;
     this.completionNotified.add(channelId);
 
+    // Clear crash-recovery tracker
+    this.db.markRunCompleted(channelId);
+
     this.stopTypingIndicator(channelId);
 
     const originalMessage = this.originalMessages.get(channelId);
@@ -272,6 +275,14 @@ export class ClaudeManager {
     return this.db.getSession(channelId);
   }
 
+  getInterruptedRuns(): { channelId: string; channelName: string; startedAt: number }[] {
+    return this.db.getInterruptedRuns();
+  }
+
+  clearAllActiveRuns(): void {
+    this.db.clearAllActiveRuns();
+  }
+
   setModel(channelId: string, model: string): void {
     this.channelModels.set(channelId, model);
     this.settings?.setModel(channelId, model);
@@ -350,6 +361,9 @@ export class ClaudeManager {
     });
 
     console.log(`Claude process spawned with PID: ${claude.pid}`);
+
+    // Track this run for crash recovery
+    this.db.markRunStarted(channelId, channelName);
 
     // Update the channel process tracking with actual process
     const channelProcess = this.channelProcesses.get(channelId);

@@ -31,6 +31,10 @@ describe('ClaudeManager', () => {
       clearSession: vi.fn(),
       getAllSessions: vi.fn(),
       cleanupOldSessions: vi.fn(),
+      markRunStarted: vi.fn(),
+      markRunCompleted: vi.fn(),
+      getInterruptedRuns: vi.fn().mockReturnValue([]),
+      clearAllActiveRuns: vi.fn(),
       close: vi.fn()
     };
     vi.mocked(DatabaseManager).mockImplementation(() => mockDb);
