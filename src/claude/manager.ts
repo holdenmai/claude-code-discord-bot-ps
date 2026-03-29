@@ -140,6 +140,20 @@ export class ClaudeManager {
     this.onCompleteCallback = callback;
   }
 
+  private handleProcessTimeout(channelId: string, process: any): void {
+    console.log(`Claude process timed out (inactivity) for channel ${channelId}, killing it`);
+    process.kill("SIGTERM");
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (channel) {
+      const timeoutEmbed = new EmbedBuilder()
+        .setTitle("⏰ Timeout")
+        .setDescription("Claude Code had no output for 5 minutes — process killed.")
+        .setColor(0xFFD700);
+      channel.send({ embeds: [timeoutEmbed] }).catch(console.error);
+    }
+  }
+
   private notifyComplete(channelId: string, status: CompletionStatus): void {
     if (this.completionNotified.has(channelId)) return;
     this.completionNotified.add(channelId);
@@ -388,23 +402,16 @@ export class ClaudeManager {
 
     let buffer = "";
 
-    // Set a timeout for the Claude process (5 minutes)
-    const timeout = setTimeout(() => {
-      console.log("Claude process timed out, killing it");
-      claude.kill("SIGTERM");
-
-      const channel = this.channelMessages.get(channelId)?.channel;
-      if (channel) {
-        const timeoutEmbed = new EmbedBuilder()
-          .setTitle("⏰ Timeout")
-          .setDescription("Claude Code took too long to respond (5 minutes)")
-          .setColor(0xFFD700); // Yellow for timeout
-
-        channel.send({ embeds: [timeoutEmbed] }).catch(console.error);
-      }
-    }, 5 * 60 * 1000); // 5 minutes
+    // Inactivity timeout: kill if no stdout for 5 minutes (resets on each output)
+    const INACTIVITY_MS = 5 * 60 * 1000;
+    let timeout = setTimeout(() => this.handleProcessTimeout(channelId, claude), INACTIVITY_MS);
+    const resetTimeout = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => this.handleProcessTimeout(channelId, claude), INACTIVITY_MS);
+    };
 
     claude.stdout.on("data", (data) => {
+      resetTimeout();
       const rawData = data.toString();
       console.log("Raw stdout data:", rawData);
 
