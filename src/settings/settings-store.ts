@@ -17,6 +17,7 @@ interface SettingsData {
     perRepo: Record<string, CustomCommand[]>;
   };
   teleportOverrides?: Record<string, string>;
+  directoryOverrides?: Record<string, string>; // channelId -> absolute path
 }
 
 export class SettingsStore {
@@ -132,6 +133,22 @@ export class SettingsStore {
       delete this.data.teleportOverrides[channelId];
       this.save();
     }
+  }
+
+  // --- Directory overrides (for adopted external sessions) ---
+
+  getDirectoryOverride(channelId: string): string | undefined {
+    return this.data.directoryOverrides?.[channelId];
+  }
+
+  setDirectoryOverride(channelId: string, dirPath: string): void {
+    if (!this.data.directoryOverrides) this.data.directoryOverrides = {};
+    this.data.directoryOverrides[channelId] = dirPath;
+    this.save();
+  }
+
+  getAllDirectoryOverrides(): Record<string, string> {
+    return { ...(this.data.directoryOverrides || {}) };
   }
 
   // --- Custom commands ---

@@ -157,6 +157,7 @@ Type any message in a channel that corresponds to a repository folder. The bot w
 - **/shortcut**: Manage custom `!command` shortcuts (add/remove/list)
 - **/sync**: Merge main into all active worktrees for this project
 - **/end**: End a worktree session — pushes branch to origin, removes the worktree, and locks/archives the thread
+- **/adopt**: Adopt a Claude CLI session started outside the bot (e.g., from a terminal in `~/Documents`). Autocomplete shows sessions not already in `BASE_FOLDER`. Creates a channel with a persistent directory override.
 - **/init**: Set this channel's category as the home for startup links
 
 ### Example

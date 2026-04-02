@@ -94,6 +94,22 @@ export class CommandHandler {
         .setName("end")
         .setDescription("End a worktree session: push branch, remove worktree, lock thread"),
       new SlashCommandBuilder()
+        .setName("adopt")
+        .setDescription("Adopt an external Claude CLI session into a new channel")
+        .addStringOption((option: any) =>
+          option
+            .setName("session")
+            .setDescription("Session to adopt (search by path)")
+            .setRequired(true)
+            .setAutocomplete(true)
+        )
+        .addStringOption((option: any) =>
+          option
+            .setName("name")
+            .setDescription("Custom channel name (defaults to folder name)")
+            .setRequired(false)
+        ),
+      new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
         .addStringOption((option: any) =>
@@ -125,10 +141,12 @@ export class CommandHandler {
   }
 
   async handleInteraction(interaction: any): Promise<void> {
-    // Handle autocomplete for /add command
+    // Handle autocomplete
     if (interaction.isAutocomplete?.()) {
       if (interaction.commandName === "add") {
         await this.handleAddAutocomplete(interaction);
+      } else if (interaction.commandName === "adopt") {
+        await this.handleAdoptAutocomplete(interaction);
       }
       return;
     }
@@ -223,6 +241,10 @@ export class CommandHandler {
       await this.handleFileCommand(interaction);
     }
 
+    if (interaction.commandName === "adopt") {
+      await this.handleAdoptCommand(interaction);
+    }
+
     if (interaction.commandName === "init") {
       const categoryId = interaction.channel?.parentId;
       if (!categoryId) {
@@ -305,6 +327,151 @@ export class CommandHandler {
       await interaction.reply(`Created <#${newChannel.id}> for project \`${folderName}\``);
     } catch (error) {
       console.error("Error creating channel:", error);
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
+    }
+  }
+
+  /**
+   * Extract the real cwd from the first line of the most recent session JSONL.
+   * Claude CLI stores the original working directory in every session entry.
+   */
+  private extractCwdFromSession(claudeProjectDir: string): { cwd: string; sessionId: string } | null {
+    let latestFile: string | undefined;
+    let latestTime = 0;
+    try {
+      for (const file of fs.readdirSync(claudeProjectDir)) {
+        if (!file.endsWith(".jsonl")) continue;
+        const stat = fs.statSync(path.join(claudeProjectDir, file));
+        if (stat.mtimeMs > latestTime) {
+          latestTime = stat.mtimeMs;
+          latestFile = file;
+        }
+      }
+    } catch { return null; }
+
+    if (!latestFile) return null;
+
+    try {
+      const fd = fs.openSync(path.join(claudeProjectDir, latestFile), "r");
+      const buf = Buffer.alloc(4096);
+      fs.readSync(fd, buf, 0, 4096, 0);
+      fs.closeSync(fd);
+      const firstLine = buf.toString("utf-8").split("\n")[0]!;
+      const parsed = JSON.parse(firstLine);
+      if (parsed.cwd) {
+        return { cwd: parsed.cwd, sessionId: latestFile.replace(".jsonl", "") };
+      }
+    } catch { /* ignore parse errors */ }
+
+    return null;
+  }
+
+  /**
+   * Autocomplete handler for /adopt - lists orphan Claude CLI sessions
+   */
+  private async handleAdoptAutocomplete(interaction: any): Promise<void> {
+    const focused = interaction.options.getFocused().toLowerCase();
+
+    try {
+      const claudeProjectsDir = path.join(os.homedir(), ".claude", "projects");
+      if (!fs.existsSync(claudeProjectsDir)) {
+        await interaction.respond([]);
+        return;
+      }
+
+      const entries = fs.readdirSync(claudeProjectsDir, { withFileTypes: true });
+      const baseFolderNorm = path.resolve(this.baseFolder);
+
+      const results: { name: string; value: string }[] = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+
+        const projectDir = path.join(claudeProjectsDir, entry.name);
+        const info = this.extractCwdFromSession(projectDir);
+        if (!info) continue;
+
+        const resolvedCwd = path.resolve(info.cwd);
+
+        // Skip projects under BASE_FOLDER (already manageable via /add)
+        if (resolvedCwd.startsWith(baseFolderNorm + path.sep) || resolvedCwd === baseFolderNorm) continue;
+
+        // Filter by search term
+        if (!info.cwd.toLowerCase().includes(focused)) continue;
+
+        // Discord autocomplete: name max 100 chars, value max 100 chars
+        const shortName = info.cwd.length > 100 ? "..." + info.cwd.slice(-97) : info.cwd;
+        results.push({ name: shortName, value: entry.name });
+
+        if (results.length >= 25) break;
+      }
+
+      await interaction.respond(results);
+    } catch (error) {
+      console.error("Error in adopt autocomplete:", error);
+      await interaction.respond([]);
+    }
+  }
+
+  /**
+   * Handle /adopt command - create a channel for an external Claude CLI session
+   */
+  private async handleAdoptCommand(interaction: any): Promise<void> {
+    const mangledName = interaction.options.getString("session");
+    const customName = interaction.options.getString("name");
+    const guild = interaction.guild;
+
+    if (!guild) {
+      await interaction.reply({ content: "This command can only be used in a server.", ephemeral: true });
+      return;
+    }
+
+    // Extract the real path from the session file
+    const claudeProjectDir = path.join(os.homedir(), ".claude", "projects", mangledName);
+    const info = this.extractCwdFromSession(claudeProjectDir);
+    if (!info) {
+      await interaction.reply({ content: "Could not read session data for this project.", ephemeral: true });
+      return;
+    }
+
+    const realPath = info.cwd;
+    if (!fs.existsSync(realPath)) {
+      await interaction.reply({ content: `Directory not found: \`${realPath}\``, ephemeral: true });
+      return;
+    }
+
+    // Determine channel name: custom name, or last path segment sanitized for Discord
+    const channelName = customName || path.basename(realPath).toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
+
+    // Check for existing channel
+    const sourceChannel = interaction.channel;
+    const categoryId = sourceChannel?.parentId || null;
+    const existing = guild.channels.cache.find(
+      (ch: any) => ch.name === channelName && ch.parentId === categoryId
+    );
+    if (existing) {
+      await interaction.reply({ content: `Channel <#${existing.id}> already exists.`, ephemeral: true });
+      return;
+    }
+
+    try {
+      const newChannel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: categoryId,
+      });
+
+      // Persist the directory override so it survives restarts
+      this.settings?.setDirectoryOverride(newChannel.id, realPath);
+      this.claudeManager.setWorkingDirOverride(newChannel.id, realPath);
+
+      // Link the session
+      this.claudeManager.setSessionFromAdopt(newChannel.id, info.sessionId, channelName);
+
+      let reply = `Created <#${newChannel.id}> → \`${realPath}\``;
+      reply += `\nLinked session: \`${info.sessionId.slice(0, 8)}...\``;
+      await interaction.reply(reply);
+    } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
     }

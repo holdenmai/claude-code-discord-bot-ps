@@ -75,6 +75,10 @@ export class ClaudeManager {
       for (const [channelId, enabled] of Object.entries(planModes)) {
         this.channelPlanMode.set(channelId, enabled);
       }
+      const dirOverrides = settings.getAllDirectoryOverrides();
+      for (const [channelId, dir] of Object.entries(dirOverrides)) {
+        this.workingDirOverrides.set(channelId, dir);
+      }
     }
   }
 
@@ -287,6 +291,10 @@ export class ClaudeManager {
 
   getSessionId(channelId: string): string | undefined {
     return this.db.getSession(channelId);
+  }
+
+  setSessionFromAdopt(channelId: string, sessionId: string, channelName: string): void {
+    this.db.setSession(channelId, sessionId, channelName);
   }
 
   getInterruptedRuns(): { channelId: string; channelName: string; startedAt: number }[] {
