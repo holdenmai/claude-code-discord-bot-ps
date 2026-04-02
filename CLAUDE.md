@@ -47,6 +47,8 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - `/sync` - Merge main into all active worktrees for this project
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread
 - `/adopt` - Adopt an external Claude CLI session into a new channel (with autocomplete)
+- `/status` - Show summary of recent activity across all project channels
+- `/todo` - Per-channel todo notes (add/list/done/clear)
 - `/init` - Set this channel's category as the home for startup links
 - `!oncrash` shortcut - If configured, auto-runs on startup for any session interrupted by a crash
 

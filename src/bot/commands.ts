@@ -110,6 +110,34 @@ export class CommandHandler {
             .setRequired(false)
         ),
       new SlashCommandBuilder()
+        .setName("status")
+        .setDescription("Show a summary of recent activity across all project channels"),
+      new SlashCommandBuilder()
+        .setName("todo")
+        .setDescription("Manage per-channel todo notes")
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("add")
+            .setDescription("Add a todo to this channel")
+            .addStringOption((o: any) => o.setName("text").setDescription("Todo text").setRequired(true))
+        )
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("list")
+            .setDescription("Show todos for this channel")
+        )
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("done")
+            .setDescription("Toggle a todo's completion status")
+            .addIntegerOption((o: any) => o.setName("number").setDescription("Todo number from the list").setRequired(true))
+        )
+        .addSubcommand((sub: any) =>
+          sub
+            .setName("clear")
+            .setDescription("Remove completed todos")
+        ),
+      new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
         .addStringOption((option: any) =>
@@ -162,7 +190,9 @@ export class CommandHandler {
     }
 
     // Multi-instance guard: skip if another instance owns this channel
-    if (this.instanceRouter) {
+    // Read-only commands bypass this guard — they don't spawn Claude processes
+    const readOnlyCommands = new Set(["status", "todo"]);
+    if (this.instanceRouter && !readOnlyCommands.has(interaction.commandName)) {
       const channel = interaction.channel;
       const isThread = channel?.isThread?.();
       const routingId = isThread ? (channel.parent?.id || interaction.channelId) : interaction.channelId;
@@ -239,6 +269,14 @@ export class CommandHandler {
 
     if (interaction.commandName === "file") {
       await this.handleFileCommand(interaction);
+    }
+
+    if (interaction.commandName === "status") {
+      await this.handleStatusCommand(interaction);
+    }
+
+    if (interaction.commandName === "todo") {
+      await this.handleTodoCommand(interaction);
     }
 
     if (interaction.commandName === "adopt") {
@@ -474,6 +512,185 @@ export class CommandHandler {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.reply({ content: `Failed to create channel: ${msg}`, ephemeral: true });
+    }
+  }
+
+  /**
+   * Handle /status command - show summary of recent activity across project channels.
+   */
+  private async handleStatusCommand(interaction: any): Promise<void> {
+    const home = this.settings?.getHomeCategory();
+    if (!home) {
+      await interaction.reply({ content: "No home category set. Run `/init` in your project category first.", ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const sessions = this.claudeManager.getAllSessions();
+    if (sessions.length === 0) {
+      await interaction.editReply("No sessions found.");
+      return;
+    }
+
+    // Get channels in home category to filter
+    let homeChanelIds: Set<string>;
+    try {
+      const guild = await interaction.client.guilds.fetch(home.guildId);
+      const channels = await guild.channels.fetch();
+      const homeChannels = channels.filter(
+        (ch: any): ch is NonNullable<typeof ch> =>
+          ch !== null && ch.parentId === home.categoryId
+      );
+      homeChanelIds = new Set(homeChannels.map((ch: any) => ch.id));
+
+      // Also include threads under those channels
+      for (const ch of homeChannels.values()) {
+        if ('threads' in ch) {
+          const threads = await (ch as any).threads.fetchActive();
+          for (const [id] of threads.threads) {
+            homeChanelIds.add(id);
+          }
+        }
+      }
+    } catch (error) {
+      await interaction.editReply("Failed to fetch home category channels.");
+      return;
+    }
+
+    const filtered = sessions.filter(s => homeChanelIds.has(s.channelId));
+    if (filtered.length === 0) {
+      await interaction.editReply("No sessions found in the home category.");
+      return;
+    }
+
+    const now = Date.now();
+    const lines: string[] = [];
+    for (const s of filtered.slice(0, 15)) {
+      const ago = this.formatRelativeTime(now - s.lastUsed);
+      const channel = `<#${s.channelId}>`;
+      let meta = ago;
+      if (s.lastNumTurns) meta += ` — ${s.lastNumTurns} turns`;
+      if (s.lastCostUsd) meta += `, $${s.lastCostUsd.toFixed(2)}`;
+
+      let line = `${channel} (${meta})`;
+
+      // Show recent prompt/result history for context
+      const history = this.claudeManager.getPromptHistory(s.channelId, 5);
+      if (history.length > 0) {
+        for (const h of history) {
+          const prompt = h.prompt.slice(0, 80).replace(/\n/g, " ");
+          line += `\n> 💬 ${prompt}${h.prompt.length > 80 ? "..." : ""}`;
+          if (h.resultSummary) {
+            const result = h.resultSummary.slice(0, 80).replace(/\n/g, " ");
+            line += `\n> ✅ ${result}${h.resultSummary.length > 80 ? "..." : ""}`;
+          }
+        }
+      } else if (s.lastSummary) {
+        // Fallback to single summary if no history yet
+        const summary = s.lastSummary.slice(0, 120).replace(/\n/g, " ");
+        line += `\n> ${summary}${s.lastSummary.length > 120 ? "..." : ""}`;
+      }
+      lines.push(line);
+    }
+
+    const content = `📊 **Project Status**\n\n${lines.join("\n\n")}`;
+
+    // Discord message limit is 2000 chars for ephemeral
+    if (content.length > 2000) {
+      await interaction.editReply(content.slice(0, 1997) + "...");
+    } else {
+      await interaction.editReply(content);
+    }
+  }
+
+  private formatRelativeTime(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return "just now";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  }
+
+  /**
+   * Handle /todo command - per-channel todo notes.
+   */
+  private async handleTodoCommand(interaction: any): Promise<void> {
+    const sub = interaction.options.getSubcommand();
+    const channelId = interaction.channelId;
+    const channel = interaction.channel;
+    const isThread = channel?.isThread?.();
+    const parentChannelId = isThread ? channel.parentId : undefined;
+
+    if (sub === "add") {
+      const text = interaction.options.getString("text");
+      this.claudeManager.addTodo(channelId, text, parentChannelId);
+      await interaction.reply({ content: `✅ Added: ${text}`, ephemeral: true });
+
+    } else if (sub === "list") {
+      // From parent channel: show own todos + child thread todos
+      // From thread: show only that thread's todos
+      const todos = isThread
+        ? this.claudeManager.getTodos(channelId)
+        : this.claudeManager.getChannelAndChildTodos(channelId);
+
+      if (todos.length === 0) {
+        await interaction.reply({ content: "No todos for this channel.", ephemeral: true });
+        return;
+      }
+
+      const channelName = isThread
+        ? channel.parent?.name || "channel"
+        : channel?.name || "channel";
+
+      // Group by channel for parent view
+      const lines: string[] = [];
+      let currentGroup = "";
+      let idx = 1;
+      for (const todo of todos) {
+        if (!isThread && todo.channelId !== channelId) {
+          // Thread todo — group header
+          const threadLabel = `<#${todo.channelId}>`;
+          if (threadLabel !== currentGroup) {
+            currentGroup = threadLabel;
+            lines.push(`\n**${threadLabel}**`);
+          }
+        }
+        const check = todo.completed ? "☑" : "☐";
+        lines.push(`${idx}. ${check} ${todo.text}`);
+        idx++;
+      }
+
+      const header = `📝 **Todos for #${channelName}**\n`;
+      await interaction.reply({ content: header + lines.join("\n"), ephemeral: true });
+
+    } else if (sub === "done") {
+      const num = interaction.options.getInteger("number");
+      const todos = isThread
+        ? this.claudeManager.getTodos(channelId)
+        : this.claudeManager.getChannelAndChildTodos(channelId);
+
+      if (num < 1 || num > todos.length) {
+        await interaction.reply({ content: `Invalid number. Use 1-${todos.length}.`, ephemeral: true });
+        return;
+      }
+
+      const todo = todos[num - 1]!;
+      // Toggle: if completed, uncomplete; if not, complete
+      if (todo.completed) {
+        this.claudeManager.uncompleteTodo(todo.id);
+        await interaction.reply({ content: `☐ Uncompleted: ${todo.text}`, ephemeral: true });
+      } else {
+        this.claudeManager.completeTodo(todo.id);
+        await interaction.reply({ content: `☑ Done: ${todo.text}`, ephemeral: true });
+      }
+
+    } else if (sub === "clear") {
+      const count = this.claudeManager.clearCompletedTodos(channelId);
+      await interaction.reply({ content: `Cleared ${count} completed todo${count !== 1 ? "s" : ""}.`, ephemeral: true });
     }
   }
 

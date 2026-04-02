@@ -158,6 +158,8 @@ Type any message in a channel that corresponds to a repository folder. The bot w
 - **/sync**: Merge main into all active worktrees for this project
 - **/end**: End a worktree session — pushes branch to origin, removes the worktree, and locks/archives the thread
 - **/adopt**: Adopt a Claude CLI session started outside the bot (e.g., from a terminal in `~/Documents`). Autocomplete shows sessions not already in `BASE_FOLDER`. Creates a channel with a persistent directory override.
+- **/status**: Show a summary of recent activity across all project channels in the home category — includes last summary, turn count, and cost
+- **/todo**: Per-channel todo notes. Subcommands: `add`, `list`, `done`, `clear`. Thread todos are visible from the parent channel.
 - **/init**: Set this channel's category as the home for startup links
 
 ### Example

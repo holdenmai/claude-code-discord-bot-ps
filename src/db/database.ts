@@ -6,6 +6,18 @@ export interface ChannelSession {
   sessionId: string;
   channelName: string;
   lastUsed: number;
+  lastSummary?: string;
+  lastCostUsd?: number;
+  lastNumTurns?: number;
+}
+
+export interface Todo {
+  id: number;
+  channelId: string;
+  parentChannelId?: string;
+  text: string;
+  completed: boolean;
+  createdAt: number;
 }
 
 export class DatabaseManager {
@@ -28,12 +40,44 @@ export class DatabaseManager {
       )
     `);
 
+    // Add summary columns to channel_sessions (idempotent migration)
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_summary TEXT"); } catch {}
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_cost_usd REAL"); } catch {}
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_num_turns INTEGER"); } catch {}
+
     // Track actively running processes — rows left after crash = interrupted runs
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS active_runs (
         channel_id TEXT PRIMARY KEY,
         channel_name TEXT NOT NULL,
         started_at INTEGER NOT NULL
+      )
+    `);
+
+    // Prompt/result history for /status context
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        result_summary TEXT,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_prompt_history_channel
+      ON prompt_history(channel_id, created_at DESC)
+    `);
+
+    // Per-channel todos
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS todos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        parent_channel_id TEXT,
+        text TEXT NOT NULL,
+        completed INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
       )
     `);
   }
@@ -59,7 +103,52 @@ export class DatabaseManager {
 
   getAllSessions(): ChannelSession[] {
     const stmt = this.db.query("SELECT * FROM channel_sessions ORDER BY last_used DESC");
-    return stmt.all() as ChannelSession[];
+    return (stmt.all() as any[]).map(r => ({
+      channelId: r.channel_id,
+      sessionId: r.session_id,
+      channelName: r.channel_name,
+      lastUsed: r.last_used,
+      lastSummary: r.last_summary ?? undefined,
+      lastCostUsd: r.last_cost_usd ?? undefined,
+      lastNumTurns: r.last_num_turns ?? undefined,
+    }));
+  }
+
+  updateSessionSummary(channelId: string, summary: string, costUsd: number, numTurns: number): void {
+    const stmt = this.db.query(`
+      UPDATE channel_sessions SET last_summary = ?, last_cost_usd = ?, last_num_turns = ?, last_used = ?
+      WHERE channel_id = ?
+    `);
+    stmt.run(summary, costUsd, numTurns, Date.now(), channelId);
+  }
+
+  // --- Prompt history ---
+
+  addPromptHistory(channelId: string, prompt: string, resultSummary: string | null): void {
+    const stmt = this.db.query(`
+      INSERT INTO prompt_history (channel_id, prompt, result_summary, created_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(channelId, prompt, resultSummary, Date.now());
+
+    // Prune to keep only the last 10 per channel
+    this.db.query(`
+      DELETE FROM prompt_history WHERE channel_id = ? AND id NOT IN (
+        SELECT id FROM prompt_history WHERE channel_id = ? ORDER BY created_at DESC LIMIT 10
+      )
+    `).run(channelId, channelId);
+  }
+
+  getPromptHistory(channelId: string, limit: number = 5): { prompt: string; resultSummary: string | null; createdAt: number }[] {
+    const stmt = this.db.query(`
+      SELECT prompt, result_summary, created_at FROM prompt_history
+      WHERE channel_id = ? ORDER BY created_at DESC LIMIT ?
+    `);
+    return (stmt.all(channelId, limit) as any[]).map(r => ({
+      prompt: r.prompt,
+      resultSummary: r.result_summary,
+      createdAt: r.created_at,
+    })).reverse(); // chronological order
   }
 
   // Clean up old sessions (older than 30 days)
@@ -97,6 +186,64 @@ export class DatabaseManager {
 
   clearAllActiveRuns(): void {
     this.db.exec("DELETE FROM active_runs");
+  }
+
+  // --- Todos ---
+
+  addTodo(channelId: string, text: string, parentChannelId?: string): Todo {
+    const stmt = this.db.query(`
+      INSERT INTO todos (channel_id, parent_channel_id, text, completed, created_at)
+      VALUES (?, ?, ?, 0, ?)
+    `);
+    const result = stmt.run(channelId, parentChannelId || null, text, Date.now());
+    return {
+      id: Number(result.lastInsertRowid),
+      channelId,
+      parentChannelId,
+      text,
+      completed: false,
+      createdAt: Date.now(),
+    };
+  }
+
+  getTodos(channelId: string): Todo[] {
+    const stmt = this.db.query(
+      "SELECT * FROM todos WHERE channel_id = ? ORDER BY created_at ASC"
+    );
+    return (stmt.all(channelId) as any[]).map(this.mapTodoRow);
+  }
+
+  getChannelAndChildTodos(channelId: string): Todo[] {
+    const stmt = this.db.query(
+      "SELECT * FROM todos WHERE channel_id = ? OR parent_channel_id = ? ORDER BY created_at ASC"
+    );
+    return (stmt.all(channelId, channelId) as any[]).map(this.mapTodoRow);
+  }
+
+  completeTodo(id: number): boolean {
+    const stmt = this.db.query("UPDATE todos SET completed = 1 WHERE id = ?");
+    return stmt.run(id).changes > 0;
+  }
+
+  uncompleteTodo(id: number): boolean {
+    const stmt = this.db.query("UPDATE todos SET completed = 0 WHERE id = ?");
+    return stmt.run(id).changes > 0;
+  }
+
+  clearCompletedTodos(channelId: string): number {
+    const stmt = this.db.query("DELETE FROM todos WHERE channel_id = ? AND completed = 1");
+    return stmt.run(channelId).changes;
+  }
+
+  private mapTodoRow(r: any): Todo {
+    return {
+      id: r.id,
+      channelId: r.channel_id,
+      parentChannelId: r.parent_channel_id ?? undefined,
+      text: r.text,
+      completed: r.completed === 1,
+      createdAt: r.created_at,
+    };
   }
 
   close(): void {

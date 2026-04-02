@@ -305,6 +305,33 @@ export class ClaudeManager {
     this.db.clearAllActiveRuns();
   }
 
+  getAllSessions() {
+    return this.db.getAllSessions();
+  }
+
+  // --- Todo passthrough ---
+  addTodo(channelId: string, text: string, parentChannelId?: string) {
+    return this.db.addTodo(channelId, text, parentChannelId);
+  }
+  getTodos(channelId: string) {
+    return this.db.getTodos(channelId);
+  }
+  getChannelAndChildTodos(channelId: string) {
+    return this.db.getChannelAndChildTodos(channelId);
+  }
+  completeTodo(id: number) {
+    return this.db.completeTodo(id);
+  }
+  uncompleteTodo(id: number) {
+    return this.db.uncompleteTodo(id);
+  }
+  clearCompletedTodos(channelId: string) {
+    return this.db.clearCompletedTodos(channelId);
+  }
+  getPromptHistory(channelId: string, limit?: number) {
+    return this.db.getPromptHistory(channelId, limit);
+  }
+
   setModel(channelId: string, model: string): void {
     this.channelModels.set(channelId, model);
     this.settings?.setModel(channelId, model);
@@ -769,6 +796,15 @@ export class ClaudeManager {
     console.log("Result message:", parsed);
     const channelName = this.channelNames.get(channelId) || "default";
     this.db.setSession(channelId, parsed.session_id, channelName);
+
+    // Persist summary for /status dashboard
+    const summary = parsed.subtype === "success" && "result" in parsed ? parsed.result : `Failed: ${parsed.subtype}`;
+    this.db.updateSessionSummary(channelId, summary, parsed.total_cost_usd, parsed.num_turns);
+
+    // Store prompt/result pair for history
+    const userMsg = this.originalMessages.get(channelId);
+    const prompt = userMsg?.content || "unknown";
+    this.db.addPromptHistory(channelId, prompt, summary);
 
     this.stopTypingIndicator(channelId);
 

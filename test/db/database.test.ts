@@ -86,14 +86,17 @@ describe("DatabaseManager", () => {
   describe("getAllSessions", () => {
     it("should return all sessions", () => {
       const mockSessions = [
-        { channel_id: "channel-1", session_id: "session-1", channel_name: "channel-one", last_used: 123456 },
-        { channel_id: "channel-2", session_id: "session-2", channel_name: "channel-two", last_used: 123457 },
+        { channel_id: "channel-1", session_id: "session-1", channel_name: "channel-one", last_used: 123456, last_summary: null, last_cost_usd: null, last_num_turns: null },
+        { channel_id: "channel-2", session_id: "session-2", channel_name: "channel-two", last_used: 123457, last_summary: null, last_cost_usd: null, last_num_turns: null },
       ];
       mockAll.mockReturnValue(mockSessions);
 
       const result = db.getAllSessions();
 
-      expect(result).toEqual(mockSessions);
+      expect(result).toEqual([
+        { channelId: "channel-1", sessionId: "session-1", channelName: "channel-one", lastUsed: 123456, lastSummary: undefined, lastCostUsd: undefined, lastNumTurns: undefined },
+        { channelId: "channel-2", sessionId: "session-2", channelName: "channel-two", lastUsed: 123457, lastSummary: undefined, lastCostUsd: undefined, lastNumTurns: undefined },
+      ]);
       expect(mockAll).toHaveBeenCalled();
     });
   });

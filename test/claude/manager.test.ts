@@ -29,12 +29,21 @@ describe('ClaudeManager', () => {
       getSession: vi.fn(),
       setSession: vi.fn(),
       clearSession: vi.fn(),
-      getAllSessions: vi.fn(),
+      getAllSessions: vi.fn().mockReturnValue([]),
       cleanupOldSessions: vi.fn(),
+      updateSessionSummary: vi.fn(),
       markRunStarted: vi.fn(),
       markRunCompleted: vi.fn(),
       getInterruptedRuns: vi.fn().mockReturnValue([]),
       clearAllActiveRuns: vi.fn(),
+      addTodo: vi.fn(),
+      getTodos: vi.fn().mockReturnValue([]),
+      getChannelAndChildTodos: vi.fn().mockReturnValue([]),
+      completeTodo: vi.fn(),
+      uncompleteTodo: vi.fn(),
+      clearCompletedTodos: vi.fn().mockReturnValue(0),
+      addPromptHistory: vi.fn(),
+      getPromptHistory: vi.fn().mockReturnValue([]),
       close: vi.fn()
     };
     vi.mocked(DatabaseManager).mockImplementation(() => mockDb);
