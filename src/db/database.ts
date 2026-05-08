@@ -11,6 +11,13 @@ export interface ChannelSession {
   lastNumTurns?: number;
 }
 
+export interface PausedSession {
+  channelId: string;
+  name: string;
+  sessionId: string;
+  pausedAt: number;
+}
+
 export interface Todo {
   id: number;
   channelId: string;
@@ -67,6 +74,17 @@ export class DatabaseManager {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_prompt_history_channel
       ON prompt_history(channel_id, created_at DESC)
+    `);
+
+    // Paused (named) sessions per channel
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS paused_sessions (
+        channel_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        paused_at INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, name)
+      )
     `);
 
     // Per-channel todos
@@ -159,6 +177,47 @@ export class DatabaseManager {
     if (result.changes > 0) {
       console.log(`Cleaned up ${result.changes} old sessions`);
     }
+  }
+
+  // --- Paused sessions ---
+
+  pauseSession(channelId: string, name: string, sessionId: string): void {
+    const stmt = this.db.query(`
+      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    stmt.run(channelId, name, sessionId, Date.now());
+  }
+
+  getPausedSessions(channelId: string): PausedSession[] {
+    const stmt = this.db.query(
+      "SELECT * FROM paused_sessions WHERE channel_id = ? ORDER BY paused_at DESC"
+    );
+    return (stmt.all(channelId) as any[]).map(r => ({
+      channelId: r.channel_id,
+      name: r.name,
+      sessionId: r.session_id,
+      pausedAt: r.paused_at,
+    }));
+  }
+
+  getPausedSession(channelId: string, name: string): PausedSession | undefined {
+    const stmt = this.db.query(
+      "SELECT * FROM paused_sessions WHERE channel_id = ? AND name = ?"
+    );
+    const r = stmt.get(channelId, name) as any | null;
+    if (!r) return undefined;
+    return {
+      channelId: r.channel_id,
+      name: r.name,
+      sessionId: r.session_id,
+      pausedAt: r.paused_at,
+    };
+  }
+
+  deletePausedSession(channelId: string, name: string): boolean {
+    const stmt = this.db.query("DELETE FROM paused_sessions WHERE channel_id = ? AND name = ?");
+    return stmt.run(channelId, name).changes > 0;
   }
 
   // Active run tracking — for crash recovery

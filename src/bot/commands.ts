@@ -138,6 +138,25 @@ export class CommandHandler {
             .setDescription("Remove completed todos")
         ),
       new SlashCommandBuilder()
+        .setName("pause")
+        .setDescription("Pause the current session with a name (next message starts fresh)")
+        .addStringOption((option: any) =>
+          option
+            .setName("name")
+            .setDescription("Name for this paused session")
+            .setRequired(true)
+        ),
+      new SlashCommandBuilder()
+        .setName("resume")
+        .setDescription("Resume a previously paused session")
+        .addStringOption((option: any) =>
+          option
+            .setName("name")
+            .setDescription("Name of the paused session to resume")
+            .setRequired(true)
+            .setAutocomplete(true)
+        ),
+      new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
         .addStringOption((option: any) =>
@@ -175,6 +194,8 @@ export class CommandHandler {
         await this.handleAddAutocomplete(interaction);
       } else if (interaction.commandName === "adopt") {
         await this.handleAdoptAutocomplete(interaction);
+      } else if (interaction.commandName === "resume") {
+        await this.handleResumeAutocomplete(interaction);
       }
       return;
     }
@@ -281,6 +302,14 @@ export class CommandHandler {
 
     if (interaction.commandName === "adopt") {
       await this.handleAdoptCommand(interaction);
+    }
+
+    if (interaction.commandName === "pause") {
+      await this.handlePauseCommand(interaction);
+    }
+
+    if (interaction.commandName === "resume") {
+      await this.handleResumeCommand(interaction);
     }
 
     if (interaction.commandName === "init") {
@@ -1166,4 +1195,74 @@ WshShell.Run "cmd /k bun run start", 1, False
       await interaction.editReply(`❌ Update failed: ${msg}`);
     }
   }
+
+  private async handlePauseCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const name = interaction.options.getString("name");
+
+    if (this.claudeManager.hasActiveProcess(channelId)) {
+      await interaction.reply({
+        content: "Cannot pause while a process is running. Use `/kill` first.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const success = this.claudeManager.pauseSession(channelId, name);
+    if (success) {
+      await interaction.reply(`Session paused as **${name}**. Next message will start a new session.`);
+    } else {
+      await interaction.reply({
+        content: "No active session to pause in this channel.",
+        ephemeral: true,
+      });
+    }
+  }
+
+  private async handleResumeCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const name = interaction.options.getString("name");
+    const channelName = interaction.channel?.name || channelId;
+
+    const success = this.claudeManager.resumeSession(channelId, name, channelName);
+    if (success) {
+      await interaction.reply(`Resumed session **${name}**. Next message will continue that session.`);
+    } else {
+      await interaction.reply({
+        content: `No paused session named **${name}** in this channel.`,
+        ephemeral: true,
+      });
+    }
+  }
+
+  private async handleResumeAutocomplete(interaction: any): Promise<void> {
+    const focused = interaction.options.getFocused().toLowerCase();
+    const channelId = interaction.channelId;
+
+    try {
+      const paused = this.claudeManager.getPausedSessions(channelId);
+      const filtered = paused
+        .filter(s => s.name.toLowerCase().includes(focused))
+        .slice(0, 25);
+
+      await interaction.respond(
+        filtered.map(s => {
+          const age = formatAge(s.pausedAt);
+          return { name: `${s.name} (paused ${age})`, value: s.name };
+        })
+      );
+    } catch {
+      await interaction.respond([]);
+    }
+  }
+}
+
+function formatAge(timestamp: number): string {
+  const diff = Date.now() - timestamp;
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }

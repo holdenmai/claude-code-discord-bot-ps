@@ -297,6 +297,26 @@ export class ClaudeManager {
     this.db.setSession(channelId, sessionId, channelName);
   }
 
+  pauseSession(channelId: string, name: string): boolean {
+    const sessionId = this.db.getSession(channelId);
+    if (!sessionId) return false;
+    this.db.pauseSession(channelId, name, sessionId);
+    this.clearSession(channelId);
+    return true;
+  }
+
+  resumeSession(channelId: string, name: string, channelName: string): boolean {
+    const paused = this.db.getPausedSession(channelId, name);
+    if (!paused) return false;
+    this.db.setSession(channelId, paused.sessionId, channelName);
+    this.db.deletePausedSession(channelId, name);
+    return true;
+  }
+
+  getPausedSessions(channelId: string) {
+    return this.db.getPausedSessions(channelId);
+  }
+
   getInterruptedRuns(): { channelId: string; channelName: string; startedAt: number }[] {
     return this.db.getInterruptedRuns();
   }
