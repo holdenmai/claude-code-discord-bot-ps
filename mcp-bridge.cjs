@@ -9,20 +9,31 @@ console.error(`MCP Bridge startup: DISCORD_CHANNEL_ID=${process.env.DISCORD_CHAN
 
 const MCP_SERVER_URL = 'http://localhost:3001/mcp';
 
+// Buffer for incomplete lines across chunks
+let lineBuffer = '';
+
 // Transform stream to handle MCP messages
 const mcpTransform = new Transform({
   objectMode: false,
   transform(chunk, encoding, callback) {
-    const data = chunk.toString();
-    
-    // Skip empty lines
-    if (!data.trim()) {
+    lineBuffer += chunk.toString();
+
+    // Split by newlines and process each complete JSON message separately
+    const lines = lineBuffer.split('\n');
+    // Keep the last element (may be incomplete)
+    lineBuffer = lines.pop() || '';
+
+    const messages = lines.filter(line => line.trim());
+
+    if (messages.length === 0) {
       callback();
       return;
     }
 
-    // Make HTTP request to our MCP server
-    const postData = data;
+    let pending = messages.length;
+    const self = this;
+
+    for (const postData of messages) {
     
     // Add Discord context environment variables as headers
     const headers = {
@@ -56,26 +67,29 @@ const mcpTransform = new Transform({
 
     const req = http.request(options, (res) => {
       let responseData = '';
-      
+
       res.on('data', (chunk) => {
         responseData += chunk;
       });
-      
+
       res.on('end', () => {
-        // Handle Server-Sent Events format
-        if (responseData.startsWith('event: message\ndata: ')) {
-          const jsonData = responseData.replace('event: message\ndata: ', '').trim();
-          this.push(jsonData + '\n');
-        } else {
-          this.push(responseData);
+        // Handle Server-Sent Events format — may contain multiple events
+        const events = responseData.split('\n\n').filter(e => e.trim());
+        for (const event of events) {
+          if (event.startsWith('event: message\ndata: ')) {
+            const jsonData = event.replace('event: message\ndata: ', '').trim();
+            self.push(jsonData + '\n');
+          } else if (event.trim()) {
+            self.push(event);
+          }
         }
-        callback();
+        if (--pending === 0) callback();
       });
     });
 
     req.on('error', (err) => {
       console.error('MCP Bridge Error:', err);
-      this.push(JSON.stringify({
+      self.push(JSON.stringify({
         jsonrpc: '2.0',
         error: {
           code: -32603,
@@ -83,11 +97,12 @@ const mcpTransform = new Transform({
         },
         id: null
       }) + '\n');
-      callback();
+      if (--pending === 0) callback();
     });
 
     req.write(postData);
     req.end();
+    } // end for loop
   }
 });
 
