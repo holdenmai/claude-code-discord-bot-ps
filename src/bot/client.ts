@@ -104,7 +104,7 @@ export class DiscordBot {
       // Dequeue the next message for this channel
       const next = await this.messageQueue.dequeueNext(channelId);
       if (next) {
-        await this.processMessage(next.message, channelId, next.channelName, next.prompt, next.imageUrls);
+        await this.processMessage(next.message, channelId, next.channelName, next.prompt, next.imageUrls, next.shortcutName);
       }
     });
   }
@@ -400,9 +400,9 @@ export class DiscordBot {
           }
         }
 
-        const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, prompt, imageAttachments);
+        const wasQueued = await this.messageQueue.enqueue(channelId, message, channelName, prompt, imageAttachments, cmdName);
         if (!wasQueued) {
-          await this.processMessage(message, channelId, channelName, prompt, imageAttachments);
+          await this.processMessage(message, channelId, channelName, prompt, imageAttachments, cmdName);
         }
         return;
       }
@@ -467,7 +467,7 @@ export class DiscordBot {
   /**
    * Shared processing logic for both direct and queued messages.
    */
-  private async processMessage(message: any, channelId: string, channelName: string, prompt: string, imageUrls: string[] = []): Promise<void> {
+  private async processMessage(message: any, channelId: string, channelName: string, prompt: string, imageUrls: string[] = [], shortcutName?: string): Promise<void> {
     const sessionId = this.claudeManager.getSessionId(channelId);
 
     console.log(`Received message in channel: ${channelName} (${channelId})`);
@@ -501,9 +501,10 @@ export class DiscordBot {
           .setTitle(`🆕 Starting New Session${planTag}`)
           .setDescription(planMode ? "Initializing Claude Code in **plan mode**..." : "Initializing Claude Code...");
       } else {
+        const shortcutInfo = shortcutName ? `\n**!${shortcutName} prompt:** ${prompt.length > 200 ? prompt.slice(0, 200) + "…" : prompt}` : "";
         statusEmbed
           .setTitle(`🔄 Continuing Session${planTag}`)
-          .setDescription(`**Session ID:** ${sessionId}\n${planMode ? "Resuming in **plan mode**..." : "Resuming Claude Code..."}`);
+          .setDescription(`**Session ID:** ${sessionId}\n${planMode ? "Resuming in **plan mode**..." : "Resuming Claude Code..."}${shortcutInfo}`);
       }
 
       // Create initial Discord message

@@ -3,6 +3,7 @@ interface QueuedMessage {
   channelName: string;
   prompt: string;
   imageUrls?: string[];
+  shortcutName?: string;
 }
 
 export class MessageQueue {
@@ -13,13 +14,13 @@ export class MessageQueue {
    * Enqueue a message for a channel. Returns true if the message was queued
    * (channel busy), false if the channel is free and the caller should process immediately.
    */
-  async enqueue(channelId: string, message: any, channelName: string, prompt: string, imageUrls?: string[]): Promise<boolean> {
+  async enqueue(channelId: string, message: any, channelName: string, prompt: string, imageUrls?: string[], shortcutName?: string): Promise<boolean> {
     if (this.processing.has(channelId)) {
       // Channel is busy — queue the message and react with ⏳
       if (!this.queues.has(channelId)) {
         this.queues.set(channelId, []);
       }
-      this.queues.get(channelId)!.push({ message, channelName, prompt, imageUrls });
+      this.queues.get(channelId)!.push({ message, channelName, prompt, imageUrls, shortcutName });
 
       try {
         await message.react("⏳");
