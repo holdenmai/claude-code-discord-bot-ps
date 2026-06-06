@@ -43,6 +43,21 @@ export type SDKMessage =
       }[];
       model: string;
       permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
+    }
+  | {
+      // Background-task (Monitor/watcher) lifecycle events. The CLI keeps the
+      // process alive past a turn's `result` to deliver these.
+      type: "system";
+      subtype: "task_started" | "task_notification" | "task_updated";
+      session_id: string;
+      task_id?: string;
+      tool_use_id?: string;
+      task_type?: string;
+      description?: string;
+      status?: string;
+      output_file?: string;
+      summary?: string;
+      patch?: { status?: string; end_time?: number };
     };
 
 export interface ChannelProcess {

@@ -55,6 +55,21 @@ export class ClaudeManager {
   // Context usage tracking: channels that have already been warned
   private contextWarned = new Set<string>();
 
+  // --- Background-task (Monitor/watcher) tracking ---
+  // Active watcher task IDs per channel. A turn's `result` no longer ends the
+  // process while this set is non-empty; the CLI keeps it alive to deliver
+  // watcher notifications.
+  private channelWatchers = new Map<string, Set<string>>();
+  // Channels whose turn produced a `result` while watchers were still running.
+  private resultSeen = new Set<string>();
+  // Completion status deferred until process close (watcher-holding runs), so we
+  // don't advance the queue — and spawn a second process — while a watcher is live.
+  private pendingCompletion = new Map<string, CompletionStatus>();
+  // Watcher notifications already surfaced to Discord (dedupe): channelId -> task IDs.
+  private notifiedTasks = new Map<string, Set<string>>();
+  // Channels that have already posted an "init" embed (guards duplicate inits).
+  private initPosted = new Set<string>();
+
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
 
@@ -120,6 +135,11 @@ export class ClaudeManager {
     this.channelDiscordContexts.delete(channelId);
     this.workingDirOverrides.delete(channelId);
     this.contextWarned.delete(channelId);
+    this.channelWatchers.delete(channelId);
+    this.resultSeen.delete(channelId);
+    this.pendingCompletion.delete(channelId);
+    this.notifiedTasks.delete(channelId);
+    this.initPosted.delete(channelId);
     this.cleanupTaskThreads(channelId);
   }
 
@@ -457,12 +477,26 @@ export class ClaudeManager {
 
     let buffer = "";
 
-    // Inactivity timeout: kill if no stdout for 5 minutes (resets on each output)
+    // Inactivity timeout: kill if no stdout for 5 minutes (resets on each output).
+    // While a watcher (Monitor) is running, the process is *expected* to sit quiet
+    // — don't reap it; re-arm instead, bounded by an absolute hold cap so a stuck
+    // watcher can't pin a process open forever.
     const INACTIVITY_MS = 5 * 60 * 1000;
-    let timeout = setTimeout(() => this.handleProcessTimeout(channelId, claude), INACTIVITY_MS);
+    const MAX_WATCHER_HOLD_MS = 30 * 60 * 1000;
+    const runStartedAt = Date.now();
+    const onInactivity = () => {
+      if (this.hasActiveWatchers(channelId) && Date.now() - runStartedAt < MAX_WATCHER_HOLD_MS) {
+        const count = this.channelWatchers.get(channelId)?.size ?? 0;
+        console.log(`Inactivity window elapsed but ${count} watcher(s) active in channel ${channelId}; not reaping`);
+        timeout = setTimeout(onInactivity, INACTIVITY_MS);
+        return;
+      }
+      this.handleProcessTimeout(channelId, claude);
+    };
+    let timeout = setTimeout(onInactivity, INACTIVITY_MS);
     const resetTimeout = () => {
       clearTimeout(timeout);
-      timeout = setTimeout(() => this.handleProcessTimeout(channelId, claude), INACTIVITY_MS);
+      timeout = setTimeout(onInactivity, INACTIVITY_MS);
     };
 
     claude.stdout.on("data", (data) => {
@@ -495,14 +529,38 @@ export class ClaudeManager {
               this.handleToolResultMessage(channelId, parsed).catch(console.error);
             } else if (parsed.type === "result") {
               this.handleResultMessage(channelId, parsed).then(() => {
-                clearTimeout(timeout);
-                claude.kill("SIGTERM");
-                this.channelProcesses.delete(channelId);
+                if (this.hasActiveWatchers(channelId)) {
+                  // A turn's `result` is not the end of the process when a Monitor
+                  // watcher is still running — keep it alive to deliver the watcher's
+                  // notification. It exits on its own once watchers finish.
+                  this.resultSeen.add(channelId);
+                  const count = this.channelWatchers.get(channelId)?.size ?? 0;
+                  console.log(`Result received; ${count} watcher(s) active in channel ${channelId} — keeping process alive`);
+                  resetTimeout();
+                } else {
+                  clearTimeout(timeout);
+                  claude.kill("SIGTERM");
+                  this.channelProcesses.delete(channelId);
+                }
               }).catch(console.error);
             } else if (parsed.type === "system") {
               console.log("System message:", parsed.subtype);
               if (parsed.subtype === "init") {
                 this.handleInitMessage(channelId, parsed).catch(console.error);
+              } else if (
+                parsed.subtype === "task_started" ||
+                parsed.subtype === "task_notification" ||
+                parsed.subtype === "task_updated"
+              ) {
+                this.handleTaskMessage(channelId, parsed).then(() => {
+                  // If the turn already finished and all watchers have now drained,
+                  // re-arm the (now watcher-less) reaper as a backstop and let the
+                  // print-mode process exit on its own.
+                  if (this.resultSeen.has(channelId) && !this.hasActiveWatchers(channelId)) {
+                    console.log(`All watchers drained after result in channel ${channelId}; awaiting natural process exit`);
+                    resetTimeout();
+                  }
+                }).catch(console.error);
               }
               const channelName = this.channelNames.get(channelId) || "default";
               this.db.setSession(channelId, parsed.session_id, channelName);
@@ -521,11 +579,29 @@ export class ClaudeManager {
       // Ensure cleanup on process close
       this.channelProcesses.delete(channelId);
 
-      // Notify completion (close event as fallback — result handler is primary)
-      this.notifyComplete(channelId, "failed");
+      // Did the turn already succeed? (completion fired at result, or was deferred
+      // because watchers were holding the process open). Capture before notifying.
+      const deferred = this.pendingCompletion.get(channelId);
+      const turnSucceeded =
+        this.resultSeen.has(channelId) ||
+        deferred !== undefined ||
+        this.completionNotified.has(channelId);
 
-      if (code !== 0 && code !== null) {
-        // Process failed - send error embed to Discord
+      // Advance the queue. For watcher-holding runs this is where completion
+      // actually fires (deferred from `result`); otherwise it's the crash
+      // fallback. notifyComplete is guarded, so an earlier success wins.
+      this.notifyComplete(channelId, deferred ?? "failed");
+
+      // Clean up watcher state for this run
+      this.channelWatchers.delete(channelId);
+      this.resultSeen.delete(channelId);
+      this.pendingCompletion.delete(channelId);
+      this.notifiedTasks.delete(channelId);
+      this.initPosted.delete(channelId);
+
+      // Only surface an exit-code error if the turn didn't already complete
+      // successfully — a non-zero exit during watcher teardown is not a failure.
+      if (code !== 0 && code !== null && !turnSucceeded) {
         const channel = this.channelMessages.get(channelId)?.channel;
         if (channel) {
           const errorEmbed = new EmbedBuilder()
@@ -588,6 +664,11 @@ export class ClaudeManager {
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
 
+    // The CLI can re-emit `init` mid-run (e.g. after watchers tear down). Only
+    // post the "Session Started" embed once per run.
+    if (this.initPosted.has(channelId)) return;
+    this.initPosted.add(channelId);
+
     const initEmbed = new EmbedBuilder()
       .setTitle("🚀 Claude Code Session Started")
       .setDescription(`**Working Directory:** ${parsed.cwd}\n**Model:** ${parsed.model}\n**Tools:** ${parsed.tools.length} available`)
@@ -597,6 +678,102 @@ export class ClaudeManager {
       await channel.send({ embeds: [initEmbed] });
     } catch (error) {
       console.error("Error sending init message:", error);
+    }
+  }
+
+  /** True while one or more Monitor/watcher tasks are running for this channel. */
+  hasActiveWatchers(channelId: string): boolean {
+    return (this.channelWatchers.get(channelId)?.size ?? 0) > 0;
+  }
+
+  private readonly TERMINAL_TASK_STATUSES = new Set([
+    "stopped", "killed", "completed", "failed", "error", "done",
+  ]);
+
+  /**
+   * Handle a background-task (Monitor) lifecycle event: maintain the per-channel
+   * watcher set and surface notifications to Discord.
+   */
+  private async handleTaskMessage(channelId: string, parsed: any): Promise<void> {
+    const taskId = parsed.task_id;
+    if (!taskId) return;
+
+    let watchers = this.channelWatchers.get(channelId);
+    if (!watchers) {
+      watchers = new Set<string>();
+      this.channelWatchers.set(channelId, watchers);
+    }
+
+    if (parsed.subtype === "task_started") {
+      watchers.add(taskId);
+      console.log(`Watcher started (task ${taskId}); ${watchers.size} active in channel ${channelId}`);
+      return;
+    }
+
+    // A user-facing notification — post it (deduped) to Discord.
+    if (parsed.subtype === "task_notification") {
+      await this.postWatcherNotification(channelId, parsed);
+    }
+
+    // Remove from the active set once the task reaches a terminal status.
+    const status: string | undefined = parsed.status || parsed.patch?.status;
+    if (status && this.TERMINAL_TASK_STATUSES.has(status) && watchers.has(taskId)) {
+      watchers.delete(taskId);
+      console.log(`Watcher finished (task ${taskId}, status ${status}); ${watchers.size} remaining in channel ${channelId}`);
+    }
+  }
+
+  /**
+   * Post a watcher's notification to Discord. Reads the task's output file (the
+   * CLI hands us a path rather than inline content) and includes its tail.
+   * Deduped per task — in normal operation a watcher fires a single notification.
+   */
+  private async postWatcherNotification(channelId: string, parsed: any): Promise<void> {
+    const taskId = parsed.task_id;
+    if (!taskId) return;
+
+    let notified = this.notifiedTasks.get(channelId);
+    if (!notified) {
+      notified = new Set<string>();
+      this.notifiedTasks.set(channelId, notified);
+    }
+    if (notified.has(taskId)) return;
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    let body = "";
+    if (parsed.output_file) {
+      try {
+        const raw = fs.readFileSync(parsed.output_file, "utf-8").trim();
+        if (raw) body = raw.length > 1500 ? "…" + raw.slice(-1500) : raw;
+      } catch {
+        // Output file may not exist yet or be unreadable — fall back to summary.
+      }
+    }
+
+    // Nothing meaningful to show — wait for a richer notification.
+    if (!body && !parsed.summary) return;
+
+    notified.add(taskId);
+
+    const description = [parsed.summary, body && "```\n" + body + "\n```"]
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, 4096);
+
+    const embed = new EmbedBuilder()
+      .setTitle("🔔 Watcher")
+      .setDescription(description)
+      .setColor(0x5865F2);
+
+    const discordContext = this.channelDiscordContexts.get(channelId);
+    const mention = discordContext ? `<@${discordContext.userId}>` : undefined;
+
+    try {
+      await channel.send({ content: mention, embeds: [embed] });
+    } catch (error) {
+      console.error("Error sending watcher notification:", error);
     }
   }
 
@@ -866,8 +1043,16 @@ export class ClaudeManager {
         .setColor(0xFF0000); // Red for failure
     }
 
-    // Notify completion early so the close handler doesn't race and mark it as failed
-    this.notifyComplete(channelId, success ? "success" : "partial");
+    // Notify completion early so the close handler doesn't race and mark it as
+    // failed. But if a watcher is still running, defer until the process actually
+    // closes — advancing the queue now could spawn a second process for this
+    // channel (two writers on the same session).
+    if (this.hasActiveWatchers(channelId)) {
+      this.pendingCompletion.set(channelId, success ? "success" : "partial");
+      console.log(`Watchers active at result for channel ${channelId}; deferring completion until process close`);
+    } else {
+      this.notifyComplete(channelId, success ? "success" : "partial");
+    }
 
     // Add prompt link to result embed
     const originalMsg = this.originalMessages.get(channelId);
