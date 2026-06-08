@@ -385,27 +385,24 @@ export class PermissionManager {
         await message.delete();
         console.log(`PermissionManager: Deleted approval message after user ${approved ? 'approved' : 'denied'}`);
       } else {
-        // For timeouts, show what happened then delete after a delay
+        // For timeouts, leave the message in place (clearly marked) so it can be
+        // reviewed later — the user didn't act, so deleting would destroy exactly
+        // what they'd want to see. Disable the controls and preserve the embed.
         const statusEmoji = '⏰';
         const statusText = `**TIMED OUT** - defaulted to ${this.defaultOnTimeout.toUpperCase()}`;
-        const updatedContent = message.content + `\n\n${statusEmoji} ${statusText}`;
-        
-        await message.edit(updatedContent);
-        
-        // Remove reactions to prevent further interaction
-        await message.reactions.removeAll().catch(() => {
+        const baseContent = message.content?.trim() ? `${message.content}\n\n` : '';
+        const updatedContent = `${baseContent}${statusEmoji} ${statusText}`;
+
+        await message.edit({
+          content: updatedContent,
+          embeds: message.embeds ?? [], // preserve the question/approval detail
+          components: [],               // disable stale buttons/select menus
+        });
+
+        // Remove reactions to prevent further interaction (legacy approval flow)
+        await message.reactions?.removeAll?.().catch(() => {
           // Ignore errors if we can't remove reactions (permissions)
         });
-        
-        // Delete the timeout message after 5 seconds
-        setTimeout(async () => {
-          try {
-            await message.delete();
-            console.log('PermissionManager: Deleted timeout message after delay');
-          } catch (error) {
-            console.error('PermissionManager: Error deleting timeout message:', error);
-          }
-        }, 5000);
       }
     } catch (error) {
       console.error('PermissionManager: Error updating approval message:', error);
