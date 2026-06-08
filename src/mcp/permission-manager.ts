@@ -643,24 +643,29 @@ export class PermissionManager {
       console.log('PermissionManager: All questions answered:', decision);
       pending.resolve(decision);
 
-      // Clean up the Discord message
+      // Leave the answered question(s) in place for later review — rebuild a full
+      // record from the in-memory question data so the options aren't lost (the
+      // selected one is marked). Disable the controls; do not delete.
+      const summary = questionState.questions
+        .map((q) => {
+          const answer = questionState.answers[q.question] ?? '(no answer)';
+          const picked = new Set(answer.split(', '));
+          const title = q.header ? `**${q.header}** — ${q.question}` : `**${q.question}**`;
+          const opts = q.options
+            .map((o: any) => `${picked.has(o.label) ? '✅' : '▫️'} ${o.label}`)
+            .join('\n');
+          return `${title}\n${opts}\n→ **${answer}**`;
+        })
+        .join('\n\n');
+
       interaction.update({
         embeds: [
           new EmbedBuilder()
             .setTitle('✅ Questions Answered')
-            .setDescription(
-              Object.entries(questionState.answers)
-                .map(([q, a]) => `**${q}**\n→ ${a}`)
-                .join('\n\n')
-            )
+            .setDescription(summary.slice(0, 4096))
             .setColor(0x00FF00),
         ],
         components: [],
-      }).then(() => {
-        // Delete after a short delay to keep chat clean
-        setTimeout(() => {
-          pending.discordMessage?.delete().catch(() => {});
-        }, 5000);
       }).catch(console.error);
 
       this.cleanupPendingApproval(pending.requestId);
