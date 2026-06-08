@@ -4,7 +4,7 @@ import * as fs from "fs";
 import { EmbedBuilder, AttachmentBuilder } from "discord.js";
 import type { SDKMessage, CompletionStatus, PromptLinkConfig } from "../types/index.js";
 import { getPromptLinkConfig } from "../types/index.js";
-import { buildClaudeCommand, type DiscordContext } from "../utils/shell.js";
+import { buildClaudeCommand, isRawCommand, type DiscordContext } from "../utils/shell.js";
 import { DatabaseManager } from "../db/database.js";
 import type { SettingsStore } from "../settings/settings-store.js";
 
@@ -69,6 +69,10 @@ export class ClaudeManager {
   private notifiedTasks = new Map<string, Set<string>>();
   // Channels that have already posted an "init" embed (guards duplicate inits).
   private initPosted = new Set<string>();
+
+  // Channels whose process was spawned in streaming-input mode (stdin held open
+  // so messages can be injected mid-turn via /interrupt and /btw).
+  private streamingChannels = new Set<string>();
 
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
@@ -140,6 +144,7 @@ export class ClaudeManager {
     this.pendingCompletion.delete(channelId);
     this.notifiedTasks.delete(channelId);
     this.initPosted.delete(channelId);
+    this.streamingChannels.delete(channelId);
     this.cleanupTaskThreads(channelId);
   }
 
@@ -309,6 +314,47 @@ export class ClaudeManager {
     this.completionNotified.delete(channelId);
   }
 
+  /**
+   * Write a stream-json user message to a process's stdin. Used both for the
+   * initial prompt of a streaming run and for mid-turn injections.
+   */
+  private writeUserMessage(process: any, text: string): boolean {
+    if (!process?.stdin?.writable) return false;
+    const message = JSON.stringify({
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+    }) + "\n";
+    try {
+      process.stdin.write(message);
+      return true;
+    } catch (error) {
+      console.error("Error writing user message to stdin:", error);
+      return false;
+    }
+  }
+
+  /**
+   * Inject a message into the running process's stdin while it works, the same
+   * as typing in the CLI mid-turn. Returns false if there's no live streaming
+   * process to inject into. `mode` only affects how the text is framed.
+   */
+  injectMessage(channelId: string, text: string, mode: "interrupt" | "btw" = "interrupt"): boolean {
+    if (!this.streamingChannels.has(channelId)) return false;
+    const process = this.channelProcesses.get(channelId)?.process;
+    if (!process) return false;
+
+    const content = mode === "btw"
+      ? `By the way — a quick side question. Answer it briefly and then continue your current task without abandoning it: ${text}`
+      : text;
+
+    const ok = this.writeUserMessage(process, content);
+    if (ok) {
+      console.log(`Injected ${mode} message into channel ${channelId}`);
+    }
+    return ok;
+  }
+
   getSessionId(channelId: string): string | undefined {
     return this.db.getSession(channelId);
   }
@@ -440,7 +486,18 @@ export class ClaudeManager {
 
     const model = this.getModel(channelId);
     const planMode = this.isPlanMode(channelId);
-    const { command, args } = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls, planMode);
+
+    // Use streaming-input mode for normal text prompts so stdin stays open and
+    // /interrupt and /btw can inject messages mid-turn. Raw CLI commands and
+    // image messages keep the legacy -p path (stdin closed).
+    const streaming = !isRawCommand(prompt) && (!imageUrls || imageUrls.length === 0);
+    if (streaming) {
+      this.streamingChannels.add(channelId);
+    } else {
+      this.streamingChannels.delete(channelId);
+    }
+
+    const { command, args } = buildClaudeCommand(workingDir, prompt, sessionId, discordContext, model, imageUrls, planMode, streaming);
     console.log(`Running command: ${command} ${args.join(" ")}`);
 
     const claude = spawn(command, args, {
@@ -463,8 +520,14 @@ export class ClaudeManager {
     // Start typing indicator
     this.startTypingIndicator(channelId);
 
-    // Close stdin to signal we're not sending input
-    claude.stdin.end();
+    if (streaming) {
+      // Deliver the initial prompt as a stream-json user message and keep stdin
+      // open so further messages can be injected while the turn runs.
+      this.writeUserMessage(claude, prompt);
+    } else {
+      // Close stdin to signal we're not sending input
+      claude.stdin.end();
+    }
 
     // Add immediate listeners to debug
     claude.on("spawn", () => {
@@ -537,6 +600,13 @@ export class ClaudeManager {
                   const count = this.channelWatchers.get(channelId)?.size ?? 0;
                   console.log(`Result received; ${count} watcher(s) active in channel ${channelId} — keeping process alive`);
                   resetTimeout();
+                } else if (this.streamingChannels.has(channelId)) {
+                  // Streaming input: close stdin (EOF) so the process drains any
+                  // injected messages still queued and exits gracefully. Completion
+                  // was deferred and fires on close. Keep the reaper armed as a backstop.
+                  console.log(`Result received in streaming channel ${channelId}; closing stdin for graceful exit`);
+                  try { claude.stdin.end(); } catch {}
+                  resetTimeout();
                 } else {
                   clearTimeout(timeout);
                   claude.kill("SIGTERM");
@@ -555,9 +625,13 @@ export class ClaudeManager {
                 this.handleTaskMessage(channelId, parsed).then(() => {
                   // If the turn already finished and all watchers have now drained,
                   // re-arm the (now watcher-less) reaper as a backstop and let the
-                  // print-mode process exit on its own.
+                  // process exit. A streaming-input process won't exit until stdin
+                  // closes, so send EOF here.
                   if (this.resultSeen.has(channelId) && !this.hasActiveWatchers(channelId)) {
-                    console.log(`All watchers drained after result in channel ${channelId}; awaiting natural process exit`);
+                    console.log(`All watchers drained after result in channel ${channelId}; closing input and awaiting exit`);
+                    if (this.streamingChannels.has(channelId)) {
+                      try { claude.stdin.end(); } catch {}
+                    }
                     resetTimeout();
                   }
                 }).catch(console.error);
@@ -592,12 +666,13 @@ export class ClaudeManager {
       // fallback. notifyComplete is guarded, so an earlier success wins.
       this.notifyComplete(channelId, deferred ?? "failed");
 
-      // Clean up watcher state for this run
+      // Clean up watcher/streaming state for this run
       this.channelWatchers.delete(channelId);
       this.resultSeen.delete(channelId);
       this.pendingCompletion.delete(channelId);
       this.notifiedTasks.delete(channelId);
       this.initPosted.delete(channelId);
+      this.streamingChannels.delete(channelId);
 
       // Only surface an exit-code error if the turn didn't already complete
       // successfully — a non-zero exit during watcher teardown is not a failure.
@@ -1044,12 +1119,13 @@ export class ClaudeManager {
     }
 
     // Notify completion early so the close handler doesn't race and mark it as
-    // failed. But if a watcher is still running, defer until the process actually
-    // closes — advancing the queue now could spawn a second process for this
-    // channel (two writers on the same session).
-    if (this.hasActiveWatchers(channelId)) {
+    // failed. But if a watcher is still running — or the process is in streaming
+    // mode and we're about to close stdin for a graceful exit — defer until the
+    // process actually closes. Advancing the queue now could spawn a second
+    // process for this channel (two writers on the same session).
+    if (this.hasActiveWatchers(channelId) || this.streamingChannels.has(channelId)) {
       this.pendingCompletion.set(channelId, success ? "success" : "partial");
-      console.log(`Watchers active at result for channel ${channelId}; deferring completion until process close`);
+      console.log(`Deferring completion for channel ${channelId} until process close (watchers/streaming active)`);
     } else {
       this.notifyComplete(channelId, success ? "success" : "partial");
     }

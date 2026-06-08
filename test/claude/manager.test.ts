@@ -174,7 +174,7 @@ describe('ClaudeManager', () => {
       
       const mockProcess = {
         pid: 12345,
-        stdin: { end: vi.fn() },
+        stdin: { end: vi.fn(), write: vi.fn(), writable: true },
         stdout: { on: vi.fn() },
         stderr: { on: vi.fn() },
         on: vi.fn(),
@@ -199,7 +199,12 @@ describe('ClaudeManager', () => {
         expect.arrayContaining(['--output-format', 'stream-json']),
         expect.objectContaining({ cwd: path.join(mockBaseFolder, 'test-channel') })
       );
-      expect(mockProcess.stdin.end).toHaveBeenCalled();
+      // Normal text prompts use streaming-input mode: the prompt is written to
+      // stdin as a stream-json user message (stdin stays open for /interrupt, /btw).
+      expect(mockProcess.stdin.write).toHaveBeenCalled();
+      const written = vi.mocked(mockProcess.stdin.write).mock.calls[0]![0] as string;
+      expect(written).toContain('"type":"user"');
+      expect(written).toContain('test prompt');
     });
   });
 

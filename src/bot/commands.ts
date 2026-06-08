@@ -157,6 +157,24 @@ export class CommandHandler {
             .setAutocomplete(true)
         ),
       new SlashCommandBuilder()
+        .setName("interrupt")
+        .setDescription("Send a message to the running process, like typing while Claude works")
+        .addStringOption((option: any) =>
+          option
+            .setName("prompt")
+            .setDescription("Message to inject into the running session")
+            .setRequired(true)
+        ),
+      new SlashCommandBuilder()
+        .setName("btw")
+        .setDescription("Ask a quick side question without interrupting Claude's current work")
+        .addStringOption((option: any) =>
+          option
+            .setName("prompt")
+            .setDescription("Side question to send to the running session")
+            .setRequired(true)
+        ),
+      new SlashCommandBuilder()
         .setName("file")
         .setDescription("Send a file from the project or Claude directory to chat")
         .addStringOption((option: any) =>
@@ -310,6 +328,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "resume") {
       await this.handleResumeCommand(interaction);
+    }
+
+    if (interaction.commandName === "interrupt" || interaction.commandName === "btw") {
+      await this.handleInjectCommand(interaction);
     }
 
     if (interaction.commandName === "init") {
@@ -1253,6 +1275,27 @@ WshShell.Run "cmd /k bun run start", 1, False
       );
     } catch {
       await interaction.respond([]);
+    }
+  }
+
+  /**
+   * Handle /interrupt and /btw — inject a message into the running process's
+   * stdin. Only works while a streaming-mode process is actively working.
+   */
+  private async handleInjectCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const prompt = interaction.options.getString("prompt");
+    const mode: "interrupt" | "btw" = interaction.commandName === "btw" ? "btw" : "interrupt";
+
+    const injected = this.claudeManager.injectMessage(channelId, prompt, mode);
+    if (injected) {
+      const label = mode === "btw" ? "Side question" : "Message";
+      await interaction.reply(`📨 ${label} sent to the running session:\n> ${prompt.slice(0, 1500)}`);
+    } else {
+      await interaction.reply({
+        content: "No active Claude process is running in this channel to send to. Send a normal message to start one.",
+        ephemeral: true,
+      });
     }
   }
 }
