@@ -45,6 +45,18 @@ export type SDKMessage =
       permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
     }
   | {
+      type: "rate_limit_event";
+      rate_limit_info: {
+        status: string;
+        resetsAt: number; // unix seconds
+        rateLimitType: string;
+        overageStatus?: string;
+        overageDisabledReason?: string;
+        isUsingOverage?: boolean;
+      };
+      session_id: string;
+    }
+  | {
       // Background-task (Monitor/watcher) lifecycle events. The CLI keeps the
       // process alive past a turn's `result` to deliver these.
       type: "system";

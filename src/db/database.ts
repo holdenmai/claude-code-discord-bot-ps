@@ -51,6 +51,7 @@ export class DatabaseManager {
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_summary TEXT"); } catch {}
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_cost_usd REAL"); } catch {}
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_num_turns INTEGER"); } catch {}
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN total_cost_usd REAL DEFAULT 0"); } catch {}
 
     // Track actively running processes — rows left after crash = interrupted runs
     this.db.exec(`
@@ -138,6 +139,21 @@ export class DatabaseManager {
       WHERE channel_id = ?
     `);
     stmt.run(summary, costUsd, numTurns, Date.now(), channelId);
+  }
+
+  /**
+   * Add a request's cost to the channel's running session total and return the
+   * new total. Resets naturally when the session row is cleared (/clear, /pause).
+   */
+  addSessionCost(channelId: string, costUsd: number): number {
+    this.db.query(`
+      UPDATE channel_sessions SET total_cost_usd = COALESCE(total_cost_usd, 0) + ?
+      WHERE channel_id = ?
+    `).run(costUsd, channelId);
+    const row = this.db.query(
+      "SELECT total_cost_usd FROM channel_sessions WHERE channel_id = ?"
+    ).get(channelId) as { total_cost_usd: number } | null;
+    return row?.total_cost_usd ?? costUsd;
   }
 
   // --- Prompt history ---

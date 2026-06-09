@@ -590,6 +590,8 @@ export class ClaudeManager {
               this.handleAssistantMessage(channelId, parsed).catch(console.error);
             } else if (parsed.type === "user" && parsed.message.content) {
               this.handleToolResultMessage(channelId, parsed).catch(console.error);
+            } else if (parsed.type === "rate_limit_event") {
+              this.handleRateLimitEvent(channelId, parsed).catch(console.error);
             } else if (parsed.type === "result") {
               this.handleResultMessage(channelId, parsed).then(() => {
                 if (this.hasActiveWatchers(channelId)) {
@@ -753,6 +755,46 @@ export class ClaudeManager {
       await channel.send({ embeds: [initEmbed] });
     } catch (error) {
       console.error("Error sending init message:", error);
+    }
+  }
+
+  /**
+   * Report a rate-limit event to Discord, telling the user when it resets.
+   */
+  private async handleRateLimitEvent(channelId: string, parsed: any): Promise<void> {
+    const info = parsed.rate_limit_info || {};
+    // Only surface actual rejections (hitting the limit), not informational events.
+    if (info.status !== "rejected") return;
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    const typeLabels: Record<string, string> = {
+      five_hour: "5-hour",
+      seven_day: "7-day",
+      daily: "daily",
+    };
+    const limitLabel = typeLabels[info.rateLimitType] || info.rateLimitType || "rate";
+
+    // resetsAt is unix seconds — use Discord's timestamp markup so it renders in
+    // the viewer's local time and as a live relative countdown.
+    const resetsAt = info.resetsAt;
+    const resetText = resetsAt
+      ? `<t:${resetsAt}:F> (<t:${resetsAt}:R>)`
+      : "unknown";
+
+    const discordContext = this.channelDiscordContexts.get(channelId);
+    const mention = discordContext ? `<@${discordContext.userId}>` : undefined;
+
+    const embed = new EmbedBuilder()
+      .setTitle("🚫 Rate Limit Hit")
+      .setDescription(`The **${limitLabel}** limit was hit.\n**Resets:** ${resetText}`)
+      .setColor(0xE74C3C);
+
+    try {
+      await channel.send({ content: mention, embeds: [embed] });
+    } catch (error) {
+      console.error("Error sending rate limit message:", error);
     }
   }
 
@@ -1073,6 +1115,10 @@ export class ClaudeManager {
     const summary = parsed.subtype === "success" && "result" in parsed ? parsed.result : `Failed: ${parsed.subtype}`;
     this.db.updateSessionSummary(channelId, summary, parsed.total_cost_usd, parsed.num_turns);
 
+    // Accumulate cost: this request plus the running session total (resets on /clear).
+    const requestCost = parsed.total_cost_usd ?? 0;
+    const totalCost = this.db.addSessionCost(channelId, requestCost);
+
     // Store prompt/result pair for history
     const userMsg = this.originalMessages.get(channelId);
     const prompt = userMsg?.content || "unknown";
@@ -1097,7 +1143,8 @@ export class ClaudeManager {
 
     if (success) {
       let description = "result" in parsed ? parsed.result : "Task completed";
-      const suffix = `\n\n*Completed in ${parsed.num_turns} turns*`;
+      const costLine = `\n💰 This request: $${requestCost.toFixed(4)} · Session total: $${totalCost.toFixed(4)}`;
+      const suffix = `\n\n*Completed in ${parsed.num_turns} turns*${costLine}`;
 
       if (description.length + suffix.length > EMBED_LIMIT) {
         // Attach full response as a file and truncate embed description
