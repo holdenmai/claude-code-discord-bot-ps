@@ -108,9 +108,16 @@ export class DatabaseManager {
   }
 
   setSession(channelId: string, sessionId: string, channelName: string): void {
+    // Upsert (not INSERT OR REPLACE): on conflict, REPLACE would delete the row
+    // and reset unlisted columns (total_cost_usd, last_summary, …) to defaults.
+    // ON CONFLICT DO UPDATE touches only these columns and preserves the rest.
     const stmt = this.db.query(`
-      INSERT OR REPLACE INTO channel_sessions (channel_id, session_id, channel_name, last_used)
+      INSERT INTO channel_sessions (channel_id, session_id, channel_name, last_used)
       VALUES (?, ?, ?, ?)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        session_id = excluded.session_id,
+        channel_name = excluded.channel_name,
+        last_used = excluded.last_used
     `);
     stmt.run(channelId, sessionId, channelName, Date.now());
   }
