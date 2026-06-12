@@ -376,7 +376,7 @@ export class ClaudeManager {
 
   resumeSession(channelId: string, name: string, channelName: string): boolean {
     const paused = this.db.getPausedSession(channelId, name);
-    if (!paused) return false;
+    if (!paused || !paused.isResumable) return false;
     this.db.setSession(channelId, paused.sessionId, channelName);
     // Restore the cost that accrued before pausing so the running total continues.
     if (paused.totalCostUsd > 0) {
@@ -386,8 +386,24 @@ export class ClaudeManager {
     return true;
   }
 
+  /**
+   * Archive the current session's cost as a non-resumable paused row before it's
+   * cleared, so cleared spend still counts toward the grand total in /costreview.
+   * Hidden from /resume (name = session id, is_resumable = 0).
+   */
+  archiveSessionCost(channelId: string): void {
+    const info = this.db.getChannelCostInfo(channelId);
+    if (info && info.totalCostUsd > 0) {
+      this.db.pauseSession(channelId, info.sessionId, info.sessionId, info.totalCostUsd, false);
+    }
+  }
+
   getPausedSessions(channelId: string) {
     return this.db.getPausedSessions(channelId);
+  }
+
+  getResumableSessions(channelId: string) {
+    return this.db.getResumableSessions(channelId);
   }
 
   getChannelCostInfo(channelId: string) {
@@ -1126,14 +1142,40 @@ export class ClaudeManager {
     const summary = parsed.subtype === "success" && "result" in parsed ? parsed.result : `Failed: ${parsed.subtype}`;
     this.db.updateSessionSummary(channelId, summary, parsed.total_cost_usd, parsed.num_turns);
 
-    // Accumulate cost: this request plus the running session total (resets on /clear).
-    const requestCost = parsed.total_cost_usd ?? 0;
-    const totalCost = this.db.addSessionCost(channelId, requestCost);
-
-    // Store prompt/result pair for history
+    // Prompt/result accounting. Dedupe on the prompt's message id so a duplicate
+    // "complete" (which can arrive with watchers/streaming) doesn't double-count
+    // the running total or duplicate history.
     const userMsg = this.originalMessages.get(channelId);
     const prompt = userMsg?.content || "unknown";
-    this.db.addPromptHistory(channelId, prompt, summary);
+    const promptMessageId: string | undefined = userMsg?.id;
+    const requestCost = parsed.total_cost_usd ?? 0;
+    const alreadyCounted = promptMessageId ? this.db.hasPromptCost(promptMessageId) : false;
+
+    let totalCost: number;
+    if (alreadyCounted) {
+      totalCost = this.db.getChannelCostInfo(channelId)?.totalCostUsd ?? requestCost;
+    } else {
+      totalCost = this.db.addSessionCost(channelId, requestCost);
+      this.db.addPromptHistory(channelId, prompt, summary);
+      // Record synchronously here (before any await) so a concurrent duplicate
+      // complete sees it via hasPromptCost and doesn't double-count. The result
+      // message id is filled in after we send below.
+      if (promptMessageId) {
+        try {
+          this.db.recordPromptCost({
+            promptMessageId,
+            channelId,
+            sessionId: parsed.session_id,
+            promptText: typeof prompt === "string" ? prompt.slice(0, 2000) : undefined,
+            costUsd: requestCost,
+            numTurns: parsed.num_turns,
+            createdAt: Date.now(),
+          });
+        } catch (error) {
+          console.error("Error recording prompt cost:", error);
+        }
+      }
+    }
 
     this.stopTypingIndicator(channelId);
 
@@ -1195,14 +1237,24 @@ export class ClaudeManager {
       resultEmbed.addFields({ name: "Prompt", value: `[Jump to prompt](${promptUrl})` });
     }
 
+    let resultMessage: any;
     try {
-      await channel.send({
+      resultMessage = await channel.send({
         content: mention || undefined,
         embeds: [resultEmbed],
         files: fileAttachment ? [fileAttachment] : [],
       });
     } catch (error) {
       console.error("Error sending result message:", error);
+    }
+
+    // Link the completion message to the prompt's cost record (best-effort).
+    if (promptMessageId && resultMessage?.id && !alreadyCounted) {
+      try {
+        this.db.setPromptResultMessage(promptMessageId, resultMessage.id);
+      } catch (error) {
+        console.error("Error linking prompt result message:", error);
+      }
     }
 
     console.log("Got result message, cleaning up process tracking");

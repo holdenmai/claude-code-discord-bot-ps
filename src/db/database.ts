@@ -17,6 +17,18 @@ export interface PausedSession {
   sessionId: string;
   pausedAt: number;
   totalCostUsd: number;
+  isResumable: boolean;
+}
+
+export interface PromptCost {
+  promptMessageId: string;
+  channelId: string;
+  sessionId?: string;
+  resultMessageId?: string;
+  promptText?: string;
+  costUsd: number;
+  numTurns?: number;
+  createdAt: number;
 }
 
 export interface Todo {
@@ -90,6 +102,26 @@ export class DatabaseManager {
     `);
     // Carry the session's accumulated cost over when it's paused (idempotent migration)
     try { this.db.exec("ALTER TABLE paused_sessions ADD COLUMN total_cost_usd REAL DEFAULT 0"); } catch {}
+    // is_resumable=0 marks a cleared session kept only for cost accounting (hidden from /resume)
+    try { this.db.exec("ALTER TABLE paused_sessions ADD COLUMN is_resumable INTEGER DEFAULT 1"); } catch {}
+
+    // Per-prompt cost tracking for later analysis (one row per prompt message)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_costs (
+        prompt_message_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        session_id TEXT,
+        result_message_id TEXT,
+        prompt_text TEXT,
+        cost_usd REAL NOT NULL,
+        num_turns INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_prompt_costs_channel
+      ON prompt_costs(channel_id, created_at DESC)
+    `);
 
     // Per-channel todos
     this.db.exec(`
@@ -207,12 +239,12 @@ export class DatabaseManager {
 
   // --- Paused sessions ---
 
-  pauseSession(channelId: string, name: string, sessionId: string, totalCostUsd: number = 0): void {
+  pauseSession(channelId: string, name: string, sessionId: string, totalCostUsd: number = 0, isResumable: boolean = true): void {
     const stmt = this.db.query(`
-      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at, total_cost_usd)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at, total_cost_usd, is_resumable)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
-    stmt.run(channelId, name, sessionId, Date.now(), totalCostUsd);
+    stmt.run(channelId, name, sessionId, Date.now(), totalCostUsd, isResumable ? 1 : 0);
   }
 
   private mapPausedRow(r: any): PausedSession {
@@ -222,14 +254,21 @@ export class DatabaseManager {
       sessionId: r.session_id,
       pausedAt: r.paused_at,
       totalCostUsd: r.total_cost_usd ?? 0,
+      isResumable: (r.is_resumable ?? 1) === 1,
     };
   }
 
+  /** All paused-session rows for a channel, including cleared (non-resumable) ones. */
   getPausedSessions(channelId: string): PausedSession[] {
     const stmt = this.db.query(
       "SELECT * FROM paused_sessions WHERE channel_id = ? ORDER BY paused_at DESC"
     );
     return (stmt.all(channelId) as any[]).map(r => this.mapPausedRow(r));
+  }
+
+  /** Only resumable paused sessions (excludes cleared cost-archive rows). */
+  getResumableSessions(channelId: string): PausedSession[] {
+    return this.getPausedSessions(channelId).filter(s => s.isResumable);
   }
 
   getPausedSession(channelId: string, name: string): PausedSession | undefined {
@@ -252,6 +291,49 @@ export class DatabaseManager {
   deletePausedSession(channelId: string, name: string): boolean {
     const stmt = this.db.query("DELETE FROM paused_sessions WHERE channel_id = ? AND name = ?");
     return stmt.run(channelId, name).changes > 0;
+  }
+
+  // --- Per-prompt cost tracking ---
+
+  hasPromptCost(promptMessageId: string): boolean {
+    const r = this.db.query(
+      "SELECT 1 FROM prompt_costs WHERE prompt_message_id = ?"
+    ).get(promptMessageId);
+    return !!r;
+  }
+
+  /**
+   * Record (or update) a prompt's cost. Keyed by the prompt's message id and
+   * upserted, so a duplicate "complete" for the same prompt updates the row
+   * instead of crashing or inserting a duplicate.
+   */
+  recordPromptCost(entry: PromptCost): void {
+    const stmt = this.db.query(`
+      INSERT INTO prompt_costs
+        (prompt_message_id, channel_id, session_id, result_message_id, prompt_text, cost_usd, num_turns, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(prompt_message_id) DO UPDATE SET
+        session_id = excluded.session_id,
+        result_message_id = excluded.result_message_id,
+        cost_usd = excluded.cost_usd,
+        num_turns = excluded.num_turns
+    `);
+    stmt.run(
+      entry.promptMessageId,
+      entry.channelId,
+      entry.sessionId ?? null,
+      entry.resultMessageId ?? null,
+      entry.promptText ?? null,
+      entry.costUsd,
+      entry.numTurns ?? null,
+      entry.createdAt,
+    );
+  }
+
+  setPromptResultMessage(promptMessageId: string, resultMessageId: string): void {
+    this.db.query(
+      "UPDATE prompt_costs SET result_message_id = ? WHERE prompt_message_id = ?"
+    ).run(resultMessageId, promptMessageId);
   }
 
   // Active run tracking — for crash recovery

@@ -4,6 +4,7 @@ import { CommandHandler } from '../../src/bot/commands.js';
 // Mock ClaudeManager
 const mockClaudeManager = {
   clearSession: vi.fn(),
+  archiveSessionCost: vi.fn(),
   hasActiveProcess: vi.fn(),
   killActiveProcess: vi.fn(),
   killAllProcesses: vi.fn().mockReturnValue(0),

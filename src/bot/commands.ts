@@ -256,6 +256,9 @@ export class CommandHandler {
 
     if (interaction.commandName === "clear") {
       const channelId = interaction.channelId;
+      // Archive the cleared session's cost (non-resumable) before deleting the row,
+      // so it still counts toward the /costreview grand total.
+      this.claudeManager.archiveSessionCost(channelId);
       this.claudeManager.clearSession(channelId);
 
       await interaction.reply(
@@ -1275,7 +1278,7 @@ WshShell.Run "cmd /k bun run start", 1, False
     const channelId = interaction.channelId;
 
     try {
-      const paused = this.claudeManager.getPausedSessions(channelId);
+      const paused = this.claudeManager.getResumableSessions(channelId);
       const filtered = paused
         .filter(s => s.name.toLowerCase().includes(focused))
         .slice(0, 25);
@@ -1343,7 +1346,8 @@ WshShell.Run "cmd /k bun run start", 1, False
       }
     }
 
-    let grandTotal = 0;
+    let activeTotal = 0;   // current + resumable (the sessions we list)
+    let clearedTotal = 0;  // archived, non-resumable cleared sessions
     const sections: string[] = [];
 
     for (const scope of scopes) {
@@ -1357,32 +1361,41 @@ WshShell.Run "cmd /k bun run start", 1, False
       }
 
       for (const p of this.claudeManager.getPausedSessions(scope.id)) {
-        lines.push(`• paused "${p.name}" — $${p.totalCostUsd.toFixed(4)}`);
-        subtotal += p.totalCostUsd;
+        if (p.isResumable) {
+          lines.push(`• paused "${p.name}" — $${p.totalCostUsd.toFixed(4)}`);
+          subtotal += p.totalCostUsd;
+        } else {
+          clearedTotal += p.totalCostUsd; // cleared sessions: counted, not listed
+        }
       }
 
-      if (lines.length === 0) continue; // no sessions recorded here
-      grandTotal += subtotal;
+      activeTotal += subtotal;
 
+      if (lines.length === 0) continue; // nothing active to list for this scope
       const header = scopes.length > 1
         ? `**#${scope.name}** — $${subtotal.toFixed(4)}`
         : `**#${scope.name}**`;
       sections.push(`${header}\n${lines.join("\n")}`);
     }
 
-    if (sections.length === 0) {
+    const grandTotal = activeTotal + clearedTotal;
+
+    if (sections.length === 0 && grandTotal === 0) {
       await interaction.editReply("💰 **Cost Review**\n\nNo sessions with recorded cost found here.");
       return;
     }
 
-    const totalLine = `\n\n**Total: $${grandTotal.toFixed(4)}**`;
-    let body = sections.join("\n\n");
+    const summary =
+      `\n\n**Active/resumable subtotal: $${activeTotal.toFixed(4)}**` +
+      `\n**Grand total (incl. cleared): $${grandTotal.toFixed(4)}**`;
+
+    let body = sections.length ? sections.join("\n\n") : "_(no active or resumable sessions)_";
     const LIMIT = 2000 - 32; // Discord message content limit, with headroom
-    if (`💰 **Cost Review**\n\n${body}${totalLine}`.length > LIMIT) {
-      body = body.slice(0, LIMIT - totalLine.length - 60) + "\n… (truncated)";
+    if (`💰 **Cost Review**\n\n${body}${summary}`.length > LIMIT) {
+      body = body.slice(0, LIMIT - summary.length - 60) + "\n… (truncated)";
     }
 
-    await interaction.editReply(`💰 **Cost Review**\n\n${body}${totalLine}`);
+    await interaction.editReply(`💰 **Cost Review**\n\n${body}${summary}`);
   }
 }
 
