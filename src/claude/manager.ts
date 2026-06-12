@@ -366,7 +366,10 @@ export class ClaudeManager {
   pauseSession(channelId: string, name: string): boolean {
     const sessionId = this.db.getSession(channelId);
     if (!sessionId) return false;
-    this.db.pauseSession(channelId, name, sessionId);
+    // Carry the accumulated cost into the paused record so it isn't lost when
+    // clearSession deletes the channel_sessions row.
+    const cost = this.db.getChannelCostInfo(channelId)?.totalCostUsd ?? 0;
+    this.db.pauseSession(channelId, name, sessionId, cost);
     this.clearSession(channelId);
     return true;
   }
@@ -375,12 +378,20 @@ export class ClaudeManager {
     const paused = this.db.getPausedSession(channelId, name);
     if (!paused) return false;
     this.db.setSession(channelId, paused.sessionId, channelName);
+    // Restore the cost that accrued before pausing so the running total continues.
+    if (paused.totalCostUsd > 0) {
+      this.db.addSessionCost(channelId, paused.totalCostUsd);
+    }
     this.db.deletePausedSession(channelId, name);
     return true;
   }
 
   getPausedSessions(channelId: string) {
     return this.db.getPausedSessions(channelId);
+  }
+
+  getChannelCostInfo(channelId: string) {
+    return this.db.getChannelCostInfo(channelId);
   }
 
   getInterruptedRuns(): { channelId: string; channelName: string; startedAt: number }[] {

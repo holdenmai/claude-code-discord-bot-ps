@@ -157,6 +157,15 @@ export class CommandHandler {
             .setAutocomplete(true)
         ),
       new SlashCommandBuilder()
+        .setName("costreview")
+        .setDescription("Review session costs for this channel (and optionally its threads)")
+        .addBooleanOption((option: any) =>
+          option
+            .setName("include_threads")
+            .setDescription("Also include sessions from this channel's threads (default: false)")
+            .setRequired(false)
+        ),
+      new SlashCommandBuilder()
         .setName("interrupt")
         .setDescription("Send a message to the running process, like typing while Claude works")
         .addStringOption((option: any) =>
@@ -230,7 +239,7 @@ export class CommandHandler {
 
     // Multi-instance guard: skip if another instance owns this channel
     // Read-only commands bypass this guard — they don't spawn Claude processes
-    const readOnlyCommands = new Set(["status", "todo"]);
+    const readOnlyCommands = new Set(["status", "todo", "costreview"]);
     if (this.instanceRouter && !readOnlyCommands.has(interaction.commandName)) {
       const channel = interaction.channel;
       const isThread = channel?.isThread?.();
@@ -332,6 +341,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "interrupt" || interaction.commandName === "btw") {
       await this.handleInjectCommand(interaction);
+    }
+
+    if (interaction.commandName === "costreview") {
+      await this.handleCostReviewCommand(interaction);
     }
 
     if (interaction.commandName === "init") {
@@ -1297,6 +1310,79 @@ WshShell.Run "cmd /k bun run start", 1, False
         ephemeral: true,
       });
     }
+  }
+
+  /**
+   * Handle /costreview — sum and list session costs for this channel (and
+   * optionally its threads). Covers the current session plus any paused ones.
+   */
+  private async handleCostReviewCommand(interaction: any): Promise<void> {
+    await interaction.deferReply();
+
+    const channel = interaction.channel;
+    const isThread = channel?.isThread?.();
+    const includeThreads = interaction.options.getBoolean("include_threads") ?? false;
+
+    // Scope: this channel, plus its threads if requested (threads have no sub-threads).
+    const scopes: { id: string; name: string }[] = [
+      { id: interaction.channelId, name: channel?.name || "this channel" },
+    ];
+
+    if (includeThreads && !isThread && channel && "threads" in channel) {
+      try {
+        const active = await (channel as any).threads.fetchActive();
+        for (const t of active.threads.values()) scopes.push({ id: t.id, name: t.name });
+      } catch (error) {
+        console.error("costreview: failed to fetch active threads:", error);
+      }
+      try {
+        const archived = await (channel as any).threads.fetchArchived();
+        for (const t of archived.threads.values()) scopes.push({ id: t.id, name: t.name });
+      } catch (error) {
+        console.error("costreview: failed to fetch archived threads:", error);
+      }
+    }
+
+    let grandTotal = 0;
+    const sections: string[] = [];
+
+    for (const scope of scopes) {
+      const lines: string[] = [];
+      let subtotal = 0;
+
+      const current = this.claudeManager.getChannelCostInfo(scope.id);
+      if (current) {
+        lines.push(`• current — $${current.totalCostUsd.toFixed(4)}`);
+        subtotal += current.totalCostUsd;
+      }
+
+      for (const p of this.claudeManager.getPausedSessions(scope.id)) {
+        lines.push(`• paused "${p.name}" — $${p.totalCostUsd.toFixed(4)}`);
+        subtotal += p.totalCostUsd;
+      }
+
+      if (lines.length === 0) continue; // no sessions recorded here
+      grandTotal += subtotal;
+
+      const header = scopes.length > 1
+        ? `**#${scope.name}** — $${subtotal.toFixed(4)}`
+        : `**#${scope.name}**`;
+      sections.push(`${header}\n${lines.join("\n")}`);
+    }
+
+    if (sections.length === 0) {
+      await interaction.editReply("💰 **Cost Review**\n\nNo sessions with recorded cost found here.");
+      return;
+    }
+
+    const totalLine = `\n\n**Total: $${grandTotal.toFixed(4)}**`;
+    let body = sections.join("\n\n");
+    const LIMIT = 2000 - 32; // Discord message content limit, with headroom
+    if (`💰 **Cost Review**\n\n${body}${totalLine}`.length > LIMIT) {
+      body = body.slice(0, LIMIT - totalLine.length - 60) + "\n… (truncated)";
+    }
+
+    await interaction.editReply(`💰 **Cost Review**\n\n${body}${totalLine}`);
   }
 }
 

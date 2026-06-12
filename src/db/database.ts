@@ -16,6 +16,7 @@ export interface PausedSession {
   name: string;
   sessionId: string;
   pausedAt: number;
+  totalCostUsd: number;
 }
 
 export interface Todo {
@@ -87,6 +88,8 @@ export class DatabaseManager {
         PRIMARY KEY (channel_id, name)
       )
     `);
+    // Carry the session's accumulated cost over when it's paused (idempotent migration)
+    try { this.db.exec("ALTER TABLE paused_sessions ADD COLUMN total_cost_usd REAL DEFAULT 0"); } catch {}
 
     // Per-channel todos
     this.db.exec(`
@@ -204,24 +207,29 @@ export class DatabaseManager {
 
   // --- Paused sessions ---
 
-  pauseSession(channelId: string, name: string, sessionId: string): void {
+  pauseSession(channelId: string, name: string, sessionId: string, totalCostUsd: number = 0): void {
     const stmt = this.db.query(`
-      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at)
-      VALUES (?, ?, ?, ?)
+      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at, total_cost_usd)
+      VALUES (?, ?, ?, ?, ?)
     `);
-    stmt.run(channelId, name, sessionId, Date.now());
+    stmt.run(channelId, name, sessionId, Date.now(), totalCostUsd);
+  }
+
+  private mapPausedRow(r: any): PausedSession {
+    return {
+      channelId: r.channel_id,
+      name: r.name,
+      sessionId: r.session_id,
+      pausedAt: r.paused_at,
+      totalCostUsd: r.total_cost_usd ?? 0,
+    };
   }
 
   getPausedSessions(channelId: string): PausedSession[] {
     const stmt = this.db.query(
       "SELECT * FROM paused_sessions WHERE channel_id = ? ORDER BY paused_at DESC"
     );
-    return (stmt.all(channelId) as any[]).map(r => ({
-      channelId: r.channel_id,
-      name: r.name,
-      sessionId: r.session_id,
-      pausedAt: r.paused_at,
-    }));
+    return (stmt.all(channelId) as any[]).map(r => this.mapPausedRow(r));
   }
 
   getPausedSession(channelId: string, name: string): PausedSession | undefined {
@@ -229,13 +237,16 @@ export class DatabaseManager {
       "SELECT * FROM paused_sessions WHERE channel_id = ? AND name = ?"
     );
     const r = stmt.get(channelId, name) as any | null;
+    return r ? this.mapPausedRow(r) : undefined;
+  }
+
+  /** The current (active) session's accumulated cost for a channel, or 0/none. */
+  getChannelCostInfo(channelId: string): { sessionId: string; totalCostUsd: number } | undefined {
+    const r = this.db.query(
+      "SELECT session_id, total_cost_usd FROM channel_sessions WHERE channel_id = ?"
+    ).get(channelId) as { session_id: string; total_cost_usd: number } | null;
     if (!r) return undefined;
-    return {
-      channelId: r.channel_id,
-      name: r.name,
-      sessionId: r.session_id,
-      pausedAt: r.paused_at,
-    };
+    return { sessionId: r.session_id, totalCostUsd: r.total_cost_usd ?? 0 };
   }
 
   deletePausedSession(channelId: string, name: string): boolean {
