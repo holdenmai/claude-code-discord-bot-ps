@@ -475,14 +475,12 @@ export class PermissionManager {
   }
 
   /**
-   * Send a question message to Discord with buttons or select menu
+   * Build the embed + interactive components for the current question.
+   * Discord allows at most 5 buttons per action row, so questions with more
+   * than 5 options fall back to a select menu instead of buttons (otherwise
+   * ActionRowBuilder.addComponents throws and the question never renders).
    */
-  private async sendQuestionMessage(pending: PendingApproval): Promise<void> {
-    const channel = await this.discordBot.client.channels.fetch(pending.discordContext.channelId);
-    if (!channel) {
-      throw new Error(`Could not find Discord channel: ${pending.discordContext.channelId}`);
-    }
-
+  private buildQuestionView(pending: PendingApproval): { embeds: EmbedBuilder[]; components: any[] } {
     const questionState = pending.pendingQuestion!;
     const question = questionState.questions[questionState.currentQuestionIndex]!;
     const questionNumber = questionState.questions.length > 1
@@ -503,16 +501,18 @@ export class PermissionManager {
 
     const components: any[] = [];
 
-    if (question.multiSelect) {
-      // Use a select menu for multi-select questions
+    // Buttons only work for single-select questions with <= 5 options.
+    const useSelectMenu = question.multiSelect || question.options.length > 5;
+
+    if (useSelectMenu) {
       const selectMenu = new StringSelectMenuBuilder()
         .setCustomId(`qs:${pending.requestId}:${questionState.currentQuestionIndex}`)
-        .setPlaceholder('Select one or more options...')
+        .setPlaceholder(question.multiSelect ? 'Select one or more options...' : 'Select an option...')
         .setMinValues(1)
-        .setMaxValues(question.options.length)
+        .setMaxValues(question.multiSelect ? question.options.length : 1)
         .addOptions(
           question.options.map((opt) => ({
-            label: opt.label,
+            label: opt.label.substring(0, 100),
             description: (opt.description || '').substring(0, 100) || undefined,
             value: opt.label,
           }))
@@ -524,20 +524,35 @@ export class PermissionManager {
       const buttons = question.options.map((opt, i) =>
         new ButtonBuilder()
           .setCustomId(`q:${pending.requestId}:${questionState.currentQuestionIndex}:${i}`)
-          .setLabel(`${String.fromCharCode(65 + i)}. ${opt.label}`)
+          .setLabel(`${String.fromCharCode(65 + i)}. ${opt.label}`.substring(0, 80))
           .setStyle(ButtonStyle.Primary)
       );
 
       components.push(new ActionRowBuilder().addComponents(...buttons));
     }
 
+    return { embeds: [embed], components };
+  }
+
+  /**
+   * Send a question message to Discord with buttons or select menu
+   */
+  private async sendQuestionMessage(pending: PendingApproval): Promise<void> {
+    const channel = await this.discordBot.client.channels.fetch(pending.discordContext.channelId);
+    if (!channel) {
+      throw new Error(`Could not find Discord channel: ${pending.discordContext.channelId}`);
+    }
+
+    const questionState = pending.pendingQuestion!;
+    const view = this.buildQuestionView(pending);
+
     if (pending.discordMessage) {
       // Update existing message for follow-up questions
-      await pending.discordMessage.edit({ embeds: [embed], components });
+      await pending.discordMessage.edit(view);
     } else {
       // Send new message for first question, mentioning the user
       const mention = `<@${pending.discordContext.userId}>`;
-      const message = await (channel as any).send({ content: mention, embeds: [embed], components });
+      const message = await (channel as any).send({ content: mention, ...view });
       pending.discordMessage = message;
     }
 
@@ -622,12 +637,15 @@ export class PermissionManager {
     const nextIndex = questionState.currentQuestionIndex + 1;
 
     if (nextIndex < questionState.questions.length) {
-      // More questions to ask - advance and update the message
+      // More questions to ask - advance and render the next one atomically in
+      // the same interaction response. (A previous two-step "clear then edit"
+      // could leave the message blank if the follow-up edit failed, making it
+      // look like only the first question ever came through.)
       questionState.currentQuestionIndex = nextIndex;
 
-      interaction.update({ content: null, embeds: [], components: [] }).then(() => {
-        this.sendQuestionMessage(pending).catch(console.error);
-      }).catch(console.error);
+      interaction.update(this.buildQuestionView(pending)).catch((error: any) => {
+        console.error('PermissionManager: Failed to render next question:', error);
+      });
     } else {
       // All questions answered - resolve the promise
       clearTimeout(pending.timeout);
