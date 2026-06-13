@@ -911,11 +911,10 @@ export class ClaudeManager {
       .setDescription(description)
       .setColor(0x5865F2);
 
-    const discordContext = this.channelDiscordContexts.get(channelId);
-    const mention = discordContext ? `<@${discordContext.userId}>` : undefined;
-
+    // Deliberately no user @mention here — watchers can fire often and pinging
+    // every time is noisy. The embed alone surfaces the notification.
     try {
-      await channel.send({ content: mention, embeds: [embed] });
+      await channel.send({ embeds: [embed] });
     } catch (error) {
       console.error("Error sending watcher notification:", error);
     }
