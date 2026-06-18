@@ -39,10 +39,12 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)
 - `/kill` - Kill the running Claude Code process in this channel
+- `/stop` - Gracefully stop the current turn (stream-json `control_request`/`interrupt`, like pressing Esc); session is preserved
 - `/killall` - Kill all running Claude Code processes
 - `/model` - Set the Claude model for this channel (sonnet/opus/haiku)
 - `/add` - Create a channel for a project folder (with autocomplete)
 - `/update` - Pull latest changes and restart the bot
+- `/restart` - Restart the bot without pulling changes
 - `/shortcut` - Manage custom `!command` prompt shortcuts (global or per-repo)
 - `/sync` - Merge main into all active worktrees for this project
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread

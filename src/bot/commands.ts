@@ -28,6 +28,9 @@ export class CommandHandler {
         .setName("kill")
         .setDescription("Kill the currently running Claude Code process"),
       new SlashCommandBuilder()
+        .setName("stop")
+        .setDescription("Gracefully stop Claude's current turn (like pressing Esc), keeping the session"),
+      new SlashCommandBuilder()
         .setName("model")
         .setDescription("Set the Claude model for this channel")
         .addStringOption((option: any) =>
@@ -60,6 +63,9 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("update")
         .setDescription("Update the bot by pulling latest changes and restarting"),
+      new SlashCommandBuilder()
+        .setName("restart")
+        .setDescription("Restart the bot without updating"),
       new SlashCommandBuilder()
         .setName("init")
         .setDescription("Set this channel's category as the home for startup links"),
@@ -276,6 +282,17 @@ export class CommandHandler {
       }
     }
 
+    if (interaction.commandName === "stop") {
+      const channelId = interaction.channelId;
+      if (!this.claudeManager.hasActiveProcess(channelId)) {
+        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
+      } else if (this.claudeManager.interruptSession(channelId)) {
+        await interaction.reply("🛑 Asked Claude to gracefully stop the current turn. Session preserved — next message continues it.");
+      } else {
+        await interaction.reply({ content: "Couldn't send a graceful stop (process not accepting input). Use `/kill` to force it.", ephemeral: true });
+      }
+    }
+
     if (interaction.commandName === "killall") {
       const count = this.claudeManager.killAllProcesses();
       await interaction.reply(`Killed ${count} running process${count !== 1 ? "es" : ""}.`);
@@ -304,6 +321,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "update") {
       await this.handleUpdateCommand(interaction);
+    }
+
+    if (interaction.commandName === "restart") {
+      await this.handleRestartCommand(interaction);
     }
 
     if (interaction.commandName === "shortcut") {
@@ -1203,35 +1224,55 @@ export class CommandHandler {
         await interaction.editReply(`✅ Updated successfully!\n\`\`\`\n${output}\n\`\`\`\n🔄 Restarting bot...`);
 
         // Give Discord time to send the message, then restart
-        setTimeout(async () => {
+        setTimeout(() => {
           console.log("Restarting bot after update...");
-
-          const cwd = process.cwd();
-          const vbsPath = path.join(cwd, "restart.vbs");
-
-          // Create a VBS script that launches cmd in a visible window
-          const vbsContent = `
-Set WshShell = CreateObject("WScript.Shell")
-WScript.Sleep 2000
-WshShell.CurrentDirectory = "${cwd.replace(/\\/g, "\\\\")}"
-WshShell.Run "cmd /k bun run start", 1, False
-`;
-          fs.writeFileSync(vbsPath, vbsContent.trim());
-
-          // Run the VBS script with wscript (doesn't block, creates independent process)
-          spawn("wscript.exe", [vbsPath], {
-            detached: true,
-            stdio: "ignore",
-          }).unref();
-
-          console.log("Restart VBS script launched, exiting...");
-          process.exit(0);
+          this.restartBot();
         }, 1000);
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`❌ Update failed: ${msg}`);
     }
+  }
+
+  /**
+   * Handle /restart command - restart the bot without pulling changes.
+   */
+  private async handleRestartCommand(interaction: any): Promise<void> {
+    await interaction.reply("🔄 Restarting bot...");
+
+    // Give Discord time to send the message, then restart
+    setTimeout(() => {
+      console.log("Restarting bot (no update)...");
+      this.restartBot();
+    }, 1000);
+  }
+
+  /**
+   * Relaunch the bot in a fresh process and exit the current one. The new
+   * process is detached so it survives this process exiting.
+   */
+  private restartBot(): void {
+    const cwd = process.cwd();
+    const vbsPath = path.join(cwd, "restart.vbs");
+
+    // Create a VBS script that launches cmd in a visible window
+    const vbsContent = `
+Set WshShell = CreateObject("WScript.Shell")
+WScript.Sleep 2000
+WshShell.CurrentDirectory = "${cwd.replace(/\\/g, "\\\\")}"
+WshShell.Run "cmd /k bun run start", 1, False
+`;
+    fs.writeFileSync(vbsPath, vbsContent.trim());
+
+    // Run the VBS script with wscript (doesn't block, creates independent process)
+    spawn("wscript.exe", [vbsPath], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+
+    console.log("Restart VBS script launched, exiting...");
+    process.exit(0);
   }
 
   private async handlePauseCommand(interaction: any): Promise<void> {

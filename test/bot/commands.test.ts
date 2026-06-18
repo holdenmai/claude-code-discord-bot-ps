@@ -28,27 +28,29 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(20);
+      expect(commands).toHaveLength(22);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
-      expect(commands[2]!.name).toBe('model');
-      expect(commands[3]!.name).toBe('killall');
-      expect(commands[4]!.name).toBe('add');
-      expect(commands[5]!.name).toBe('plan');
-      expect(commands[6]!.name).toBe('update');
-      expect(commands[7]!.name).toBe('init');
-      expect(commands[8]!.name).toBe('shortcut');
-      expect(commands[9]!.name).toBe('sync');
-      expect(commands[10]!.name).toBe('end');
-      expect(commands[11]!.name).toBe('adopt');
-      expect(commands[12]!.name).toBe('status');
-      expect(commands[13]!.name).toBe('todo');
-      expect(commands[14]!.name).toBe('pause');
-      expect(commands[15]!.name).toBe('resume');
-      expect(commands[16]!.name).toBe('costreview');
-      expect(commands[17]!.name).toBe('interrupt');
-      expect(commands[18]!.name).toBe('btw');
-      expect(commands[19]!.name).toBe('file');
+      expect(commands[2]!.name).toBe('stop');
+      expect(commands[3]!.name).toBe('model');
+      expect(commands[4]!.name).toBe('killall');
+      expect(commands[5]!.name).toBe('add');
+      expect(commands[6]!.name).toBe('plan');
+      expect(commands[7]!.name).toBe('update');
+      expect(commands[8]!.name).toBe('restart');
+      expect(commands[9]!.name).toBe('init');
+      expect(commands[10]!.name).toBe('shortcut');
+      expect(commands[11]!.name).toBe('sync');
+      expect(commands[12]!.name).toBe('end');
+      expect(commands[13]!.name).toBe('adopt');
+      expect(commands[14]!.name).toBe('status');
+      expect(commands[15]!.name).toBe('todo');
+      expect(commands[16]!.name).toBe('pause');
+      expect(commands[17]!.name).toBe('resume');
+      expect(commands[18]!.name).toBe('costreview');
+      expect(commands[19]!.name).toBe('interrupt');
+      expect(commands[20]!.name).toBe('btw');
+      expect(commands[21]!.name).toBe('file');
     });
   });
 

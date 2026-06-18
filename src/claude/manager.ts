@@ -355,6 +355,33 @@ export class ClaudeManager {
     return ok;
   }
 
+  /**
+   * Gracefully stop the current turn by sending a `control_request`/`interrupt`
+   * to the running process's stdin — the programmatic equivalent of pressing
+   * Esc once in the interactive CLI. Claude aborts in-flight work cleanly and
+   * emits a result, so the session is preserved (unlike SIGTERM via /kill).
+   * Returns false if there's no process accepting input to interrupt.
+   */
+  interruptSession(channelId: string): boolean {
+    const process = this.channelProcesses.get(channelId)?.process;
+    if (!process?.stdin?.writable) return false;
+
+    const message = JSON.stringify({
+      type: "control_request",
+      request_id: `interrupt_${Date.now()}`,
+      request: { subtype: "interrupt" },
+    }) + "\n";
+
+    try {
+      process.stdin.write(message);
+      console.log(`Sent graceful interrupt (control_request) to channel ${channelId}`);
+      return true;
+    } catch (error) {
+      console.error("Error sending interrupt control_request to stdin:", error);
+      return false;
+    }
+  }
+
   getSessionId(channelId: string): string | undefined {
     return this.db.getSession(channelId);
   }
