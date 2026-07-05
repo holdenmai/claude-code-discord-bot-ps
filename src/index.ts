@@ -12,6 +12,14 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled promise rejection (kept alive):', reason);
 });
 
+// Synchronous twin of the above. The flaky Claude API lives in the spawned CLI,
+// so the bot only ever sees its output — but a stray synchronous throw in a sync
+// callback (a stream `data` handler, a timer) would otherwise take the process
+// down. Log and keep running: a dropped message beats a dead bot.
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception (kept alive):', error);
+});
+
 async function main() {
   const config = validateConfig();
 

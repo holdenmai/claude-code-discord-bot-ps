@@ -757,9 +757,19 @@ export class ClaudeManager {
       ) {
         const channel = this.channelMessages.get(channelId)?.channel;
         if (channel) {
+          // Truncate before building the embed. Claude API connection errors
+          // ("Unable to connect to API… Retrying") can carry a long stack trace
+          // that blows past Discord's 4096-char embed limit — an oversized embed
+          // is rejected at send time and the message is lost entirely. We'd
+          // rather show a trimmed warning than nothing.
+          const trimmed = stderrOutput.trim();
+          const description = trimmed.length > 1900
+            ? trimmed.slice(0, 1900) + "\n…(truncated)"
+            : trimmed;
+
           const warningEmbed = new EmbedBuilder()
             .setTitle("⚠️ Warning")
-            .setDescription(stderrOutput.trim())
+            .setDescription(description)
             .setColor(0xFFA500); // Orange for warnings
 
           channel.send({ embeds: [warningEmbed] }).catch(console.error);
