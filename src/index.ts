@@ -5,6 +5,13 @@ import { MCPPermissionServer } from './mcp/server.js';
 import { SettingsStore } from './settings/settings-store.js';
 import { InstanceRouter } from './routing/instance-router.js';
 
+// Global backstop: a stray rejected promise (most often a Discord interaction
+// ack that landed after the 3s window) must never take the whole bot down.
+// Log it and keep running; per-call sites still handle their own errors.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection (kept alive):', reason);
+});
+
 async function main() {
   const config = validateConfig();
 
