@@ -1,7 +1,43 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { ClaudeManager } from '../../src/claude/manager.js';
+import { ClaudeManager, apiRetryDelayMs, isApiErrorText } from '../../src/claude/manager.js';
 import * as fs from 'fs';
 import * as path from 'path';
+
+describe('API-error auto-resume helpers', () => {
+  describe('apiRetryDelayMs', () => {
+    it('follows the escalating schedule: 10s, 20s, 30s, 60s, then +60s each', () => {
+      expect(apiRetryDelayMs(0)).toBe(10_000);
+      expect(apiRetryDelayMs(1)).toBe(20_000);
+      expect(apiRetryDelayMs(2)).toBe(30_000);
+      expect(apiRetryDelayMs(3)).toBe(60_000);
+      expect(apiRetryDelayMs(4)).toBe(120_000);
+      expect(apiRetryDelayMs(5)).toBe(180_000);
+    });
+
+    it('caps at 10 minutes and stays there forever', () => {
+      expect(apiRetryDelayMs(12)).toBe(600_000); // 60 + (12-3)*60 = 600s
+      expect(apiRetryDelayMs(13)).toBe(600_000);
+      expect(apiRetryDelayMs(100)).toBe(600_000);
+    });
+  });
+
+  describe('isApiErrorText', () => {
+    it('matches known API-error signatures (case-insensitive)', () => {
+      expect(isApiErrorText('API Error: Connection closed mid-response.')).toBe(true);
+      expect(isApiErrorText('Unable to connect to API')).toBe(true);
+      expect(isApiErrorText('overloaded_error')).toBe(true);
+      expect(isApiErrorText('Request timed out')).toBe(true);
+      expect(isApiErrorText('ECONNRESET')).toBe(true);
+    });
+
+    it('ignores normal output and empty input', () => {
+      expect(isApiErrorText('Task completed successfully')).toBe(false);
+      expect(isApiErrorText('')).toBe(false);
+      expect(isApiErrorText(undefined)).toBe(false);
+      expect(isApiErrorText(null)).toBe(false);
+    });
+  });
+});
 
 vi.mock('fs');
 vi.mock('child_process');

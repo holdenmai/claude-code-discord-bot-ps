@@ -10,6 +10,44 @@ import type { SettingsStore } from "../settings/settings-store.js";
 
 export type OnCompleteCallback = (channelId: string, status: CompletionStatus, originalMessage: any) => void;
 
+// Substrings that mark a Claude/Anthropic API-layer failure (as opposed to a
+// normal task failure). Matched case-insensitively. Kept deliberately specific
+// so a model merely *discussing* API errors doesn't trigger the auto-retry.
+const API_ERROR_MARKERS = [
+  "connection closed mid-response",
+  "api error",
+  "unable to connect",
+  "connection error",
+  "overloaded",
+  "internal server error",
+  "request timed out",
+  "econnreset",
+  "etimedout",
+];
+
+export function isApiErrorText(text: string | undefined | null): boolean {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return API_ERROR_MARKERS.some((m) => t.includes(m));
+}
+
+// Escalating backoff for API-error auto-resume: 10s, 20s, 30s, 60s, then +60s
+// each attempt, capped at 10 minutes — and it stays at 10 minutes forever after.
+export function apiRetryDelayMs(attempt: number): number {
+  const steps = [10, 20, 30, 60]; // seconds for attempts 0..3
+  const sec = attempt < steps.length
+    ? steps[attempt]!
+    : Math.min(60 + (attempt - 3) * 60, 600);
+  return sec * 1000;
+}
+
+function humanizeMs(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s} seconds`;
+  const m = Math.round(s / 60);
+  return `${m} minute${m === 1 ? "" : "s"}`;
+}
+
 export class ClaudeManager {
   private db: DatabaseManager;
   private channelMessages = new Map<string, any>();
@@ -74,6 +112,23 @@ export class ClaudeManager {
   // so messages can be injected mid-turn via /interrupt and /btw).
   private streamingChannels = new Set<string>();
 
+  // --- API-error auto-resume ---
+  // When a run hits a Claude/Anthropic API error (connection dropped mid-response,
+  // unable to connect, timed out, overloaded, …), we resume the session and retry
+  // the turn — forever, with escalating backoff — until it completes without an
+  // API error. See anthropics/claude-code#69415.
+  //   apiErrorThisRun  — channels whose current run saw an API error (checked at close).
+  //   apiRetryState    — per-channel backoff attempt counter + pending retry timer.
+  //   lastRunParams    — exact params to relaunch a channel's turn on resume.
+  private apiErrorThisRun = new Set<string>();
+  private apiRetryState = new Map<string, { attempt: number; timer?: ReturnType<typeof setTimeout> }>();
+  private lastRunParams = new Map<string, {
+    channelName: string;
+    prompt: string;
+    discordContext?: DiscordContext;
+    imageUrls?: string[];
+  }>();
+
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
 
@@ -102,15 +157,24 @@ export class ClaudeManager {
   }
 
   hasActiveProcess(channelId: string): boolean {
-    return this.channelProcesses.has(channelId);
+    // A channel awaiting an API-error retry has no live process but is logically
+    // still busy — report it as active so /kill and /stop can cancel the loop.
+    return this.channelProcesses.has(channelId) || this.apiRetryState.has(channelId);
   }
 
   killActiveProcess(channelId: string): void {
+    const wasRetrying = this.cancelApiRetry(channelId);
     const activeProcess = this.channelProcesses.get(channelId);
     if (activeProcess?.process) {
       console.log(`Killing active process for channel ${channelId}`);
       this.stopTypingIndicator(channelId);
-      activeProcess.process.kill("SIGTERM");
+      activeProcess.process.kill("SIGTERM"); // `close` advances the queue
+    } else if (wasRetrying) {
+      // No live process, but we cancelled a pending retry — release the channel.
+      console.log(`Cancelled pending API-error retry for channel ${channelId}`);
+      this.stopTypingIndicator(channelId);
+      this.channelProcesses.delete(channelId);
+      this.notifyComplete(channelId, "failed");
     }
   }
 
@@ -121,6 +185,15 @@ export class ClaudeManager {
         console.log(`Killing process for channel ${channelId}`);
         this.stopTypingIndicator(channelId);
         entry.process.kill("SIGTERM");
+        count++;
+      }
+    }
+    // Also cancel channels waiting on an API-error retry (no live process).
+    for (const channelId of [...this.apiRetryState.keys()]) {
+      if (!this.channelProcesses.get(channelId)?.process && this.cancelApiRetry(channelId)) {
+        this.stopTypingIndicator(channelId);
+        this.channelProcesses.delete(channelId);
+        this.notifyComplete(channelId, "failed");
         count++;
       }
     }
@@ -145,6 +218,8 @@ export class ClaudeManager {
     this.notifiedTasks.delete(channelId);
     this.initPosted.delete(channelId);
     this.streamingChannels.delete(channelId);
+    this.cancelApiRetry(channelId);
+    this.lastRunParams.delete(channelId);
     this.cleanupTaskThreads(channelId);
   }
 
@@ -171,16 +246,41 @@ export class ClaudeManager {
 
   private handleProcessTimeout(channelId: string, process: any): void {
     console.log(`Claude process timed out (inactivity) for channel ${channelId}, killing it`);
-    process.kill("SIGTERM");
+    try { process.kill("SIGTERM"); } catch {}
 
     const channel = this.channelMessages.get(channelId)?.channel;
     if (channel) {
       const timeoutEmbed = new EmbedBuilder()
         .setTitle("⏰ Timeout")
-        .setDescription("Claude Code had no output for 5 minutes — process killed.")
+        .setDescription("Claude Code had no output for 10 minutes — process killed.")
         .setColor(0xFFD700);
       channel.send({ embeds: [timeoutEmbed] }).catch(console.error);
     }
+
+    // Guarantee the channel never hangs. Normally the `close` handler advances
+    // the queue via notifyComplete, but SIGTERM can be ignored (wedged process)
+    // or `close` can be delayed indefinitely if a grandchild keeps the stdio
+    // pipe open. So escalate to SIGKILL, then — if `close` still hasn't fired —
+    // force-advance the queue ourselves. notifyComplete is idempotent (guarded
+    // by completionNotified), so a normal `close` in this window makes the
+    // fallback a harmless no-op.
+    setTimeout(() => {
+      try { process.kill("SIGKILL"); } catch {}
+    }, 10_000);
+
+    setTimeout(() => {
+      if (this.completionNotified.has(channelId)) return; // `close` already advanced us
+      if (this.apiRetryState.has(channelId)) return; // an API-error retry is pending — leave it be
+      console.error(
+        `Reaper fallback for channel ${channelId}: process never closed after timeout kill — force-advancing queue`
+      );
+      this.channelProcesses.delete(channelId);
+      this.streamingChannels.delete(channelId);
+      this.channelWatchers.delete(channelId);
+      this.resultSeen.delete(channelId);
+      this.pendingCompletion.delete(channelId);
+      this.notifyComplete(channelId, "failed");
+    }, 20_000);
   }
 
   private notifyComplete(channelId: string, status: CompletionStatus): void {
@@ -196,6 +296,74 @@ export class ClaudeManager {
     if (this.onCompleteCallback) {
       this.onCompleteCallback(channelId, status, originalMessage);
     }
+  }
+
+  // --- API-error auto-resume ---
+
+  /**
+   * Cancel a pending API-error retry (the wait between attempts). Returns true
+   * if one was pending. Does NOT advance the queue — the caller decides that.
+   */
+  private cancelApiRetry(channelId: string): boolean {
+    const state = this.apiRetryState.get(channelId);
+    this.apiErrorThisRun.delete(channelId);
+    if (!state) return false;
+    if (state.timer) clearTimeout(state.timer);
+    this.apiRetryState.delete(channelId);
+    return true;
+  }
+
+  /**
+   * Schedule the next API-error resume with escalating backoff. The queue stays
+   * held (we never call notifyComplete), so no new turn starts underneath.
+   */
+  private scheduleApiRetry(channelId: string): void {
+    const attempt = this.apiRetryState.get(channelId)?.attempt ?? 0;
+    const delay = apiRetryDelayMs(attempt);
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (channel) {
+      const embed = new EmbedBuilder()
+        .setTitle("🔁 API error — auto-resuming")
+        .setDescription(
+          `Claude hit an API error. Resuming the session in **${humanizeMs(delay)}** ` +
+          `(attempt ${attempt + 1}). I'll keep retrying until it goes through.`
+        )
+        .setColor(0xFFA500);
+      channel.send({ embeds: [embed] }).catch(console.error);
+    }
+
+    const timer = setTimeout(() => this.retryTurn(channelId), delay);
+    this.apiRetryState.set(channelId, { attempt: attempt + 1, timer });
+  }
+
+  /**
+   * Relaunch a channel's turn by resuming its session. Called by the backoff
+   * timer. The turn's outcome comes back through the normal stream/close path,
+   * which re-detects any API error and schedules the next attempt.
+   */
+  private retryTurn(channelId: string): void {
+    const params = this.lastRunParams.get(channelId);
+    if (!params) {
+      console.error(`retryTurn: no saved params for channel ${channelId}; giving up`);
+      this.apiRetryState.delete(channelId);
+      this.channelProcesses.delete(channelId);
+      this.notifyComplete(channelId, "failed");
+      return;
+    }
+
+    const sessionId = this.getSessionId(channelId);
+    const discordMessage = this.channelMessages.get(channelId);
+    // reserveChannel resets the completion guard so the resumed turn can complete.
+    this.reserveChannel(channelId, sessionId, discordMessage);
+    this.runClaudeCode(
+      channelId, params.channelName, params.prompt, sessionId, params.discordContext, params.imageUrls
+    ).catch((err) => {
+      // A spawn/setup failure won't produce a `close`, so back off and retry here.
+      console.error(`retryTurn: relaunch failed for channel ${channelId}:`, err);
+      this.channelProcesses.delete(channelId);
+      this.scheduleApiRetry(channelId);
+    });
   }
 
   // --- Typing indicator ---
@@ -364,7 +532,17 @@ export class ClaudeManager {
    */
   interruptSession(channelId: string): boolean {
     const process = this.channelProcesses.get(channelId)?.process;
-    if (!process?.stdin?.writable) return false;
+    if (!process?.stdin?.writable) {
+      // No live process — but if we're between API-error retries, cancelling the
+      // pending retry is the graceful stop the user is asking for.
+      if (this.cancelApiRetry(channelId)) {
+        this.stopTypingIndicator(channelId);
+        this.channelProcesses.delete(channelId);
+        this.notifyComplete(channelId, "failed");
+        return true;
+      }
+      return false;
+    }
 
     const message = JSON.stringify({
       type: "control_request",
@@ -525,6 +703,11 @@ export class ClaudeManager {
     discordContext?: DiscordContext,
     imageUrls?: string[]
   ): Promise<void> {
+    // Remember exactly how to relaunch this turn, so an API-error auto-resume can
+    // replay it verbatim. Start the run with a clean API-error flag.
+    this.lastRunParams.set(channelId, { channelName, prompt, discordContext, imageUrls });
+    this.apiErrorThisRun.delete(channelId);
+
     // Store the channel name for path replacement
     this.channelNames.set(channelId, channelName);
     if (discordContext) {
@@ -594,11 +777,13 @@ export class ClaudeManager {
 
     let buffer = "";
 
-    // Inactivity timeout: kill if no stdout for 5 minutes (resets on each output).
-    // While a watcher (Monitor) is running, the process is *expected* to sit quiet
-    // — don't reap it; re-arm instead, bounded by an absolute hold cap so a stuck
-    // watcher can't pin a process open forever.
-    const INACTIVITY_MS = 5 * 60 * 1000;
+    // Inactivity timeout: kill if no stdout for 10 minutes (resets on each output).
+    // Long / slow API turns can go quiet for minutes at a time — especially when
+    // Anthropic is overloaded — so keep this generous to avoid reaping a turn that
+    // is merely slow rather than wedged. While a watcher (Monitor) is running, the
+    // process is *expected* to sit quiet — don't reap it; re-arm instead, bounded
+    // by an absolute hold cap so a stuck watcher can't pin a process open forever.
+    const INACTIVITY_MS = 10 * 60 * 1000;
     const MAX_WATCHER_HOLD_MS = 30 * 60 * 1000;
     const runStartedAt = Date.now();
     const onInactivity = () => {
@@ -639,6 +824,32 @@ export class ClaudeManager {
           try {
             const parsed: SDKMessage = JSON.parse(line);
             console.log("Parsed message type:", parsed.type);
+
+            // Flag Claude/Anthropic API errors so the turn is auto-resumed on close.
+            // Precise on purpose: only CLI-synthesized assistant messages
+            // (model === "<synthetic>") and error-flagged results count, so a model
+            // merely *discussing* API errors never triggers an infinite retry.
+            {
+              const p = parsed as any;
+              const isSynthApiErr = p.type === "assistant"
+                && p.message?.model === "<synthetic>"
+                && isApiErrorText(JSON.stringify(p.message?.content ?? ""));
+              const isResultApiErr = p.type === "result"
+                && (p.is_error === true || (typeof p.subtype === "string" && p.subtype !== "success"))
+                && isApiErrorText(JSON.stringify(p));
+              if (isSynthApiErr || isResultApiErr) {
+                if (!this.apiErrorThisRun.has(channelId)) {
+                  console.log(`Detected API error in channel ${channelId} (${p.type}) — will auto-resume on close`);
+                }
+                this.apiErrorThisRun.add(channelId);
+              } else if (p.type === "result" && p.subtype === "success" && p.is_error !== true) {
+                // The turn finished cleanly. The CLI does its own transient retries
+                // (e.g. "Unable to connect… Retrying" on stderr) and may recover on
+                // its own — a success result means any earlier blip is moot, so don't
+                // resume.
+                this.apiErrorThisRun.delete(channelId);
+              }
+            }
 
             if (parsed.type === "assistant" && parsed.message.content) {
               this.handleAssistantMessage(channelId, parsed).catch(console.error);
@@ -709,6 +920,25 @@ export class ClaudeManager {
       // Ensure cleanup on process close
       this.channelProcesses.delete(channelId);
 
+      // API-error auto-resume: if this run hit an API error, don't finalize the
+      // turn. Reset the per-run streaming/watcher state (the resumed run rebuilds
+      // it) and schedule the next resume with escalating backoff. We intentionally
+      // do NOT call notifyComplete, so the queue stays held and no new turn starts.
+      if (this.apiErrorThisRun.has(channelId)) {
+        this.apiErrorThisRun.delete(channelId);
+        this.channelWatchers.delete(channelId);
+        this.resultSeen.delete(channelId);
+        this.pendingCompletion.delete(channelId);
+        this.notifiedTasks.delete(channelId);
+        this.initPosted.delete(channelId);
+        this.streamingChannels.delete(channelId);
+        this.scheduleApiRetry(channelId);
+        return;
+      }
+      // Clean end for this run — reset the backoff so the next independent API
+      // error starts again at 10s.
+      this.apiRetryState.delete(channelId);
+
       // Did the turn already succeed? (completion fired at result, or was deferred
       // because watchers were holding the process open). Capture before notifying.
       const deferred = this.pendingCompletion.get(channelId);
@@ -748,6 +978,12 @@ export class ClaudeManager {
     claude.stderr.on("data", (data) => {
       const stderrOutput = data.toString();
       console.error("Claude stderr:", stderrOutput);
+
+      // API connection errors ("Unable to connect to API… Retrying", resets,
+      // timeouts) surface on stderr — flag them for auto-resume at close.
+      if (isApiErrorText(stderrOutput)) {
+        this.apiErrorThisRun.add(channelId);
+      }
 
       // If there's significant stderr output, send warning to Discord
       if (
@@ -1390,6 +1626,11 @@ export class ClaudeManager {
     // Close all active processes
     for (const [channelId] of this.channelProcesses) {
       this.killActiveProcess(channelId);
+    }
+
+    // Cancel any pending API-error retries (channels with no live process).
+    for (const channelId of [...this.apiRetryState.keys()]) {
+      this.cancelApiRetry(channelId);
     }
 
     // Close database connection
