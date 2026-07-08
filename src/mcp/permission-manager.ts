@@ -16,6 +16,8 @@ export class PermissionManager {
   private discordBot: any = null; // Will be set via setDiscordBot
   private approvalTimeout: number;
   private defaultOnTimeout: 'allow' | 'deny';
+  // Questions get a longer window than plain approvals (they need real input).
+  private questionTimeout = 120_000; // 2 minutes
   // Track tools that user chose "Always Allow" for, keyed by channelId
   private alwaysAllowedTools = new Map<string, Set<string>>();
   private settings?: SettingsStore;
@@ -374,6 +376,49 @@ export class PermissionManager {
   }
 
   /**
+   * Handle an AskUserQuestion timeout.
+   *
+   * Unlike a plain approval, a multi-question prompt is rendered one question at
+   * a time in a single message that is edited forward. The generic timeout
+   * handler would preserve only whichever question was on screen, losing the
+   * already-answered and not-yet-shown ones. So we resolve the tool call the
+   * same way (default deny / allow-with-partial-answers), then edit the message
+   * to leave the FULL record of every question + option in chat for later
+   * review, with the controls disabled.
+   */
+  private handleQuestionTimeout(requestId: string): void {
+    const pending = this.pendingApprovals.get(requestId);
+    if (!pending || !pending.pendingQuestion) return;
+
+    console.log(`PermissionManager: Question timed out for ${requestId}, defaulting to ${this.defaultOnTimeout}`);
+
+    const decision: PermissionDecision = {
+      behavior: this.defaultOnTimeout,
+      updatedInput: this.defaultOnTimeout === 'allow'
+        ? { questions: pending.pendingQuestion.questions, answers: pending.pendingQuestion.answers }
+        : undefined,
+      message: `Question timed out after ${this.questionTimeout / 1000} seconds, defaulted to ${this.defaultOnTimeout}`,
+    };
+
+    pending.resolve(decision);
+    this.cleanupPendingApproval(requestId);
+
+    // Leave the FULL multi-question record in chat, controls disabled, so the
+    // user can review every question and answer in a follow-up message.
+    const summary = this.buildQuestionSummary(pending.pendingQuestion);
+    pending.discordMessage?.edit({
+      content: '',
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('⏰ Questions Timed Out — review below')
+          .setDescription(summary.slice(0, 4096))
+          .setColor(0xFFA500),
+      ],
+      components: [],
+    }).catch(console.error);
+  }
+
+  /**
    * Update the approval message to show the result
    */
   private async updateApprovalMessage(message: any, approved: boolean | null): Promise<void> {
@@ -437,13 +482,10 @@ export class PermissionManager {
       };
     }
 
-    // Use a longer timeout for questions (2 minutes)
-    const questionTimeout = 120_000;
-
     return new Promise<PermissionDecision>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.handleApprovalTimeout(requestId);
-      }, questionTimeout);
+        this.handleQuestionTimeout(requestId);
+      }, this.questionTimeout);
 
       const pending: PendingApproval = {
         requestId,
@@ -630,6 +672,27 @@ export class PermissionManager {
   }
 
   /**
+   * Rebuild a full record of every question + option from in-memory state.
+   * Picked options are marked ✅, others ▫️; unanswered questions show
+   * "(no answer)" and all their options remain visible. Shared by the
+   * all-answered summary and the timeout record so a timed-out multi-question
+   * prompt still shows every question (not just the one that was on screen).
+   */
+  private buildQuestionSummary(questionState: PendingQuestionState): string {
+    return questionState.questions
+      .map((q) => {
+        const answer = questionState.answers[q.question] ?? '(no answer)';
+        const picked = new Set(answer.split(', '));
+        const title = q.header ? `**${q.header}** — ${q.question}` : `**${q.question}**`;
+        const opts = q.options
+          .map((o: any) => `${picked.has(o.label) ? '✅' : '▫️'} ${o.label}`)
+          .join('\n');
+        return `${title}\n${opts}\n→ **${answer}**`;
+      })
+      .join('\n\n');
+  }
+
+  /**
    * Advance to the next question or resolve if all questions are answered
    */
   private advanceOrResolveQuestion(pending: PendingApproval, interaction: any): void {
@@ -664,17 +727,7 @@ export class PermissionManager {
       // Leave the answered question(s) in place for later review — rebuild a full
       // record from the in-memory question data so the options aren't lost (the
       // selected one is marked). Disable the controls; do not delete.
-      const summary = questionState.questions
-        .map((q) => {
-          const answer = questionState.answers[q.question] ?? '(no answer)';
-          const picked = new Set(answer.split(', '));
-          const title = q.header ? `**${q.header}** — ${q.question}` : `**${q.question}**`;
-          const opts = q.options
-            .map((o: any) => `${picked.has(o.label) ? '✅' : '▫️'} ${o.label}`)
-            .join('\n');
-          return `${title}\n${opts}\n→ **${answer}**`;
-        })
-        .join('\n\n');
+      const summary = this.buildQuestionSummary(questionState);
 
       interaction.update({
         embeds: [
