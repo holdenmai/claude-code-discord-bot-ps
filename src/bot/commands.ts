@@ -154,11 +154,11 @@ export class CommandHandler {
         ),
       new SlashCommandBuilder()
         .setName("resume")
-        .setDescription("Resume a previously paused session")
+        .setDescription("Resume a paused session by name, or any session by its id")
         .addStringOption((option: any) =>
           option
             .setName("name")
-            .setDescription("Name of the paused session to resume")
+            .setDescription("Paused session name, or a session id (GUID) to resume directly")
             .setRequired(true)
             .setAutocomplete(true)
         ),
@@ -1300,18 +1300,61 @@ WshShell.Run "cmd /k bun run start", 1, False
 
   private async handleResumeCommand(interaction: any): Promise<void> {
     const channelId = interaction.channelId;
-    const name = interaction.options.getString("name");
+    const input = (interaction.options.getString("name") || "").trim();
     const channelName = interaction.channel?.name || channelId;
 
-    const success = this.claudeManager.resumeSession(channelId, name, channelName);
-    if (success) {
-      await interaction.reply(`Resumed session **${name}**. Next message will continue that session.`);
-    } else {
+    // Don't switch sessions mid-run — mirror /pause's guard.
+    if (this.claudeManager.hasActiveProcess(channelId)) {
       await interaction.reply({
-        content: `No paused session named **${name}** in this channel.`,
+        content: "Cannot switch sessions while a process is running. Use `/kill` or `/stop` first.",
         ephemeral: true,
       });
+      return;
     }
+
+    // Resolve the target BEFORE mutating anything, so a bad input never leaves
+    // the channel without a session. A paused-session name wins over a GUID, so
+    // switching back to a previously auto-paused session (whose name is its id)
+    // goes through resumeSession and restores its cost + cleans up the record.
+    const isPausedName = this.claudeManager
+      .getResumableSessions(channelId)
+      .some((s) => s.name === input);
+    const asGuid = isSessionGuid(input);
+
+    if (!isPausedName && !asGuid) {
+      await interaction.reply({
+        content: `No paused session named **${input}** in this channel, and that's not a valid session id.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const current = this.claudeManager.getSessionId(channelId);
+
+    if (asGuid && !isPausedName && current === input) {
+      await interaction.reply({
+        content: "That session is already active in this channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Auto-pause the current session under its own id so it's always recoverable
+    // via `/resume <that-id>` (previously it was silently overwritten).
+    if (current) {
+      this.claudeManager.pauseSession(channelId, current);
+    }
+
+    if (isPausedName) {
+      this.claudeManager.resumeSession(channelId, input, channelName);
+    } else {
+      this.claudeManager.setSessionFromAdopt(channelId, input, channelName);
+    }
+
+    const back = current
+      ? ` Previous session paused as \`${current}\` — \`/resume ${current}\` to switch back.`
+      : "";
+    await interaction.reply(`Resumed session **${input}**. Next message will continue that session.${back}`);
   }
 
   private async handleResumeAutocomplete(interaction: any): Promise<void> {
@@ -1438,6 +1481,14 @@ WshShell.Run "cmd /k bun run start", 1, False
 
     await interaction.editReply(`💰 **Cost Review**\n\n${body}${summary}`);
   }
+}
+
+// A Claude session id is a v4-style UUID. We only check the shape — if the id
+// doesn't exist (or belongs to another folder), the CLI reports it on the next
+// message, matching `claude --resume <id>` in the console.
+const SESSION_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isSessionGuid(s: string): boolean {
+  return SESSION_GUID_RE.test(s.trim());
 }
 
 function formatAge(timestamp: number): string {

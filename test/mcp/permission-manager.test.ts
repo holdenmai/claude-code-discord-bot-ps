@@ -71,11 +71,11 @@ describe('AskUserQuestion timeout preserves the full multi-question record', () 
 
     // The tool call still resolves (default deny, display-only fix).
     expect(resolve).toHaveBeenCalledTimes(1);
-    expect(resolve.mock.calls[0][0].behavior).toBe('deny');
+    expect(resolve.mock.calls[0]![0].behavior).toBe('deny');
 
     // The message is edited to a single record with controls removed.
     expect(edit).toHaveBeenCalledTimes(1);
-    const payload = edit.mock.calls[0][0];
+    const payload = edit.mock.calls[0]![0];
     expect(payload.components).toEqual([]);
 
     const description = payload.embeds[0].data.description as string;
