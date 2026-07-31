@@ -41,6 +41,28 @@ export function apiRetryDelayMs(attempt: number): number {
   return sec * 1000;
 }
 
+// Raw stream log. It records every byte of every turn's stdout, so it grows
+// without bound — roll it at LOG_MAX_MB and keep one previous generation, which
+// is enough to debug the run that just happened without ever eating the disk.
+const LOG_MAX_BYTES = Number(process.env.LOG_MAX_MB || 256) * 1024 * 1024;
+
+export function appendStreamLog(text: string): void {
+  const logPath = path.join(process.cwd(), "log.txt");
+  try {
+    // statSync per append is cheap next to the write itself, and checking before
+    // writing is what keeps a single huge turn from blowing past the cap.
+    let size = 0;
+    try { size = fs.statSync(logPath).size; } catch {}
+    if (size + text.length > LOG_MAX_BYTES) {
+      try { fs.renameSync(logPath, `${logPath}.1`); } catch {}
+      console.log(`Rotated log.txt at ${(size / 1024 / 1024).toFixed(0)} MB`);
+    }
+    fs.appendFileSync(logPath, text);
+  } catch (error) {
+    console.error("Error writing to log.txt:", error);
+  }
+}
+
 function humanizeMs(ms: number): string {
   const s = Math.round(ms / 1000);
   if (s < 60) return `${s} seconds`;
@@ -807,12 +829,7 @@ export class ClaudeManager {
       console.log("Raw stdout data:", rawData);
 
       // Log all streamed output to log.txt
-      try {
-        fs.appendFileSync(path.join(process.cwd(), 'log.txt'),
-          `[${new Date().toISOString()}] Channel: ${channelId}\n${rawData}\n---\n`);
-      } catch (error) {
-        console.error("Error writing to log.txt:", error);
-      }
+      appendStreamLog(`[${new Date().toISOString()}] Channel: ${channelId}\n${rawData}\n---\n`);
 
       buffer += rawData;
       const lines = buffer.split("\n");

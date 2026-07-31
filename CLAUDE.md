@@ -66,6 +66,9 @@ Optional (multi-instance):
 - `BOT_INSTANCE_ID` - Instance name (e.g., "linux", "windows"). Enables multi-instance routing
 - `BOT_PRIORITY` - Integer priority (1 = highest, default: 1). Lower priority bots wait before processing
 
+Optional (models, timeouts, logging):
+- `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
+
 ## Environment
 
 - Bun automatically loads .env files (no need for dotenv)

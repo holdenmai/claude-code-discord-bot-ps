@@ -36,4 +36,5 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 sessions.db
 settings.json
 log.txt
+log.txt.*
 docs/plans
