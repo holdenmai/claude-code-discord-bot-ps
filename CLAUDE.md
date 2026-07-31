@@ -85,6 +85,7 @@ Optional (multi-instance):
 Optional (models, timeouts, logging):
 - `DEFAULT_MODEL` - Model new sessions start on (default: `claude-opus-5`)
 - `LEGACY_SESSION_MODEL` - Model for sessions created before per-session pinning (default: `claude-opus-4-8`)
+- `QUESTION_WATCHDOG_SECONDS` - Silence allowed after AskUserQuestion answers are delivered before the turn is treated as wedged and recovered (default: 120)
 - `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
 
 ## Environment

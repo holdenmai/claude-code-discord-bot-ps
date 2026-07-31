@@ -48,6 +48,9 @@ async function main() {
 
   // Connect MCP server to Discord bot for interactive approvals
   mcpServer.setDiscordBot(bot);
+  // …and to the Claude manager, so answered questions arm the post-answer
+  // watchdog that recovers a turn wedged on its own AskUserQuestion.
+  mcpServer.setClaudeManager(claudeManager);
 
   // Handle graceful shutdown
   let isShuttingDown = false;

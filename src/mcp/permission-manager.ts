@@ -14,6 +14,7 @@ import type { SettingsStore } from '../settings/settings-store.js';
 export class PermissionManager {
   private pendingApprovals = new Map<string, PendingApproval>();
   private discordBot: any = null; // Will be set via setDiscordBot
+  private claudeManager: any = null; // Will be set via setClaudeManager
   private approvalTimeout: number;
   private defaultOnTimeout: 'allow' | 'deny';
   // Questions get a longer window than plain approvals (they need real input).
@@ -41,6 +42,14 @@ export class PermissionManager {
    */
   setDiscordBot(discordBot: any): void {
     this.discordBot = discordBot;
+  }
+
+  /**
+   * Set the Claude manager, so answered questions can arm its post-answer
+   * watchdog (the CLI sometimes accepts the answers and then wedges).
+   */
+  setClaudeManager(claudeManager: any): void {
+    this.claudeManager = claudeManager;
   }
 
   /**
@@ -693,6 +702,16 @@ export class PermissionManager {
   }
 
   /**
+   * Plain-text rendering of the answers, for replaying them as a normal message
+   * if the turn wedges after receiving them.
+   */
+  private buildAnswerReplay(questionState: PendingQuestionState): string {
+    return questionState.questions
+      .map((q) => `Q: ${q.question}\nA: ${questionState.answers[q.question] ?? '(no answer)'}`)
+      .join('\n\n');
+  }
+
+  /**
    * Advance to the next question or resolve if all questions are answered
    */
   private advanceOrResolveQuestion(pending: PendingApproval, interaction: any): void {
@@ -705,6 +724,13 @@ export class PermissionManager {
       // could leave the message blank if the follow-up edit failed, making it
       // look like only the first question ever came through.)
       questionState.currentQuestionIndex = nextIndex;
+
+      // Give the next question its own full window. The timeout is a budget per
+      // question, not for the whole prompt: with one shared deadline, a careful
+      // reader on a 3-question prompt could blow it mid-way, which resolved the
+      // tool call as a denial and left every remaining button dead.
+      clearTimeout(pending.timeout);
+      pending.timeout = setTimeout(() => this.handleQuestionTimeout(pending.requestId), this.questionTimeout);
 
       interaction.update(this.buildQuestionView(pending)).catch((error: any) => {
         console.error('PermissionManager: Failed to render next question:', error);
@@ -723,6 +749,18 @@ export class PermissionManager {
 
       console.log('PermissionManager: All questions answered:', decision);
       pending.resolve(decision);
+
+      // The answers are on their way back to the CLI over the MCP response. If
+      // the turn goes silent from here, it's wedged — let the manager watch for
+      // that and recover rather than losing the answers to the 10-minute reaper.
+      try {
+        this.claudeManager?.noteQuestionAnswered?.(
+          pending.discordContext.channelId,
+          this.buildAnswerReplay(questionState)
+        );
+      } catch (error) {
+        console.error('PermissionManager: failed to arm question watchdog:', error);
+      }
 
       // Leave the answered question(s) in place for later review — rebuild a full
       // record from the in-memory question data so the options aren't lost (the

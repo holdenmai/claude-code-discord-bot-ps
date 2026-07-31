@@ -34,6 +34,13 @@ export function resolveModelAlias(model: string): string {
   return MODEL_ALIASES[model] ?? model;
 }
 
+// How long to wait for the CLI to say *anything* after we hand it the answers to
+// an AskUserQuestion. On the healthy path the tool_result comes back over stdout
+// within seconds — before any thinking — so silence this long means the turn is
+// wedged, not slow. Deliberately far below the 10-minute inactivity reaper, which
+// would otherwise sit on a dead turn for the full window and then lose the answers.
+const QUESTION_ANSWER_WATCHDOG_MS = Number(process.env.QUESTION_WATCHDOG_SECONDS || 120) * 1000;
+
 // Substrings that mark a Claude/Anthropic API-layer failure (as opposed to a
 // normal task failure). Matched case-insensitively. Kept deliberately specific
 // so a model merely *discussing* API errors doesn't trigger the auto-retry.
@@ -103,6 +110,13 @@ export class ClaudeManager {
   // Model the in-flight run was launched with, so a newly reported session_id
   // is pinned to it (see getModelForRun / DatabaseManager.setSession).
   private channelRunModel = new Map<string, string>();
+  // AskUserQuestion hang recovery:
+  //   questionWatchdogs  — armed when answers go back to the CLI, cleared by any stdout.
+  //   questionRecovery   — answers to replay as a prompt after killing a wedged turn.
+  //   questionRecovered  — channels already recovered once this turn (recover at most once).
+  private questionWatchdogs = new Map<string, NodeJS.Timeout>();
+  private questionRecovery = new Map<string, string>();
+  private questionRecovered = new Set<string>();
   private channelProcesses = new Map<
     string,
     {
@@ -213,6 +227,10 @@ export class ClaudeManager {
 
   killActiveProcess(channelId: string): void {
     const wasRetrying = this.cancelApiRetry(channelId);
+    // An explicit kill outranks question-hang recovery: don't resurrect the turn
+    // the user just stopped.
+    this.questionRecovery.delete(channelId);
+    this.clearQuestionWatchdog(channelId);
     const activeProcess = this.channelProcesses.get(channelId);
     if (activeProcess?.process) {
       console.log(`Killing active process for channel ${channelId}`);
@@ -233,6 +251,8 @@ export class ClaudeManager {
       if (entry.process) {
         console.log(`Killing process for channel ${channelId}`);
         this.stopTypingIndicator(channelId);
+        this.questionRecovery.delete(channelId);
+        this.clearQuestionWatchdog(channelId);
         entry.process.kill("SIGTERM");
         count++;
       }
@@ -336,6 +356,12 @@ export class ClaudeManager {
     if (this.completionNotified.has(channelId)) return;
     this.completionNotified.add(channelId);
 
+    // The once-per-turn question-recovery guard is scoped to the turn that just
+    // ended; the next one starts fresh.
+    this.questionRecovered.delete(channelId);
+    this.questionRecovery.delete(channelId);
+    this.clearQuestionWatchdog(channelId);
+
     // Clear crash-recovery tracker
     this.db.markRunCompleted(channelId);
 
@@ -390,8 +416,11 @@ export class ClaudeManager {
    * Relaunch a channel's turn by resuming its session. Called by the backoff
    * timer. The turn's outcome comes back through the normal stream/close path,
    * which re-detects any API error and schedules the next attempt.
+   *
+   * `promptOverride` replays something other than the original prompt — used by
+   * question-hang recovery to resume with the answers the user already gave.
    */
-  private retryTurn(channelId: string): void {
+  private retryTurn(channelId: string, promptOverride?: string): void {
     const params = this.lastRunParams.get(channelId);
     if (!params) {
       console.error(`retryTurn: no saved params for channel ${channelId}; giving up`);
@@ -406,13 +435,117 @@ export class ClaudeManager {
     // reserveChannel resets the completion guard so the resumed turn can complete.
     this.reserveChannel(channelId, sessionId, discordMessage);
     this.runClaudeCode(
-      channelId, params.channelName, params.prompt, sessionId, params.discordContext, params.imageUrls
+      channelId, params.channelName, promptOverride ?? params.prompt, sessionId, params.discordContext, params.imageUrls
     ).catch((err) => {
       // A spawn/setup failure won't produce a `close`, so back off and retry here.
       console.error(`retryTurn: relaunch failed for channel ${channelId}:`, err);
       this.channelProcesses.delete(channelId);
       this.scheduleApiRetry(channelId);
     });
+  }
+
+  // --- AskUserQuestion hang recovery ---
+
+  /**
+   * Arm the post-answer watchdog. Called by the permission manager the moment
+   * an AskUserQuestion's answers are handed back to the CLI over MCP.
+   *
+   * The wedge this exists for: the CLI receives the answers, the permission
+   * response returns cleanly, and then the turn produces no further output at
+   * all — the tool call never resolves, so nothing downstream ever fires. From
+   * the bot's side it is indistinguishable from a very slow turn until the
+   * 10-minute reaper finally kills it and the answers are lost.
+   */
+  noteQuestionAnswered(channelId: string, answersText: string): void {
+    this.clearQuestionWatchdog(channelId);
+    if (!this.channelProcesses.has(channelId)) return;
+    const timer = setTimeout(
+      () => this.handleQuestionHang(channelId, answersText),
+      QUESTION_ANSWER_WATCHDOG_MS
+    );
+    this.questionWatchdogs.set(channelId, timer);
+    console.log(
+      `Question answers delivered for channel ${channelId}; watchdog armed for ` +
+      `${humanizeMs(QUESTION_ANSWER_WATCHDOG_MS)}`
+    );
+  }
+
+  /** Any output from the CLI means it isn't wedged — disarm. */
+  private clearQuestionWatchdog(channelId: string): void {
+    const timer = this.questionWatchdogs.get(channelId);
+    if (timer) {
+      clearTimeout(timer);
+      this.questionWatchdogs.delete(channelId);
+    }
+  }
+
+  /**
+   * The watchdog fired: the turn is wedged on an answered question. Kill it and
+   * mark the channel for recovery — `close` resumes the session with the answers
+   * replayed as a normal message, so the work continues instead of being lost.
+   *
+   * Recovery runs at most once per turn. If the resumed turn wedges the same way
+   * the second time, we let it fail normally rather than loop.
+   */
+  private handleQuestionHang(channelId: string, answersText: string): void {
+    this.questionWatchdogs.delete(channelId);
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry) return;
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+
+    if (this.questionRecovered.has(channelId)) {
+      console.error(
+        `Channel ${channelId} wedged on an answered question again after recovery; not retrying`
+      );
+      if (channel) {
+        channel.send({
+          embeds: [new EmbedBuilder()
+            .setTitle("⚠️ Stuck on question answers again")
+            .setDescription(
+              "The session wedged after answering a question a second time, so I stopped " +
+              "auto-recovering. Send the answers as a normal message to continue."
+            )
+            .setColor(0xFF0000)],
+        }).catch(console.error);
+      }
+      return;
+    }
+
+    console.log(`Channel ${channelId} produced no output ${humanizeMs(QUESTION_ANSWER_WATCHDOG_MS)} after ` +
+      `question answers were delivered — killing and resuming with the answers`);
+    this.questionRecovered.add(channelId);
+    this.questionRecovery.set(channelId, answersText);
+
+    if (channel) {
+      channel.send({
+        embeds: [new EmbedBuilder()
+          .setTitle("🔁 Recovering the answered question")
+          .setDescription(
+            "Claude went silent after receiving your answers. Restarting the session and " +
+            "replaying them so nothing is lost."
+          )
+          .setColor(0xFFA500)],
+      }).catch(console.error);
+    }
+
+    try { entry.process.kill("SIGTERM"); } catch {}
+    // SIGTERM can be ignored by a wedged process; escalate so `close` fires and
+    // the recovery in the close handler actually runs.
+    setTimeout(() => {
+      if (this.channelProcesses.get(channelId)?.process === entry.process) {
+        try { entry.process.kill("SIGKILL"); } catch {}
+      }
+    }, 5000);
+  }
+
+  /** The message replayed after a question hang, so Claude sees the answers again. */
+  private buildQuestionReplayPrompt(answersText: string): string {
+    return (
+      "The session was interrupted while your last question was being answered, so the " +
+      "answers never reached you. Here they are — continue the task with them in mind, " +
+      "and do not ask the same questions again:\n\n" + answersText
+    );
   }
 
   // --- Typing indicator ---
@@ -888,6 +1021,9 @@ export class ClaudeManager {
 
     claude.stdout.on("data", (data) => {
       resetTimeout();
+      // Any output at all means the CLI digested the question answers and is
+      // moving again — the post-answer watchdog has nothing to catch.
+      this.clearQuestionWatchdog(channelId);
       const rawData = data.toString();
       console.log("Raw stdout data:", rawData);
 
@@ -996,9 +1132,28 @@ export class ClaudeManager {
     claude.on("close", (code) => {
       console.log(`Claude process exited with code ${code}`);
       clearTimeout(timeout);
+      this.clearQuestionWatchdog(channelId);
       this.stopTypingIndicator(channelId);
       // Ensure cleanup on process close
       this.channelProcesses.delete(channelId);
+
+      // Question-hang recovery: this run was killed because it went silent after
+      // an AskUserQuestion was answered. Resume the session replaying the answers
+      // instead of finalizing the turn. Same shape as the API-error path below —
+      // the queue stays held so no new turn starts underneath.
+      const questionAnswers = this.questionRecovery.get(channelId);
+      if (questionAnswers !== undefined) {
+        this.questionRecovery.delete(channelId);
+        this.apiErrorThisRun.delete(channelId);
+        this.channelWatchers.delete(channelId);
+        this.resultSeen.delete(channelId);
+        this.pendingCompletion.delete(channelId);
+        this.notifiedTasks.delete(channelId);
+        this.initPosted.delete(channelId);
+        this.streamingChannels.delete(channelId);
+        this.retryTurn(channelId, this.buildQuestionReplayPrompt(questionAnswers));
+        return;
+      }
 
       // API-error auto-resume: if this run hit an API error, don't finalize the
       // turn. Reset the per-run streaming/watcher state (the resumed run rebuilds

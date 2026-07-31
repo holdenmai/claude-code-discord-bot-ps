@@ -29,6 +29,10 @@ export class MCPPermissionServer {
     this.permissionManager.setDiscordBot(discordBot);
   }
 
+  setClaudeManager(claudeManager: any): void {
+    this.permissionManager.setClaudeManager(claudeManager);
+  }
+
   /**
    * Get the permission manager instance
    */
