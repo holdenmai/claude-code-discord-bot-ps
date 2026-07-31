@@ -35,13 +35,29 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - Shows the last 3 streamed responses in each message
 - Use `/clear` slash command to reset a session
 
+### Model selection
+
+The model is pinned **per session**, not per channel, so a conversation never
+changes model mid-flight. When a session is created it records the model it ran
+with (`channel_sessions.session_model`) and keeps it for its whole life, across
+resumes and `/resume` after a pause. Resolution order for a run:
+
+1. the session's pinned model
+2. `LEGACY_SESSION_MODEL` for sessions created before pinning existed
+3. the channel default (`/model`, else `DEFAULT_MODEL`) — new sessions only
+
+`/model` sets the channel default *and* repins the current session, since it's an
+explicit choice about the conversation on screen. Bare tier aliases (`opus`) are
+resolved to concrete IDs before being pinned — an alias follows whatever the CLI
+currently points that tier at, which is the drift pinning exists to prevent.
+
 ### Commands
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)
 - `/kill` - Kill the running Claude Code process in this channel
 - `/stop` - Gracefully stop the current turn (stream-json `control_request`/`interrupt`, like pressing Esc); session is preserved
 - `/killall` - Kill all running Claude Code processes
-- `/model` - Set the Claude model for this channel (sonnet/opus/haiku)
+- `/model` - Set the model for this channel and repin the session in flight
 - `/add` - Create a channel for a project folder (with autocomplete)
 - `/update` - Pull latest changes and restart the bot
 - `/restart` - Restart the bot without pulling changes
@@ -67,6 +83,8 @@ Optional (multi-instance):
 - `BOT_PRIORITY` - Integer priority (1 = highest, default: 1). Lower priority bots wait before processing
 
 Optional (models, timeouts, logging):
+- `DEFAULT_MODEL` - Model new sessions start on (default: `claude-opus-5`)
+- `LEGACY_SESSION_MODEL` - Model for sessions created before per-session pinning (default: `claude-opus-4-8`)
 - `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
 
 ## Environment

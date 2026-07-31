@@ -10,6 +10,30 @@ import type { SettingsStore } from "../settings/settings-store.js";
 
 export type OnCompleteCallback = (channelId: string, status: CompletionStatus, originalMessage: any) => void;
 
+// Model a brand-new session starts on. A full model ID, not a bare "opus"
+// alias: aliases follow whatever the CLI currently points that tier at, so a
+// tier moving underneath us would silently change every channel at once.
+export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "claude-opus-5";
+
+// Model for sessions that predate per-session pinning (session_model IS NULL).
+// They were created and have been running under the previous Opus, so that's
+// what they resume on rather than being jumped forward mid-conversation.
+export const LEGACY_SESSION_MODEL = process.env.LEGACY_SESSION_MODEL || "claude-opus-4-8";
+
+// Bare tier aliases resolve to whatever the CLI currently points that tier at.
+// Channels configured with one before /model offered explicit versions would
+// otherwise pin a *floating* name at session creation, which defeats pinning —
+// so aliases are resolved to a concrete ID at the moment a session is created.
+const MODEL_ALIASES: Record<string, string> = {
+  opus: "claude-opus-5",
+  sonnet: "claude-sonnet-5",
+  haiku: "claude-haiku-4-5",
+};
+
+export function resolveModelAlias(model: string): string {
+  return MODEL_ALIASES[model] ?? model;
+}
+
 // Substrings that mark a Claude/Anthropic API-layer failure (as opposed to a
 // normal task failure). Matched case-insensitively. Kept deliberately specific
 // so a model merely *discussing* API errors doesn't trigger the auto-retry.
@@ -76,6 +100,9 @@ export class ClaudeManager {
   private channelToolCalls = new Map<string, Map<string, { message: any, toolId: string }>>();
   private channelNames = new Map<string, string>();
   private channelModels = new Map<string, string>();
+  // Model the in-flight run was launched with, so a newly reported session_id
+  // is pinned to it (see getModelForRun / DatabaseManager.setSession).
+  private channelRunModel = new Map<string, string>();
   private channelProcesses = new Map<
     string,
     {
@@ -596,7 +623,10 @@ export class ClaudeManager {
     // Carry the accumulated cost into the paused record so it isn't lost when
     // clearSession deletes the channel_sessions row.
     const cost = this.db.getChannelCostInfo(channelId)?.totalCostUsd ?? 0;
-    this.db.pauseSession(channelId, name, sessionId, cost);
+    // The pinned model lives on the channel_sessions row clearSession is about to
+    // delete — carry it into the paused record so /resume restores it.
+    const model = this.db.getSessionModel(channelId);
+    this.db.pauseSession(channelId, name, sessionId, cost, true, model);
     this.clearSession(channelId);
     return true;
   }
@@ -604,7 +634,7 @@ export class ClaudeManager {
   resumeSession(channelId: string, name: string, channelName: string): boolean {
     const paused = this.db.getPausedSession(channelId, name);
     if (!paused || !paused.isResumable) return false;
-    this.db.setSession(channelId, paused.sessionId, channelName);
+    this.db.setSession(channelId, paused.sessionId, channelName, paused.sessionModel);
     // Restore the cost that accrued before pausing so the running total continues.
     if (paused.totalCostUsd > 0) {
       this.db.addSessionCost(channelId, paused.totalCostUsd);
@@ -675,10 +705,40 @@ export class ClaudeManager {
   setModel(channelId: string, model: string): void {
     this.channelModels.set(channelId, model);
     this.settings?.setModel(channelId, model);
+    // An explicit /model is a deliberate choice about the conversation in front
+    // of the user, so it repins the session in flight too — not just the default
+    // for the next one.
+    if (this.db.getSession(channelId)) {
+      this.db.setSessionModel(channelId, resolveModelAlias(model));
+    }
   }
 
+  /** The channel's default model for *new* sessions. */
   getModel(channelId: string): string {
-    return this.channelModels.get(channelId) || "opus";
+    return this.channelModels.get(channelId) || DEFAULT_MODEL;
+  }
+
+  /**
+   * The model a run should actually launch with.
+   *
+   * Models are pinned per session, not per channel: a session keeps the model it
+   * was created with for its whole life, so moving the channel default never
+   * switches a conversation mid-flight. Precedence:
+   *
+   *   1. the session's pinned model (set at creation, or by an explicit /model)
+   *   2. LEGACY_SESSION_MODEL, for sessions created before pinning existed —
+   *      they predate the current default and should resume on what they ran on
+   *   3. the channel default (/model, else DEFAULT_MODEL) for a brand-new session
+   *
+   * Note the CLI's bare aliases ("opus", "sonnet") float to whatever that tier
+   * currently points at, which is exactly what pinning is here to prevent — so
+   * the defaults are full model IDs.
+   */
+  getModelForRun(channelId: string): string {
+    const pinned = this.db.getSessionModel(channelId);
+    if (pinned) return pinned;
+    if (this.db.getSession(channelId)) return LEGACY_SESSION_MODEL;
+    return resolveModelAlias(this.getModel(channelId));
   }
 
   setPlanMode(channelId: string, enabled: boolean): void {
@@ -743,7 +803,10 @@ export class ClaudeManager {
       throw new Error(`Working directory does not exist: ${workingDir}`);
     }
 
-    const model = this.getModel(channelId);
+    const model = this.getModelForRun(channelId);
+    // Remember it so the session_id this run reports back gets pinned to the
+    // model it actually ran on.
+    this.channelRunModel.set(channelId, model);
     const planMode = this.isPlanMode(channelId);
 
     // Use streaming-input mode for normal text prompts so stdin stays open and
@@ -921,7 +984,7 @@ export class ClaudeManager {
                 }).catch(console.error);
               }
               const channelName = this.channelNames.get(channelId) || "default";
-              this.db.setSession(channelId, parsed.session_id, channelName);
+              this.db.setSession(channelId, parsed.session_id, channelName, this.channelRunModel.get(channelId));
             }
           } catch (error) {
             console.error("Error parsing JSON:", error, "Line:", line);
@@ -1295,7 +1358,7 @@ export class ClaudeManager {
       }
 
       const channelName = this.channelNames.get(channelId) || "default";
-      this.db.setSession(channelId, parsed.session_id, channelName);
+      this.db.setSession(channelId, parsed.session_id, channelName, this.channelRunModel.get(channelId));
       this.channelToolCalls.set(channelId, toolCalls);
 
       // Check context window usage and warn if getting full
@@ -1425,7 +1488,7 @@ export class ClaudeManager {
   ): Promise<void> {
     console.log("Result message:", parsed);
     const channelName = this.channelNames.get(channelId) || "default";
-    this.db.setSession(channelId, parsed.session_id, channelName);
+    this.db.setSession(channelId, parsed.session_id, channelName, this.channelRunModel.get(channelId));
 
     // Persist summary for /status dashboard
     const summary = parsed.subtype === "success" && "result" in parsed ? parsed.result : `Failed: ${parsed.subtype}`;

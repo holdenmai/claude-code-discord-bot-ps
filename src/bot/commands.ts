@@ -32,16 +32,20 @@ export class CommandHandler {
         .setDescription("Gracefully stop Claude's current turn (like pressing Esc), keeping the session"),
       new SlashCommandBuilder()
         .setName("model")
-        .setDescription("Set the Claude model for this channel")
+        .setDescription("Set the model for this channel (and repin the current session)")
         .addStringOption((option: any) =>
           option
             .setName("name")
             .setDescription("Model to use")
             .setRequired(true)
+            // Explicit versions, not the bare "opus"/"sonnet" aliases: an alias
+            // follows whatever the CLI currently points that tier at, so picking
+            // one moves the channel silently whenever a new model ships.
             .addChoices(
-              { name: "Sonnet", value: "sonnet" },
-              { name: "Opus (default)", value: "opus" },
-              { name: "Haiku", value: "haiku" },
+              { name: "Opus 5 (default)", value: "claude-opus-5" },
+              { name: "Opus 4.8", value: "claude-opus-4-8" },
+              { name: "Sonnet 5", value: "claude-sonnet-5" },
+              { name: "Haiku 4.5", value: "claude-haiku-4-5" },
             )
         ),
       new SlashCommandBuilder()

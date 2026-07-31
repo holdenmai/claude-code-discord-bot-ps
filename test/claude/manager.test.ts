@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { ClaudeManager, apiRetryDelayMs, isApiErrorText } from '../../src/claude/manager.js';
+import {
+  ClaudeManager,
+  apiRetryDelayMs,
+  isApiErrorText,
+  resolveModelAlias,
+  DEFAULT_MODEL,
+  LEGACY_SESSION_MODEL,
+} from '../../src/claude/manager.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -18,6 +25,19 @@ describe('API-error auto-resume helpers', () => {
       expect(apiRetryDelayMs(12)).toBe(600_000); // 60 + (12-3)*60 = 600s
       expect(apiRetryDelayMs(13)).toBe(600_000);
       expect(apiRetryDelayMs(100)).toBe(600_000);
+    });
+  });
+
+  describe('resolveModelAlias', () => {
+    it('pins bare tier aliases to a concrete version', () => {
+      expect(resolveModelAlias('opus')).toBe('claude-opus-5');
+      expect(resolveModelAlias('sonnet')).toBe('claude-sonnet-5');
+      expect(resolveModelAlias('haiku')).toBe('claude-haiku-4-5');
+    });
+
+    it('leaves explicit model IDs alone', () => {
+      expect(resolveModelAlias('claude-opus-4-8')).toBe('claude-opus-4-8');
+      expect(resolveModelAlias('claude-opus-5')).toBe('claude-opus-5');
     });
   });
 
@@ -64,6 +84,8 @@ describe('ClaudeManager', () => {
     mockDb = {
       getSession: vi.fn(),
       setSession: vi.fn(),
+      getSessionModel: vi.fn(),
+      setSessionModel: vi.fn(),
       clearSession: vi.fn(),
       getAllSessions: vi.fn().mockReturnValue([]),
       cleanupOldSessions: vi.fn(),
@@ -90,6 +112,49 @@ describe('ClaudeManager', () => {
   afterEach(() => {
     manager.destroy();
     vi.restoreAllMocks();
+  });
+
+  describe('getModelForRun', () => {
+    it('starts a brand-new session on the current default', () => {
+      mockDb.getSessionModel.mockReturnValue(undefined);
+      mockDb.getSession.mockReturnValue(undefined);
+      expect(manager.getModelForRun('channel-1')).toBe(DEFAULT_MODEL);
+    });
+
+    it('resumes a session created before pinning on the legacy model', () => {
+      // session_model IS NULL but a session exists: it predates pinning, so it
+      // keeps running on what it was created under rather than jumping forward.
+      mockDb.getSessionModel.mockReturnValue(undefined);
+      mockDb.getSession.mockReturnValue('sess-old');
+      expect(manager.getModelForRun('channel-1')).toBe(LEGACY_SESSION_MODEL);
+    });
+
+    it('keeps a pinned session on its model even when the channel default moves', () => {
+      mockDb.getSessionModel.mockReturnValue('claude-opus-5');
+      mockDb.getSession.mockReturnValue('sess-new');
+      manager.setModel('channel-1', 'claude-sonnet-5');
+      expect(manager.getModelForRun('channel-1')).toBe('claude-opus-5');
+    });
+
+    it('resolves a stale bare alias before it can be pinned', () => {
+      mockDb.getSessionModel.mockReturnValue(undefined);
+      mockDb.getSession.mockReturnValue(undefined);
+      manager.setModel('channel-1', 'opus');
+      expect(manager.getModelForRun('channel-1')).toBe('claude-opus-5');
+    });
+
+    it('repins the live session when /model is used explicitly', () => {
+      mockDb.getSession.mockReturnValue('sess-live');
+      manager.setModel('channel-1', 'opus');
+      // The alias is resolved on the way in, so the pin can't float later.
+      expect(mockDb.setSessionModel).toHaveBeenCalledWith('channel-1', 'claude-opus-5');
+    });
+
+    it('does not repin when the channel has no session yet', () => {
+      mockDb.getSession.mockReturnValue(undefined);
+      manager.setModel('channel-1', 'claude-opus-4-8');
+      expect(mockDb.setSessionModel).not.toHaveBeenCalled();
+    });
   });
 
   describe('hasActiveProcess', () => {
