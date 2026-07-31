@@ -1,9 +1,16 @@
-import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits } from "discord.js";
+import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits, EmbedBuilder } from "discord.js";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { spawn, execSync } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
+import {
+  findTranscriptPath,
+  parseTranscript,
+  planImport,
+  renderTurn,
+  transcriptCwd,
+} from '../claude/transcript.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
 
@@ -167,6 +174,28 @@ export class CommandHandler {
             .setAutocomplete(true)
         ),
       new SlashCommandBuilder()
+        .setName("online")
+        .setDescription("Import offline CLI work from this session's transcript into the channel")
+        .addStringOption((option: any) =>
+          option
+            .setName("session")
+            .setDescription("Session id or paused-session name (default: this channel's session)")
+            .setRequired(false)
+            .setAutocomplete(true)
+        )
+        .addBooleanOption((option: any) =>
+          option
+            .setName("preview")
+            .setDescription("Show what would be imported without posting it")
+            .setRequired(false)
+        )
+        .addBooleanOption((option: any) =>
+          option
+            .setName("all")
+            .setDescription("Import the whole transcript, ignoring what's already in the channel")
+            .setRequired(false)
+        ),
+      new SlashCommandBuilder()
         .setName("costreview")
         .setDescription("Review session costs for this channel (and optionally its threads)")
         .addBooleanOption((option: any) =>
@@ -231,7 +260,7 @@ export class CommandHandler {
         await this.handleAddAutocomplete(interaction);
       } else if (interaction.commandName === "adopt") {
         await this.handleAdoptAutocomplete(interaction);
-      } else if (interaction.commandName === "resume") {
+      } else if (interaction.commandName === "resume" || interaction.commandName === "online") {
         await this.handleResumeAutocomplete(interaction);
       }
       return;
@@ -365,6 +394,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "resume") {
       await this.handleResumeCommand(interaction);
+    }
+
+    if (interaction.commandName === "online") {
+      await this.handleOnlineCommand(interaction);
     }
 
     if (interaction.commandName === "interrupt" || interaction.commandName === "btw") {
@@ -1380,6 +1413,168 @@ WshShell.Run "cmd /k bun run start", 1, False
     } catch {
       await interaction.respond([]);
     }
+  }
+
+  /**
+   * Handle /online — replay a session's CLI transcript into the channel so work
+   * done outside Discord (bot down, or just working at the terminal) becomes
+   * part of the channel's history.
+   *
+   * Read-only by design: it never talks to the CLI, never answers a question the
+   * transcript recorded, and never touches the live session. It only posts.
+   */
+  private async handleOnlineCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const input = (interaction.options.getString("session") || "").trim();
+    const preview = interaction.options.getBoolean("preview") === true;
+    const all = interaction.options.getBoolean("all") === true;
+
+    // A live run posts to this same channel; interleaving replayed history with
+    // it would produce a transcript that never happened in that order.
+    if (this.claudeManager.hasActiveProcess(channelId)) {
+      await interaction.reply({
+        content: "A Claude process is running in this channel. Wait for it to finish (or `/stop`) before importing history.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    let sessionId: string | undefined;
+    if (input) {
+      const paused = this.claudeManager.getPausedSessions(channelId).find((s) => s.name === input);
+      sessionId = paused?.sessionId ?? (isSessionGuid(input) ? input : undefined);
+      if (!sessionId) {
+        await interaction.reply({
+          content: `No paused session named **${input}** in this channel, and that's not a valid session id.`,
+          ephemeral: true,
+        });
+        return;
+      }
+    } else {
+      sessionId = this.claudeManager.getSessionId(channelId);
+      if (!sessionId) {
+        await interaction.reply({
+          content: "No session in this channel. Pass a session id or paused-session name.",
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    const transcriptPath = findTranscriptPath(sessionId);
+    if (!transcriptPath) {
+      await interaction.reply({
+        content: `No transcript found for session \`${sessionId}\` under \`~/.claude/projects\`.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    let events;
+    let cwd: string | undefined;
+    try {
+      const raw = fs.readFileSync(transcriptPath, "utf-8");
+      events = parseTranscript(raw);
+      cwd = transcriptCwd(raw);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Failed to read transcript: ${msg}`);
+      return;
+    }
+
+    // What's already in the channel, so we only post what's missing.
+    const discordTexts: string[] = [];
+    if (!all) {
+      try {
+        const recent = await interaction.channel.messages.fetch({ limit: 100 });
+        for (const msg of recent.values()) {
+          if (msg.content) discordTexts.push(msg.content);
+          for (const embed of msg.embeds) {
+            if (embed.description) discordTexts.push(embed.description);
+          }
+        }
+      } catch (error) {
+        console.error("Error fetching channel history for /online:", error);
+      }
+    }
+
+    const watermark = this.claudeManager.getImportWatermark(channelId);
+    const plan = planImport(events, {
+      discordTexts,
+      watermarkUuid: watermark?.sessionId === sessionId ? watermark.lastUuid : undefined,
+      all,
+    });
+
+    const anchorLabel: Record<string, string> = {
+      watermark: "resuming after the last import",
+      content: "anchored to the newest message already in this channel",
+      fallback: "no matching message found — falling back to the last 10 turns",
+      all: "importing the entire transcript",
+    };
+    const header =
+      `Session \`${sessionId.slice(0, 8)}…\`${cwd ? ` → \`${cwd}\`` : ""}\n` +
+      `${plan.turns.length} turn(s), ${plan.messages.length} message(s) — ${anchorLabel[plan.anchor]}.` +
+      (plan.droppedTurns > 0 ? `\nSkipped the oldest ${plan.droppedTurns} turn(s) to keep the import manageable.` : "");
+
+    if (plan.messages.length === 0) {
+      await interaction.editReply(`Nothing new to import.\n${header}`);
+      return;
+    }
+
+    if (preview) {
+      const outline = plan.turns
+        .map((t, i) => `${i + 1}. ${(t.prompt || t.texts[0] || "(tool work)").replace(/\s+/g, " ").slice(0, 90)}`)
+        .join("\n")
+        .slice(0, 1500);
+      await interaction.editReply(`**Preview — nothing posted.**\n${header}\n\n${outline}`);
+      return;
+    }
+
+    const channel = interaction.channel;
+    const started = plan.turns[0]?.startedAt;
+    await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("📥 Offline work imported")
+          .setDescription(
+            `Replaying ${plan.turns.length} turn(s) from the CLI session \`${sessionId.slice(0, 8)}…\`` +
+            `${started ? `, starting ${new Date(started).toLocaleString()}` : ""}.\n` +
+            `Condensed view — tool calls are summarized, not replayed.`
+          )
+          .setColor(0x95A5A6),
+      ],
+    });
+
+    // Post turn by turn and advance the watermark as we go, so a failure partway
+    // through (rate limit, permissions) doesn't re-post everything next time.
+    let posted = 0;
+    let lastUuid: string | undefined;
+    try {
+      for (const turn of plan.turns) {
+        for (const message of renderTurn(turn)) {
+          const embed = new EmbedBuilder().setDescription(message.description).setColor(message.color);
+          if (message.title) embed.setTitle(message.title);
+          await channel.send({ embeds: [embed] });
+          posted++;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        lastUuid = turn.lastUuid;
+      }
+    } catch (error) {
+      console.error("Error posting imported transcript:", error);
+      if (lastUuid) this.claudeManager.setImportWatermark(channelId, sessionId, lastUuid);
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Posted ${posted} message(s), then failed: ${msg}\nRun \`/online\` again to continue.`);
+      return;
+    }
+
+    if (lastUuid) this.claudeManager.setImportWatermark(channelId, sessionId, lastUuid);
+    await channel.send({
+      embeds: [new EmbedBuilder().setDescription("— end of imported history —").setColor(0x95A5A6)],
+    });
+    await interaction.editReply(`Imported ${posted} message(s).\n${header}`);
   }
 
   /**

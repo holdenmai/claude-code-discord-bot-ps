@@ -812,6 +812,14 @@ export class ClaudeManager {
     return this.db.getAllSessions();
   }
 
+  // --- Transcript import passthrough (/online) ---
+  getImportWatermark(channelId: string) {
+    return this.db.getImportWatermark(channelId);
+  }
+  setImportWatermark(channelId: string, sessionId: string, lastUuid: string): void {
+    this.db.setImportWatermark(channelId, sessionId, lastUuid);
+  }
+
   // --- Todo passthrough ---
   addTodo(channelId: string, text: string, parentChannelId?: string) {
     return this.db.addTodo(channelId, text, parentChannelId);

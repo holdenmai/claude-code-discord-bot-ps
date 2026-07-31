@@ -17,6 +17,7 @@ This is a TypeScript project with strict type checking enabled.
 - `src/bot/client.ts` - Discord bot client, event handlers, message routing
 - `src/bot/commands.ts` - Slash command definitions and handlers
 - `src/claude/manager.ts` - Claude Code process lifecycle and streaming
+- `src/claude/transcript.ts` - Reads CLI session `.jsonl` transcripts for `/online` (pure, no Discord)
 - `src/mcp/server.ts` - MCP permission server for tool approvals
 - `src/mcp/permission-manager.ts` - Interactive approval/denial via Discord
 - `src/queue/message-queue.ts` - Per-channel message queue (one Claude process at a time)
@@ -51,6 +52,32 @@ explicit choice about the conversation on screen. Bare tier aliases (`opus`) are
 resolved to concrete IDs before being pinned — an alias follows whatever the CLI
 currently points that tier at, which is the drift pinning exists to prevent.
 
+### Importing offline work
+
+Work done in the Claude CLI (bot down, or just working at the terminal) leaves no
+trace in Discord. `/online` replays a session's transcript
+(`~/.claude/projects/<mangled-cwd>/<session-id>.jsonl`) into the channel so the
+channel stays the record of the conversation. It is strictly read-only: it never
+launches the CLI, never answers a question the transcript recorded, and never
+touches the live session.
+
+Where the replay starts, in order:
+
+1. the saved watermark (`transcript_imports.last_uuid`) if it's for the same session
+2. the newest transcript text that already appears in the channel's last 100 messages
+3. failing both, the last 10 turns
+
+Anchoring is by *content*, not timestamp — the bot posts plenty of non-transcript
+messages (startup links, error embeds), and one arriving after the last real reply
+would push a timestamp anchor past the very work being imported.
+
+The replay is condensed: prompts and Claude's prose get their own embeds, and each
+turn's tool calls collapse to one summary line. Replaying every tool call after the
+fact buries the channel — a three-day session is hundreds of embeds.
+
+Options: `session` (id or paused-session name, default the channel's session),
+`preview` (report without posting), `all` (whole transcript, ignoring the anchor).
+
 ### Commands
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)
@@ -65,6 +92,7 @@ currently points that tier at, which is the drift pinning exists to prevent.
 - `/sync` - Merge main into all active worktrees for this project
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread
 - `/adopt` - Adopt an external Claude CLI session into a new channel (with autocomplete)
+- `/online` - Import offline CLI work from a session's `.jsonl` transcript into the channel
 - `/status` - Show summary of recent activity across all project channels
 - `/todo` - Per-channel todo notes (add/list/done/clear)
 - `/init` - Set this channel's category as the home for startup links

@@ -131,6 +131,17 @@ export class DatabaseManager {
       ON prompt_costs(channel_id, created_at DESC)
     `);
 
+    // How far a channel has replayed its session transcript (/online). Keyed by
+    // channel so switching sessions and coming back re-anchors by content.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS transcript_imports (
+        channel_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        last_uuid TEXT NOT NULL,
+        imported_at INTEGER NOT NULL
+      )
+    `);
+
     // Per-channel todos
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS todos (
@@ -372,6 +383,26 @@ export class DatabaseManager {
     this.db.query(
       "UPDATE prompt_costs SET result_message_id = ? WHERE prompt_message_id = ?"
     ).run(resultMessageId, promptMessageId);
+  }
+
+  // --- Transcript import watermarks (/online) ---
+
+  /**
+   * The last transcript entry this channel imported, if any. Returned with its
+   * session id so a caller can ignore a watermark left by a different session.
+   */
+  getImportWatermark(channelId: string): { sessionId: string; lastUuid: string } | undefined {
+    const r = this.db.query(
+      "SELECT session_id, last_uuid FROM transcript_imports WHERE channel_id = ?"
+    ).get(channelId) as { session_id: string; last_uuid: string } | null;
+    return r ? { sessionId: r.session_id, lastUuid: r.last_uuid } : undefined;
+  }
+
+  setImportWatermark(channelId: string, sessionId: string, lastUuid: string): void {
+    this.db.query(`
+      INSERT OR REPLACE INTO transcript_imports (channel_id, session_id, last_uuid, imported_at)
+      VALUES (?, ?, ?, ?)
+    `).run(channelId, sessionId, lastUuid, Date.now());
   }
 
   // Active run tracking — for crash recovery

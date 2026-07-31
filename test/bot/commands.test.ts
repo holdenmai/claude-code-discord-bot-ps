@@ -34,7 +34,7 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(22);
+      expect(commands).toHaveLength(23);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('stop');
@@ -53,10 +53,11 @@ describe('CommandHandler', () => {
       expect(commands[15]!.name).toBe('todo');
       expect(commands[16]!.name).toBe('pause');
       expect(commands[17]!.name).toBe('resume');
-      expect(commands[18]!.name).toBe('costreview');
-      expect(commands[19]!.name).toBe('interrupt');
-      expect(commands[20]!.name).toBe('btw');
-      expect(commands[21]!.name).toBe('file');
+      expect(commands[18]!.name).toBe('online');
+      expect(commands[19]!.name).toBe('costreview');
+      expect(commands[20]!.name).toBe('interrupt');
+      expect(commands[21]!.name).toBe('btw');
+      expect(commands[22]!.name).toBe('file');
     });
   });
 
