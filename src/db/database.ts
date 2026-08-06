@@ -337,6 +337,25 @@ export class DatabaseManager {
     return { sessionId: r.session_id, totalCostUsd: r.total_cost_usd ?? 0 };
   }
 
+  /**
+   * Rename a paused session in place. Used by /autopause, which parks the
+   * session under its id immediately and renames it once Claude answers.
+   *
+   * Returns false without touching anything if the row is gone (the user
+   * resumed it in the meantime) or the new name is already taken — an UPDATE
+   * onto an existing (channel_id, name) would trade one paused session for
+   * another.
+   */
+  renamePausedSession(channelId: string, oldName: string, newName: string): boolean {
+    if (oldName === newName) return true;
+    if (!this.getPausedSession(channelId, oldName)) return false;
+    if (this.getPausedSession(channelId, newName)) return false;
+    const stmt = this.db.query(
+      "UPDATE paused_sessions SET name = ? WHERE channel_id = ? AND name = ?"
+    );
+    return stmt.run(newName, channelId, oldName).changes > 0;
+  }
+
   deletePausedSession(channelId: string, name: string): boolean {
     const stmt = this.db.query("DELETE FROM paused_sessions WHERE channel_id = ? AND name = ?");
     return stmt.run(channelId, name).changes > 0;

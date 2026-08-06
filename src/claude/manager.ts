@@ -764,6 +764,39 @@ export class ClaudeManager {
     return true;
   }
 
+  /**
+   * Pause the current session under its own id and hand back everything the
+   * naming run needs. Order matters: pauseSession -> clearSession drops the
+   * channel_sessions row *and* the working-dir override (worktrees), so the
+   * model and cwd are captured before the pause, not after.
+   */
+  autoPauseSession(
+    channelId: string,
+    channelName: string
+  ): { sessionId: string; model: string; workingDir?: string } | undefined {
+    const sessionId = this.db.getSession(channelId);
+    if (!sessionId) return undefined;
+    const model = this.getModelForRun(channelId);
+    // Prefer the directory runs in this channel actually used (override, else the
+    // name the last run was launched with) over the caller's guess.
+    const workingDir =
+      this.workingDirOverrides.get(channelId) ||
+      path.join(this.baseFolder, this.channelNames.get(channelId) || channelName);
+    if (!this.pauseSession(channelId, sessionId)) return undefined;
+    // The pause stands either way, but don't hand back a cwd we can't spawn
+    // into: an invalid cwd surfaces as ENOENT naming the *command*, not the
+    // directory. No cwd means "paused, but skip the naming run".
+    if (!fs.existsSync(workingDir)) {
+      console.error(`Auto-pause: working directory does not exist, skipping naming run: ${workingDir}`);
+      return { sessionId, model };
+    }
+    return { sessionId, model, workingDir };
+  }
+
+  renamePausedSession(channelId: string, oldName: string, newName: string): boolean {
+    return this.db.renamePausedSession(channelId, oldName, newName);
+  }
+
   resumeSession(channelId: string, name: string, channelName: string): boolean {
     const paused = this.db.getPausedSession(channelId, name);
     if (!paused || !paused.isResumable) return false;

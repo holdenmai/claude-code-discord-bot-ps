@@ -78,6 +78,31 @@ fact buries the channel — a three-day session is hundreds of embeds.
 Options: `session` (id or paused-session name, default the channel's session),
 `preview` (report without posting), `all` (whole transcript, ignoring the anchor).
 
+### Naming a session on the way out
+
+`/pause <name>` needs a name up front, which is exactly when you're least willing
+to think of one. `/autopause` asks Claude instead, and doesn't make you wait:
+
+1. the session is parked immediately under its own session id (same shape as
+   `/resume`'s auto-pause), so the channel is free for new work at once
+2. a one-shot CLI run resumes that session and asks it for a name
+3. the paused row is renamed in place when the answer arrives
+
+The naming run is deliberately outside the normal machinery — it never enters the
+per-channel message queue and is never the channel's active process, or the "start
+your next session immediately" part wouldn't hold. It uses `--fork-session`, so
+the naming turn lands in a throwaway session id and the paused session's own
+transcript is exactly what you left behind. It runs on the session's pinned model.
+
+Everything about it is best-effort: a bad answer, a timeout, or a session that got
+resumed before the name arrived all leave the session parked under its id, where
+`/resume <id>` still finds it. Names are lowercased to `[a-z0-9-]`, capped at 32
+characters (they're typed into `/resume` and packed into its autocomplete labels),
+rejected if they're GUID-shaped (a paused name shadows a session id in `/resume`),
+and suffixed `-2`, `-3`… on collision — `paused_sessions` is keyed on
+`(channel_id, name)` and written with `INSERT OR REPLACE`, so reusing a name would
+silently destroy the session already parked under it.
+
 ### Commands
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)
@@ -93,6 +118,7 @@ Options: `session` (id or paused-session name, default the channel's session),
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread
 - `/adopt` - Adopt an external Claude CLI session into a new channel (with autocomplete)
 - `/online` - Import offline CLI work from a session's `.jsonl` transcript into the channel
+- `/autopause` - Pause the current session and let Claude name it (name lands a bit later)
 - `/status` - Show summary of recent activity across all project channels
 - `/todo` - Per-channel todo notes (add/list/done/clear)
 - `/init` - Set this channel's category as the home for startup links
@@ -113,6 +139,7 @@ Optional (multi-instance):
 Optional (models, timeouts, logging):
 - `DEFAULT_MODEL` - Model new sessions start on (default: `claude-opus-5`)
 - `LEGACY_SESSION_MODEL` - Model for sessions created before per-session pinning (default: `claude-opus-4-8`)
+- `AUTOPAUSE_TIMEOUT_SECONDS` - How long `/autopause` waits for Claude to answer with a name before giving up and leaving the session under its id (default: 180)
 - `QUESTION_WATCHDOG_SECONDS` - Silence allowed after AskUserQuestion answers are delivered before the turn is treated as wedged and recovered (default: 120)
 - `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
 

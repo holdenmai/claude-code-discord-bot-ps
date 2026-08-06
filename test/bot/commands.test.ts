@@ -1,4 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+// The naming run spawns the CLI; stub it so /autopause tests stay hermetic.
+const mockRequestSessionName = vi.fn();
+vi.mock('../../src/claude/session-namer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/claude/session-namer.js')>();
+  return { ...actual, requestSessionName: (...args: any[]) => mockRequestSessionName(...args) };
+});
+
 import { CommandHandler, isSessionGuid } from '../../src/bot/commands.js';
 
 // Mock ClaudeManager
@@ -16,6 +24,10 @@ const mockClaudeManager = {
   pauseSession: vi.fn(),
   resumeSession: vi.fn().mockReturnValue(true),
   setSessionFromAdopt: vi.fn(),
+  // /autopause surface
+  autoPauseSession: vi.fn(),
+  getPausedSessions: vi.fn().mockReturnValue([]),
+  renamePausedSession: vi.fn().mockReturnValue(true),
 };
 
 const mockSettings = {
@@ -34,7 +46,7 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(23);
+      expect(commands).toHaveLength(24);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('stop');
@@ -52,12 +64,13 @@ describe('CommandHandler', () => {
       expect(commands[14]!.name).toBe('status');
       expect(commands[15]!.name).toBe('todo');
       expect(commands[16]!.name).toBe('pause');
-      expect(commands[17]!.name).toBe('resume');
-      expect(commands[18]!.name).toBe('online');
-      expect(commands[19]!.name).toBe('costreview');
-      expect(commands[20]!.name).toBe('interrupt');
-      expect(commands[21]!.name).toBe('btw');
-      expect(commands[22]!.name).toBe('file');
+      expect(commands[17]!.name).toBe('autopause');
+      expect(commands[18]!.name).toBe('resume');
+      expect(commands[19]!.name).toBe('online');
+      expect(commands[20]!.name).toBe('costreview');
+      expect(commands[21]!.name).toBe('interrupt');
+      expect(commands[22]!.name).toBe('btw');
+      expect(commands[23]!.name).toBe('file');
     });
   });
 
@@ -190,6 +203,144 @@ describe('CommandHandler', () => {
       expect(isSessionGuid('6387edd3')).toBe(false); // truncated
       expect(isSessionGuid('6387edd3-cb1a-40c4-8dd4-2b7948df354')).toBe(false); // last group too short
       expect(isSessionGuid('')).toBe(false);
+    });
+  });
+
+  describe('autopause command', () => {
+    const GUID = '6387edd3-cb1a-40c4-8dd4-2b7948df354f';
+    const paused = { sessionId: GUID, model: 'claude-opus-5', workingDir: '/repos/my-chan' };
+
+    function autopauseInteraction() {
+      return {
+        isChatInputCommand: () => true,
+        user: { id: allowedUserId },
+        channelId: 'channel-123',
+        commandName: 'autopause',
+        channel: { name: 'my-chan' },
+        options: { getString: () => null },
+        reply: vi.fn(),
+        followUp: vi.fn(),
+      };
+    }
+
+    /** Let the un-awaited naming continuation run to completion. */
+    const settle = () => new Promise((r) => setImmediate(r));
+
+    it('pauses under the session id and replies before the name exists', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue(paused);
+      mockRequestSessionName.mockReturnValue(new Promise(() => {})); // never resolves
+
+      const interaction = autopauseInteraction();
+      await commandHandler.handleInteraction(interaction);
+
+      expect(mockClaudeManager.autoPauseSession).toHaveBeenCalledWith('channel-123', 'my-chan');
+      expect(interaction.reply).toHaveBeenCalledWith(expect.stringContaining(GUID));
+      expect(interaction.followUp).not.toHaveBeenCalled();
+    });
+
+    it('renames the paused row once Claude answers', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue(paused);
+      mockClaudeManager.getPausedSessions.mockReturnValue([]);
+      mockClaudeManager.renamePausedSession.mockReturnValue(true);
+      mockRequestSessionName.mockResolvedValue('autopause-command');
+
+      const interaction = autopauseInteraction();
+      await commandHandler.handleInteraction(interaction);
+      await settle();
+
+      expect(mockClaudeManager.renamePausedSession).toHaveBeenCalledWith(
+        'channel-123',
+        GUID,
+        'autopause-command'
+      );
+      expect(interaction.followUp).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining('autopause-command') })
+      );
+    });
+
+    it('suffixes a name that collides with an existing paused session', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue(paused);
+      mockClaudeManager.getPausedSessions.mockReturnValue([{ name: 'autopause-command' }]);
+      mockClaudeManager.renamePausedSession.mockReturnValue(true);
+      mockRequestSessionName.mockResolvedValue('autopause-command');
+
+      await commandHandler.handleInteraction(autopauseInteraction());
+      await settle();
+
+      expect(mockClaudeManager.renamePausedSession).toHaveBeenCalledWith(
+        'channel-123',
+        GUID,
+        'autopause-command-2'
+      );
+    });
+
+    it('leaves the session under its id when no name comes back', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue(paused);
+      mockRequestSessionName.mockResolvedValue(undefined);
+
+      const interaction = autopauseInteraction();
+      await commandHandler.handleInteraction(interaction);
+      await settle();
+
+      expect(mockClaudeManager.renamePausedSession).not.toHaveBeenCalled();
+      expect(interaction.followUp).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining(GUID) })
+      );
+    });
+
+    it('resolves the parent channel in a thread, not the thread name', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue(paused);
+      mockRequestSessionName.mockReturnValue(new Promise(() => {}));
+
+      const interaction = autopauseInteraction();
+      interaction.channel = { name: 'fix-login-bug', isThread: () => true, parent: { name: 'my-chan' } } as any;
+      await commandHandler.handleInteraction(interaction);
+
+      expect(mockClaudeManager.autoPauseSession).toHaveBeenCalledWith('channel-123', 'my-chan');
+    });
+
+    it('still pauses but skips naming when the project folder is missing', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue({ sessionId: GUID, model: 'claude-opus-5' });
+
+      const interaction = autopauseInteraction();
+      await commandHandler.handleInteraction(interaction);
+      await settle();
+
+      expect(mockRequestSessionName).not.toHaveBeenCalled();
+      expect(interaction.reply).toHaveBeenCalledWith(expect.stringContaining(GUID));
+      expect(interaction.followUp).not.toHaveBeenCalled();
+    });
+
+    it('refuses while a process is running', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(true);
+
+      const interaction = autopauseInteraction();
+      await commandHandler.handleInteraction(interaction);
+
+      expect(mockClaudeManager.autoPauseSession).not.toHaveBeenCalled();
+      expect(mockRequestSessionName).not.toHaveBeenCalled();
+      expect(interaction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({ ephemeral: true })
+      );
+    });
+
+    it('reports when there is no session to pause', async () => {
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.autoPauseSession.mockReturnValue(undefined);
+
+      const interaction = autopauseInteraction();
+      await commandHandler.handleInteraction(interaction);
+
+      expect(mockRequestSessionName).not.toHaveBeenCalled();
+      expect(interaction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining('No active session') })
+      );
     });
   });
 

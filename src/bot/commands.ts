@@ -11,6 +11,7 @@ import {
   renderTurn,
   transcriptCwd,
 } from '../claude/transcript.js';
+import { requestSessionName, uniqueSessionName } from '../claude/session-namer.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
 
@@ -163,6 +164,9 @@ export class CommandHandler {
             .setDescription("Name for this paused session")
             .setRequired(true)
         ),
+      new SlashCommandBuilder()
+        .setName("autopause")
+        .setDescription("Pause the current session and let Claude name it (name arrives shortly after)"),
       new SlashCommandBuilder()
         .setName("resume")
         .setDescription("Resume a paused session by name, or any session by its id")
@@ -390,6 +394,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "pause") {
       await this.handlePauseCommand(interaction);
+    }
+
+    if (interaction.commandName === "autopause") {
+      await this.handleAutoPauseCommand(interaction);
     }
 
     if (interaction.commandName === "resume") {
@@ -1333,6 +1341,110 @@ WshShell.Run "cmd /k bun run start", 1, False
         ephemeral: true,
       });
     }
+  }
+
+  /**
+   * /autopause — park the session now, name it later.
+   *
+   * The pause is immediate and unconditional (under the session id, exactly like
+   * /resume's auto-pause), so the channel is free for a new session the moment
+   * the command returns. Asking Claude for a name is fire-and-forget: it runs
+   * off the queue, and the paused row is renamed whenever the answer lands.
+   * Every failure path is survivable — the session stays parked under its id and
+   * `/resume <id>` still works.
+   */
+  private async handleAutoPauseCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    // In a thread the *parent* is the repo — the thread name is the worktree.
+    // Using the thread's own name here points the naming run at a folder that
+    // doesn't exist, which Node reports as a baffling ENOENT on "claude".
+    const channel = interaction.channel;
+    const channelName = channel?.isThread?.()
+      ? channel.parent?.name || "default"
+      : channel?.name || "default";
+
+    if (this.claudeManager.hasActiveProcess(channelId)) {
+      await interaction.reply({
+        content: "Cannot pause while a process is running. Use `/kill` or `/stop` first.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const paused = this.claudeManager.autoPauseSession(channelId, channelName);
+    if (!paused) {
+      await interaction.reply({
+        content: "No active session to pause in this channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!paused.workingDir) {
+      // Paused fine, but there's nowhere to run the naming turn from.
+      await interaction.reply(
+        `Session paused as \`${paused.sessionId}\`, but this channel's project folder is missing, so it can't be named. \`/resume ${paused.sessionId}\` to pick it back up.`
+      );
+      return;
+    }
+
+    await interaction.reply(
+      `Session paused as \`${paused.sessionId}\`. Next message starts a new session — asking Claude for a shorter name…`
+    );
+
+    // Deliberately not awaited: the user is free to start working immediately.
+    void this.namePausedSession(interaction, channelId, { ...paused, workingDir: paused.workingDir });
+  }
+
+  private async namePausedSession(
+    interaction: any,
+    channelId: string,
+    paused: { sessionId: string; model: string; workingDir: string }
+  ): Promise<void> {
+    let name: string | undefined;
+    try {
+      name = await requestSessionName({
+        sessionId: paused.sessionId,
+        workingDir: paused.workingDir,
+        model: paused.model,
+      });
+    } catch (error) {
+      console.error("Session naming failed:", error);
+    }
+
+    const notify = async (content: string) => {
+      try {
+        await interaction.followUp({ content, ephemeral: false });
+      } catch (error) {
+        console.error("Failed to post autopause result:", error);
+      }
+    };
+
+    if (!name) {
+      await notify(
+        `Couldn't get a name for \`${paused.sessionId}\` — it stays paused under its id. \`/resume ${paused.sessionId}\` to pick it back up.`
+      );
+      return;
+    }
+
+    // The channel moved on while we were asking: dedupe against whatever is
+    // parked here *now*, not against what was there when the pause happened.
+    const taken = this.claudeManager
+      .getPausedSessions(channelId)
+      .map((s: any) => s.name)
+      .filter((n: string) => n !== paused.sessionId);
+    const finalName = uniqueSessionName(name, taken);
+
+    if (!this.claudeManager.renamePausedSession(channelId, paused.sessionId, finalName)) {
+      // The row is gone — the session was resumed (or cleared) before the name
+      // arrived, so there is nothing left to rename.
+      await notify(
+        `Claude named \`${paused.sessionId}\` **${finalName}**, but that session is no longer paused — leaving it alone.`
+      );
+      return;
+    }
+
+    await notify(`Paused session renamed to **${finalName}** — \`/resume ${finalName}\` to pick it back up.`);
   }
 
   private async handleResumeCommand(interaction: any): Promise<void> {
