@@ -16,6 +16,21 @@ export interface PausedSession {
   name: string;
   sessionId: string;
   pausedAt: number;
+  totalCostUsd: number;
+  isResumable: boolean;
+  /** Model this session was pinned to; undefined for pre-pinning rows. */
+  sessionModel?: string;
+}
+
+export interface PromptCost {
+  promptMessageId: string;
+  channelId: string;
+  sessionId?: string;
+  resultMessageId?: string;
+  promptText?: string;
+  costUsd: number;
+  numTurns?: number;
+  createdAt: number;
 }
 
 export interface Todo {
@@ -51,6 +66,10 @@ export class DatabaseManager {
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_summary TEXT"); } catch {}
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_cost_usd REAL"); } catch {}
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN last_num_turns INTEGER"); } catch {}
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN total_cost_usd REAL DEFAULT 0"); } catch {}
+    // Model pinned to this session at creation. NULL on rows written before
+    // pinning existed — those resume on LEGACY_SESSION_MODEL (see ClaudeManager).
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN session_model TEXT"); } catch {}
 
     // Track actively running processes — rows left after crash = interrupted runs
     this.db.exec(`
@@ -86,6 +105,42 @@ export class DatabaseManager {
         PRIMARY KEY (channel_id, name)
       )
     `);
+    // Carry the session's accumulated cost over when it's paused (idempotent migration)
+    try { this.db.exec("ALTER TABLE paused_sessions ADD COLUMN total_cost_usd REAL DEFAULT 0"); } catch {}
+    // is_resumable=0 marks a cleared session kept only for cost accounting (hidden from /resume)
+    try { this.db.exec("ALTER TABLE paused_sessions ADD COLUMN is_resumable INTEGER DEFAULT 1"); } catch {}
+    // Carry the session's pinned model across a pause so /resume doesn't hand it
+    // back on a different model than it was running on (idempotent migration)
+    try { this.db.exec("ALTER TABLE paused_sessions ADD COLUMN session_model TEXT"); } catch {}
+
+    // Per-prompt cost tracking for later analysis (one row per prompt message)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS prompt_costs (
+        prompt_message_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        session_id TEXT,
+        result_message_id TEXT,
+        prompt_text TEXT,
+        cost_usd REAL NOT NULL,
+        num_turns INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_prompt_costs_channel
+      ON prompt_costs(channel_id, created_at DESC)
+    `);
+
+    // How far a channel has replayed its session transcript (/online). Keyed by
+    // channel so switching sessions and coming back re-anchors by content.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS transcript_imports (
+        channel_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        last_uuid TEXT NOT NULL,
+        imported_at INTEGER NOT NULL
+      )
+    `);
 
     // Per-channel todos
     this.db.exec(`
@@ -106,12 +161,48 @@ export class DatabaseManager {
     return result?.session_id;
   }
 
-  setSession(channelId: string, sessionId: string, channelName: string): void {
+  /**
+   * The model pinned to this channel's current session, or undefined for a
+   * session created before pinning existed (or no session at all).
+   */
+  getSessionModel(channelId: string): string | undefined {
+    const stmt = this.db.query("SELECT session_model FROM channel_sessions WHERE channel_id = ?");
+    const result = stmt.get(channelId) as { session_model: string | null } | null;
+    return result?.session_model ?? undefined;
+  }
+
+  setSession(channelId: string, sessionId: string, channelName: string, model?: string): void {
+    // Upsert (not INSERT OR REPLACE): on conflict, REPLACE would delete the row
+    // and reset unlisted columns (total_cost_usd, last_summary, …) to defaults.
+    // ON CONFLICT DO UPDATE touches only these columns and preserves the rest.
+    //
+    // session_model is pinned for the life of a session: a *new* session_id
+    // stamps the model the run was launched with, while repeat writes for the
+    // same session keep the existing pin. That's what makes a resumed session
+    // stay on the model it was created with even after the channel default moves.
     const stmt = this.db.query(`
-      INSERT OR REPLACE INTO channel_sessions (channel_id, session_id, channel_name, last_used)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO channel_sessions (channel_id, session_id, channel_name, last_used, session_model)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        session_id = excluded.session_id,
+        channel_name = excluded.channel_name,
+        last_used = excluded.last_used,
+        session_model = CASE
+          WHEN channel_sessions.session_id = excluded.session_id
+            THEN COALESCE(channel_sessions.session_model, excluded.session_model)
+          ELSE excluded.session_model
+        END
     `);
-    stmt.run(channelId, sessionId, channelName, Date.now());
+    stmt.run(channelId, sessionId, channelName, Date.now(), model ?? null);
+  }
+
+  /**
+   * Force the pinned model for the channel's current session (used by /model,
+   * where an explicit choice should take effect on the session in flight).
+   */
+  setSessionModel(channelId: string, model: string): void {
+    const stmt = this.db.query("UPDATE channel_sessions SET session_model = ? WHERE channel_id = ?");
+    stmt.run(model, channelId);
   }
 
   clearSession(channelId: string): void {
@@ -138,6 +229,21 @@ export class DatabaseManager {
       WHERE channel_id = ?
     `);
     stmt.run(summary, costUsd, numTurns, Date.now(), channelId);
+  }
+
+  /**
+   * Add a request's cost to the channel's running session total and return the
+   * new total. Resets naturally when the session row is cleared (/clear, /pause).
+   */
+  addSessionCost(channelId: string, costUsd: number): number {
+    this.db.query(`
+      UPDATE channel_sessions SET total_cost_usd = COALESCE(total_cost_usd, 0) + ?
+      WHERE channel_id = ?
+    `).run(costUsd, channelId);
+    const row = this.db.query(
+      "SELECT total_cost_usd FROM channel_sessions WHERE channel_id = ?"
+    ).get(channelId) as { total_cost_usd: number } | null;
+    return row?.total_cost_usd ?? costUsd;
   }
 
   // --- Prompt history ---
@@ -181,24 +287,37 @@ export class DatabaseManager {
 
   // --- Paused sessions ---
 
-  pauseSession(channelId: string, name: string, sessionId: string): void {
+  pauseSession(channelId: string, name: string, sessionId: string, totalCostUsd: number = 0, isResumable: boolean = true, sessionModel?: string): void {
     const stmt = this.db.query(`
-      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at)
-      VALUES (?, ?, ?, ?)
+      INSERT OR REPLACE INTO paused_sessions (channel_id, name, session_id, paused_at, total_cost_usd, is_resumable, session_model)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-    stmt.run(channelId, name, sessionId, Date.now());
+    stmt.run(channelId, name, sessionId, Date.now(), totalCostUsd, isResumable ? 1 : 0, sessionModel ?? null);
   }
 
-  getPausedSessions(channelId: string): PausedSession[] {
-    const stmt = this.db.query(
-      "SELECT * FROM paused_sessions WHERE channel_id = ? ORDER BY paused_at DESC"
-    );
-    return (stmt.all(channelId) as any[]).map(r => ({
+  private mapPausedRow(r: any): PausedSession {
+    return {
       channelId: r.channel_id,
       name: r.name,
       sessionId: r.session_id,
       pausedAt: r.paused_at,
-    }));
+      totalCostUsd: r.total_cost_usd ?? 0,
+      isResumable: (r.is_resumable ?? 1) === 1,
+      sessionModel: r.session_model ?? undefined,
+    };
+  }
+
+  /** All paused-session rows for a channel, including cleared (non-resumable) ones. */
+  getPausedSessions(channelId: string): PausedSession[] {
+    const stmt = this.db.query(
+      "SELECT * FROM paused_sessions WHERE channel_id = ? ORDER BY paused_at DESC"
+    );
+    return (stmt.all(channelId) as any[]).map(r => this.mapPausedRow(r));
+  }
+
+  /** Only resumable paused sessions (excludes cleared cost-archive rows). */
+  getResumableSessions(channelId: string): PausedSession[] {
+    return this.getPausedSessions(channelId).filter(s => s.isResumable);
   }
 
   getPausedSession(channelId: string, name: string): PausedSession | undefined {
@@ -206,18 +325,103 @@ export class DatabaseManager {
       "SELECT * FROM paused_sessions WHERE channel_id = ? AND name = ?"
     );
     const r = stmt.get(channelId, name) as any | null;
+    return r ? this.mapPausedRow(r) : undefined;
+  }
+
+  /** The current (active) session's accumulated cost for a channel, or 0/none. */
+  getChannelCostInfo(channelId: string): { sessionId: string; totalCostUsd: number } | undefined {
+    const r = this.db.query(
+      "SELECT session_id, total_cost_usd FROM channel_sessions WHERE channel_id = ?"
+    ).get(channelId) as { session_id: string; total_cost_usd: number } | null;
     if (!r) return undefined;
-    return {
-      channelId: r.channel_id,
-      name: r.name,
-      sessionId: r.session_id,
-      pausedAt: r.paused_at,
-    };
+    return { sessionId: r.session_id, totalCostUsd: r.total_cost_usd ?? 0 };
+  }
+
+  /**
+   * Rename a paused session in place. Used by /autopause, which parks the
+   * session under its id immediately and renames it once Claude answers.
+   *
+   * Returns false without touching anything if the row is gone (the user
+   * resumed it in the meantime) or the new name is already taken — an UPDATE
+   * onto an existing (channel_id, name) would trade one paused session for
+   * another.
+   */
+  renamePausedSession(channelId: string, oldName: string, newName: string): boolean {
+    if (oldName === newName) return true;
+    if (!this.getPausedSession(channelId, oldName)) return false;
+    if (this.getPausedSession(channelId, newName)) return false;
+    const stmt = this.db.query(
+      "UPDATE paused_sessions SET name = ? WHERE channel_id = ? AND name = ?"
+    );
+    return stmt.run(newName, channelId, oldName).changes > 0;
   }
 
   deletePausedSession(channelId: string, name: string): boolean {
     const stmt = this.db.query("DELETE FROM paused_sessions WHERE channel_id = ? AND name = ?");
     return stmt.run(channelId, name).changes > 0;
+  }
+
+  // --- Per-prompt cost tracking ---
+
+  hasPromptCost(promptMessageId: string): boolean {
+    const r = this.db.query(
+      "SELECT 1 FROM prompt_costs WHERE prompt_message_id = ?"
+    ).get(promptMessageId);
+    return !!r;
+  }
+
+  /**
+   * Record (or update) a prompt's cost. Keyed by the prompt's message id and
+   * upserted, so a duplicate "complete" for the same prompt updates the row
+   * instead of crashing or inserting a duplicate.
+   */
+  recordPromptCost(entry: PromptCost): void {
+    const stmt = this.db.query(`
+      INSERT INTO prompt_costs
+        (prompt_message_id, channel_id, session_id, result_message_id, prompt_text, cost_usd, num_turns, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(prompt_message_id) DO UPDATE SET
+        session_id = excluded.session_id,
+        result_message_id = excluded.result_message_id,
+        cost_usd = excluded.cost_usd,
+        num_turns = excluded.num_turns
+    `);
+    stmt.run(
+      entry.promptMessageId,
+      entry.channelId,
+      entry.sessionId ?? null,
+      entry.resultMessageId ?? null,
+      entry.promptText ?? null,
+      entry.costUsd,
+      entry.numTurns ?? null,
+      entry.createdAt,
+    );
+  }
+
+  setPromptResultMessage(promptMessageId: string, resultMessageId: string): void {
+    this.db.query(
+      "UPDATE prompt_costs SET result_message_id = ? WHERE prompt_message_id = ?"
+    ).run(resultMessageId, promptMessageId);
+  }
+
+  // --- Transcript import watermarks (/online) ---
+
+  /**
+   * The last transcript entry this channel imported, if any. Returned with its
+   * session id so a caller can ignore a watermark left by a different session.
+   */
+  getImportWatermark(channelId: string): { sessionId: string; lastUuid: string } | undefined {
+    const r = this.db.query(
+      "SELECT session_id, last_uuid FROM transcript_imports WHERE channel_id = ?"
+    ).get(channelId) as { session_id: string; last_uuid: string } | null;
+    return r ? { sessionId: r.session_id, lastUuid: r.last_uuid } : undefined;
+  }
+
+  setImportWatermark(channelId: string, sessionId: string, lastUuid: string): void {
+    this.db.query(`
+      INSERT OR REPLACE INTO transcript_imports (channel_id, session_id, last_uuid, imported_at)
+      VALUES (?, ?, ?, ?)
+    `).run(channelId, sessionId, lastUuid, Date.now());
   }
 
   // Active run tracking — for crash recovery

@@ -14,8 +14,11 @@ import type { SettingsStore } from '../settings/settings-store.js';
 export class PermissionManager {
   private pendingApprovals = new Map<string, PendingApproval>();
   private discordBot: any = null; // Will be set via setDiscordBot
+  private claudeManager: any = null; // Will be set via setClaudeManager
   private approvalTimeout: number;
   private defaultOnTimeout: 'allow' | 'deny';
+  // Questions get a longer window than plain approvals (they need real input).
+  private questionTimeout = 120_000; // 2 minutes
   // Track tools that user chose "Always Allow" for, keyed by channelId
   private alwaysAllowedTools = new Map<string, Set<string>>();
   private settings?: SettingsStore;
@@ -39,6 +42,14 @@ export class PermissionManager {
    */
   setDiscordBot(discordBot: any): void {
     this.discordBot = discordBot;
+  }
+
+  /**
+   * Set the Claude manager, so answered questions can arm its post-answer
+   * watchdog (the CLI sometimes accepts the answers and then wedges).
+   */
+  setClaudeManager(claudeManager: any): void {
+    this.claudeManager = claudeManager;
   }
 
   /**
@@ -374,6 +385,49 @@ export class PermissionManager {
   }
 
   /**
+   * Handle an AskUserQuestion timeout.
+   *
+   * Unlike a plain approval, a multi-question prompt is rendered one question at
+   * a time in a single message that is edited forward. The generic timeout
+   * handler would preserve only whichever question was on screen, losing the
+   * already-answered and not-yet-shown ones. So we resolve the tool call the
+   * same way (default deny / allow-with-partial-answers), then edit the message
+   * to leave the FULL record of every question + option in chat for later
+   * review, with the controls disabled.
+   */
+  private handleQuestionTimeout(requestId: string): void {
+    const pending = this.pendingApprovals.get(requestId);
+    if (!pending || !pending.pendingQuestion) return;
+
+    console.log(`PermissionManager: Question timed out for ${requestId}, defaulting to ${this.defaultOnTimeout}`);
+
+    const decision: PermissionDecision = {
+      behavior: this.defaultOnTimeout,
+      updatedInput: this.defaultOnTimeout === 'allow'
+        ? { questions: pending.pendingQuestion.questions, answers: pending.pendingQuestion.answers }
+        : undefined,
+      message: `Question timed out after ${this.questionTimeout / 1000} seconds, defaulted to ${this.defaultOnTimeout}`,
+    };
+
+    pending.resolve(decision);
+    this.cleanupPendingApproval(requestId);
+
+    // Leave the FULL multi-question record in chat, controls disabled, so the
+    // user can review every question and answer in a follow-up message.
+    const summary = this.buildQuestionSummary(pending.pendingQuestion);
+    pending.discordMessage?.edit({
+      content: '',
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('⏰ Questions Timed Out — review below')
+          .setDescription(summary.slice(0, 4096))
+          .setColor(0xFFA500),
+      ],
+      components: [],
+    }).catch(console.error);
+  }
+
+  /**
    * Update the approval message to show the result
    */
   private async updateApprovalMessage(message: any, approved: boolean | null): Promise<void> {
@@ -385,27 +439,24 @@ export class PermissionManager {
         await message.delete();
         console.log(`PermissionManager: Deleted approval message after user ${approved ? 'approved' : 'denied'}`);
       } else {
-        // For timeouts, show what happened then delete after a delay
+        // For timeouts, leave the message in place (clearly marked) so it can be
+        // reviewed later — the user didn't act, so deleting would destroy exactly
+        // what they'd want to see. Disable the controls and preserve the embed.
         const statusEmoji = '⏰';
         const statusText = `**TIMED OUT** - defaulted to ${this.defaultOnTimeout.toUpperCase()}`;
-        const updatedContent = message.content + `\n\n${statusEmoji} ${statusText}`;
-        
-        await message.edit(updatedContent);
-        
-        // Remove reactions to prevent further interaction
-        await message.reactions.removeAll().catch(() => {
+        const baseContent = message.content?.trim() ? `${message.content}\n\n` : '';
+        const updatedContent = `${baseContent}${statusEmoji} ${statusText}`;
+
+        await message.edit({
+          content: updatedContent,
+          embeds: message.embeds ?? [], // preserve the question/approval detail
+          components: [],               // disable stale buttons/select menus
+        });
+
+        // Remove reactions to prevent further interaction (legacy approval flow)
+        await message.reactions?.removeAll?.().catch(() => {
           // Ignore errors if we can't remove reactions (permissions)
         });
-        
-        // Delete the timeout message after 5 seconds
-        setTimeout(async () => {
-          try {
-            await message.delete();
-            console.log('PermissionManager: Deleted timeout message after delay');
-          } catch (error) {
-            console.error('PermissionManager: Error deleting timeout message:', error);
-          }
-        }, 5000);
       }
     } catch (error) {
       console.error('PermissionManager: Error updating approval message:', error);
@@ -440,13 +491,10 @@ export class PermissionManager {
       };
     }
 
-    // Use a longer timeout for questions (2 minutes)
-    const questionTimeout = 120_000;
-
     return new Promise<PermissionDecision>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.handleApprovalTimeout(requestId);
-      }, questionTimeout);
+        this.handleQuestionTimeout(requestId);
+      }, this.questionTimeout);
 
       const pending: PendingApproval = {
         requestId,
@@ -478,14 +526,12 @@ export class PermissionManager {
   }
 
   /**
-   * Send a question message to Discord with buttons or select menu
+   * Build the embed + interactive components for the current question.
+   * Discord allows at most 5 buttons per action row, so questions with more
+   * than 5 options fall back to a select menu instead of buttons (otherwise
+   * ActionRowBuilder.addComponents throws and the question never renders).
    */
-  private async sendQuestionMessage(pending: PendingApproval): Promise<void> {
-    const channel = await this.discordBot.client.channels.fetch(pending.discordContext.channelId);
-    if (!channel) {
-      throw new Error(`Could not find Discord channel: ${pending.discordContext.channelId}`);
-    }
-
+  private buildQuestionView(pending: PendingApproval): { embeds: EmbedBuilder[]; components: any[] } {
     const questionState = pending.pendingQuestion!;
     const question = questionState.questions[questionState.currentQuestionIndex]!;
     const questionNumber = questionState.questions.length > 1
@@ -506,16 +552,18 @@ export class PermissionManager {
 
     const components: any[] = [];
 
-    if (question.multiSelect) {
-      // Use a select menu for multi-select questions
+    // Buttons only work for single-select questions with <= 5 options.
+    const useSelectMenu = question.multiSelect || question.options.length > 5;
+
+    if (useSelectMenu) {
       const selectMenu = new StringSelectMenuBuilder()
         .setCustomId(`qs:${pending.requestId}:${questionState.currentQuestionIndex}`)
-        .setPlaceholder('Select one or more options...')
+        .setPlaceholder(question.multiSelect ? 'Select one or more options...' : 'Select an option...')
         .setMinValues(1)
-        .setMaxValues(question.options.length)
+        .setMaxValues(question.multiSelect ? question.options.length : 1)
         .addOptions(
           question.options.map((opt) => ({
-            label: opt.label,
+            label: opt.label.substring(0, 100),
             description: (opt.description || '').substring(0, 100) || undefined,
             value: opt.label,
           }))
@@ -527,20 +575,35 @@ export class PermissionManager {
       const buttons = question.options.map((opt, i) =>
         new ButtonBuilder()
           .setCustomId(`q:${pending.requestId}:${questionState.currentQuestionIndex}:${i}`)
-          .setLabel(`${String.fromCharCode(65 + i)}. ${opt.label}`)
+          .setLabel(`${String.fromCharCode(65 + i)}. ${opt.label}`.substring(0, 80))
           .setStyle(ButtonStyle.Primary)
       );
 
       components.push(new ActionRowBuilder().addComponents(...buttons));
     }
 
+    return { embeds: [embed], components };
+  }
+
+  /**
+   * Send a question message to Discord with buttons or select menu
+   */
+  private async sendQuestionMessage(pending: PendingApproval): Promise<void> {
+    const channel = await this.discordBot.client.channels.fetch(pending.discordContext.channelId);
+    if (!channel) {
+      throw new Error(`Could not find Discord channel: ${pending.discordContext.channelId}`);
+    }
+
+    const questionState = pending.pendingQuestion!;
+    const view = this.buildQuestionView(pending);
+
     if (pending.discordMessage) {
       // Update existing message for follow-up questions
-      await pending.discordMessage.edit({ embeds: [embed], components });
+      await pending.discordMessage.edit(view);
     } else {
       // Send new message for first question, mentioning the user
       const mention = `<@${pending.discordContext.userId}>`;
-      const message = await (channel as any).send({ content: mention, embeds: [embed], components });
+      const message = await (channel as any).send({ content: mention, ...view });
       pending.discordMessage = message;
     }
 
@@ -618,6 +681,37 @@ export class PermissionManager {
   }
 
   /**
+   * Rebuild a full record of every question + option from in-memory state.
+   * Picked options are marked ✅, others ▫️; unanswered questions show
+   * "(no answer)" and all their options remain visible. Shared by the
+   * all-answered summary and the timeout record so a timed-out multi-question
+   * prompt still shows every question (not just the one that was on screen).
+   */
+  private buildQuestionSummary(questionState: PendingQuestionState): string {
+    return questionState.questions
+      .map((q) => {
+        const answer = questionState.answers[q.question] ?? '(no answer)';
+        const picked = new Set(answer.split(', '));
+        const title = q.header ? `**${q.header}** — ${q.question}` : `**${q.question}**`;
+        const opts = q.options
+          .map((o: any) => `${picked.has(o.label) ? '✅' : '▫️'} ${o.label}`)
+          .join('\n');
+        return `${title}\n${opts}\n→ **${answer}**`;
+      })
+      .join('\n\n');
+  }
+
+  /**
+   * Plain-text rendering of the answers, for replaying them as a normal message
+   * if the turn wedges after receiving them.
+   */
+  private buildAnswerReplay(questionState: PendingQuestionState): string {
+    return questionState.questions
+      .map((q) => `Q: ${q.question}\nA: ${questionState.answers[q.question] ?? '(no answer)'}`)
+      .join('\n\n');
+  }
+
+  /**
    * Advance to the next question or resolve if all questions are answered
    */
   private advanceOrResolveQuestion(pending: PendingApproval, interaction: any): void {
@@ -625,12 +719,22 @@ export class PermissionManager {
     const nextIndex = questionState.currentQuestionIndex + 1;
 
     if (nextIndex < questionState.questions.length) {
-      // More questions to ask - advance and update the message
+      // More questions to ask - advance and render the next one atomically in
+      // the same interaction response. (A previous two-step "clear then edit"
+      // could leave the message blank if the follow-up edit failed, making it
+      // look like only the first question ever came through.)
       questionState.currentQuestionIndex = nextIndex;
 
-      interaction.update({ content: null, embeds: [], components: [] }).then(() => {
-        this.sendQuestionMessage(pending).catch(console.error);
-      }).catch(console.error);
+      // Give the next question its own full window. The timeout is a budget per
+      // question, not for the whole prompt: with one shared deadline, a careful
+      // reader on a 3-question prompt could blow it mid-way, which resolved the
+      // tool call as a denial and left every remaining button dead.
+      clearTimeout(pending.timeout);
+      pending.timeout = setTimeout(() => this.handleQuestionTimeout(pending.requestId), this.questionTimeout);
+
+      interaction.update(this.buildQuestionView(pending)).catch((error: any) => {
+        console.error('PermissionManager: Failed to render next question:', error);
+      });
     } else {
       // All questions answered - resolve the promise
       clearTimeout(pending.timeout);
@@ -646,24 +750,31 @@ export class PermissionManager {
       console.log('PermissionManager: All questions answered:', decision);
       pending.resolve(decision);
 
-      // Clean up the Discord message
+      // The answers are on their way back to the CLI over the MCP response. If
+      // the turn goes silent from here, it's wedged — let the manager watch for
+      // that and recover rather than losing the answers to the 10-minute reaper.
+      try {
+        this.claudeManager?.noteQuestionAnswered?.(
+          pending.discordContext.channelId,
+          this.buildAnswerReplay(questionState)
+        );
+      } catch (error) {
+        console.error('PermissionManager: failed to arm question watchdog:', error);
+      }
+
+      // Leave the answered question(s) in place for later review — rebuild a full
+      // record from the in-memory question data so the options aren't lost (the
+      // selected one is marked). Disable the controls; do not delete.
+      const summary = this.buildQuestionSummary(questionState);
+
       interaction.update({
         embeds: [
           new EmbedBuilder()
             .setTitle('✅ Questions Answered')
-            .setDescription(
-              Object.entries(questionState.answers)
-                .map(([q, a]) => `**${q}**\n→ ${a}`)
-                .join('\n\n')
-            )
+            .setDescription(summary.slice(0, 4096))
             .setColor(0x00FF00),
         ],
         components: [],
-      }).then(() => {
-        // Delete after a short delay to keep chat clean
-        setTimeout(() => {
-          pending.discordMessage?.delete().catch(() => {});
-        }, 5000);
       }).catch(console.error);
 
       this.cleanupPendingApproval(pending.requestId);

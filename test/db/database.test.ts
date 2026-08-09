@@ -40,6 +40,34 @@ describe("DatabaseManager", () => {
     });
   });
 
+  describe("renamePausedSession", () => {
+    it("renames in place when the row exists and the target name is free", () => {
+      mockGet
+        .mockReturnValueOnce({ channel_id: "c", name: "old", session_id: "s", paused_at: 1 })
+        .mockReturnValueOnce(null);
+      mockRun.mockReturnValue({ changes: 1 });
+
+      expect(db.renamePausedSession("c", "old", "new")).toBe(true);
+      expect(mockRun).toHaveBeenCalledWith("new", "c", "old");
+    });
+
+    it("refuses when the target name is already taken", () => {
+      mockGet
+        .mockReturnValueOnce({ channel_id: "c", name: "old", session_id: "s", paused_at: 1 })
+        .mockReturnValueOnce({ channel_id: "c", name: "new", session_id: "other", paused_at: 2 });
+
+      expect(db.renamePausedSession("c", "old", "new")).toBe(false);
+      expect(mockRun).not.toHaveBeenCalled();
+    });
+
+    it("returns false when the session was already resumed away", () => {
+      mockGet.mockReturnValueOnce(null);
+
+      expect(db.renamePausedSession("c", "old", "new")).toBe(false);
+      expect(mockRun).not.toHaveBeenCalled();
+    });
+  });
+
   describe("session management", () => {
     it("should return undefined for non-existent session", () => {
       mockGet.mockReturnValue(null);
@@ -66,11 +94,26 @@ describe("DatabaseManager", () => {
 
       db.setSession(channelId, sessionId, channelName);
 
+      // No model given — the row records NULL rather than guessing one, so the
+      // session resolves through LEGACY_SESSION_MODEL.
       expect(mockRun).toHaveBeenCalledWith(
         channelId,
         sessionId,
         channelName,
-        expect.any(Number)
+        expect.any(Number),
+        null
+      );
+    });
+
+    it("should pin the model a session was created with", () => {
+      db.setSession("test-channel-123", "session-456", "test-channel", "claude-opus-5");
+
+      expect(mockRun).toHaveBeenCalledWith(
+        "test-channel-123",
+        "session-456",
+        "test-channel",
+        expect.any(Number),
+        "claude-opus-5"
       );
     });
 

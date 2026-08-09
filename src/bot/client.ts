@@ -14,6 +14,7 @@ import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
 import { worktreeExists, getExistingWorktree, createWorktree, getWorktreePath, sanitizeWorktreeName } from '../utils/worktree.js';
 import { isRawCommand } from '../utils/shell.js';
+import { isBenignInteractionError } from '../utils/discord-errors.js';
 import { exec } from 'child_process';
 import * as path from 'path';
 import { getReactionConfig, getActivityLinkConfig, type ReactionConfig, type ActivityLinkConfig, type CompletionStatus } from '../types/index.js';
@@ -173,6 +174,7 @@ export class DiscordBot {
     });
 
     this.client.on("interactionCreate", async (interaction) => {
+     try {
       // Handle button and select menu interactions
       if (interaction.isButton() || interaction.isStringSelectMenu()) {
         if (this.mcpServer) {
@@ -212,6 +214,18 @@ export class DiscordBot {
       }
 
       await this.commandHandler.handleInteraction(interaction);
+     } catch (error) {
+      // A late/duplicate interaction ack (Discord's 3s window, double-clicks,
+      // stale buttons) is expected on a busy bot — log quietly and move on.
+      // Anything else is a real bug: log it loudly, but never let it crash the
+      // process (the global unhandledRejection backstop in index.ts is the last
+      // line of defense; this keeps the failure scoped to one interaction).
+      if (isBenignInteractionError(error)) {
+        console.warn(`Ignored expired/duplicate interaction ack: ${(error as any)?.code}`);
+      } else {
+        console.error("Error handling interaction:", error);
+      }
+     }
     });
 
     this.client.on("messageCreate", async (message) => {
@@ -628,7 +642,7 @@ export class DiscordBot {
    */
   private async handleWorktreeConfirmation(interaction: any): Promise<void> {
     const customId = interaction.customId as string;
-    const channelId = customId.split(":")[1];
+    const channelId = customId.split(":")[1] ?? "";
     const pending = this.pendingWorktreeConfirmations.get(channelId);
 
     if (!pending) {

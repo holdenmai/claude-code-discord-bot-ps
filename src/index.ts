@@ -5,6 +5,21 @@ import { MCPPermissionServer } from './mcp/server.js';
 import { SettingsStore } from './settings/settings-store.js';
 import { InstanceRouter } from './routing/instance-router.js';
 
+// Global backstop: a stray rejected promise (most often a Discord interaction
+// ack that landed after the 3s window) must never take the whole bot down.
+// Log it and keep running; per-call sites still handle their own errors.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection (kept alive):', reason);
+});
+
+// Synchronous twin of the above. The flaky Claude API lives in the spawned CLI,
+// so the bot only ever sees its output — but a stray synchronous throw in a sync
+// callback (a stream `data` handler, a timer) would otherwise take the process
+// down. Log and keep running: a dropped message beats a dead bot.
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception (kept alive):', error);
+});
+
 async function main() {
   const config = validateConfig();
 
@@ -33,6 +48,9 @@ async function main() {
 
   // Connect MCP server to Discord bot for interactive approvals
   mcpServer.setDiscordBot(bot);
+  // …and to the Claude manager, so answered questions arm the post-answer
+  // watchdog that recovers a turn wedged on its own AskUserQuestion.
+  mcpServer.setClaudeManager(claudeManager);
 
   // Handle graceful shutdown
   let isShuttingDown = false;

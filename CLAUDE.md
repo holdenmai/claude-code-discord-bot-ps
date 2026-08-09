@@ -17,6 +17,7 @@ This is a TypeScript project with strict type checking enabled.
 - `src/bot/client.ts` - Discord bot client, event handlers, message routing
 - `src/bot/commands.ts` - Slash command definitions and handlers
 - `src/claude/manager.ts` - Claude Code process lifecycle and streaming
+- `src/claude/transcript.ts` - Reads CLI session `.jsonl` transcripts for `/online` (pure, no Discord)
 - `src/mcp/server.ts` - MCP permission server for tool approvals
 - `src/mcp/permission-manager.ts` - Interactive approval/denial via Discord
 - `src/queue/message-queue.ts` - Per-channel message queue (one Claude process at a time)
@@ -35,18 +36,89 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - Shows the last 3 streamed responses in each message
 - Use `/clear` slash command to reset a session
 
+### Model selection
+
+The model is pinned **per session**, not per channel, so a conversation never
+changes model mid-flight. When a session is created it records the model it ran
+with (`channel_sessions.session_model`) and keeps it for its whole life, across
+resumes and `/resume` after a pause. Resolution order for a run:
+
+1. the session's pinned model
+2. `LEGACY_SESSION_MODEL` for sessions created before pinning existed
+3. the channel default (`/model`, else `DEFAULT_MODEL`) — new sessions only
+
+`/model` sets the channel default *and* repins the current session, since it's an
+explicit choice about the conversation on screen. Bare tier aliases (`opus`) are
+resolved to concrete IDs before being pinned — an alias follows whatever the CLI
+currently points that tier at, which is the drift pinning exists to prevent.
+
+### Importing offline work
+
+Work done in the Claude CLI (bot down, or just working at the terminal) leaves no
+trace in Discord. `/online` replays a session's transcript
+(`~/.claude/projects/<mangled-cwd>/<session-id>.jsonl`) into the channel so the
+channel stays the record of the conversation. It is strictly read-only: it never
+launches the CLI, never answers a question the transcript recorded, and never
+touches the live session.
+
+Where the replay starts, in order:
+
+1. the saved watermark (`transcript_imports.last_uuid`) if it's for the same session
+2. the newest transcript text that already appears in the channel's last 100 messages
+3. failing both, the last 10 turns
+
+Anchoring is by *content*, not timestamp — the bot posts plenty of non-transcript
+messages (startup links, error embeds), and one arriving after the last real reply
+would push a timestamp anchor past the very work being imported.
+
+The replay is condensed: prompts and Claude's prose get their own embeds, and each
+turn's tool calls collapse to one summary line. Replaying every tool call after the
+fact buries the channel — a three-day session is hundreds of embeds.
+
+Options: `session` (id or paused-session name, default the channel's session),
+`preview` (report without posting), `all` (whole transcript, ignoring the anchor).
+
+### Naming a session on the way out
+
+`/pause <name>` needs a name up front, which is exactly when you're least willing
+to think of one. `/autopause` asks Claude instead, and doesn't make you wait:
+
+1. the session is parked immediately under its own session id (same shape as
+   `/resume`'s auto-pause), so the channel is free for new work at once
+2. a one-shot CLI run resumes that session and asks it for a name
+3. the paused row is renamed in place when the answer arrives
+
+The naming run is deliberately outside the normal machinery — it never enters the
+per-channel message queue and is never the channel's active process, or the "start
+your next session immediately" part wouldn't hold. It uses `--fork-session`, so
+the naming turn lands in a throwaway session id and the paused session's own
+transcript is exactly what you left behind. It runs on the session's pinned model.
+
+Everything about it is best-effort: a bad answer, a timeout, or a session that got
+resumed before the name arrived all leave the session parked under its id, where
+`/resume <id>` still finds it. Names are lowercased to `[a-z0-9-]`, capped at 32
+characters (they're typed into `/resume` and packed into its autocomplete labels),
+rejected if they're GUID-shaped (a paused name shadows a session id in `/resume`),
+and suffixed `-2`, `-3`… on collision — `paused_sessions` is keyed on
+`(channel_id, name)` and written with `INSERT OR REPLACE`, so reusing a name would
+silently destroy the session already parked under it.
+
 ### Commands
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)
 - `/kill` - Kill the running Claude Code process in this channel
+- `/stop` - Gracefully stop the current turn (stream-json `control_request`/`interrupt`, like pressing Esc); session is preserved
 - `/killall` - Kill all running Claude Code processes
-- `/model` - Set the Claude model for this channel (sonnet/opus/haiku)
+- `/model` - Set the model for this channel and repin the session in flight
 - `/add` - Create a channel for a project folder (with autocomplete)
 - `/update` - Pull latest changes and restart the bot
+- `/restart` - Restart the bot without pulling changes
 - `/shortcut` - Manage custom `!command` prompt shortcuts (global or per-repo)
 - `/sync` - Merge main into all active worktrees for this project
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread
 - `/adopt` - Adopt an external Claude CLI session into a new channel (with autocomplete)
+- `/online` - Import offline CLI work from a session's `.jsonl` transcript into the channel
+- `/autopause` - Pause the current session and let Claude name it (name lands a bit later)
 - `/status` - Show summary of recent activity across all project channels
 - `/todo` - Per-channel todo notes (add/list/done/clear)
 - `/init` - Set this channel's category as the home for startup links
@@ -63,6 +135,13 @@ Required environment variables:
 Optional (multi-instance):
 - `BOT_INSTANCE_ID` - Instance name (e.g., "linux", "windows"). Enables multi-instance routing
 - `BOT_PRIORITY` - Integer priority (1 = highest, default: 1). Lower priority bots wait before processing
+
+Optional (models, timeouts, logging):
+- `DEFAULT_MODEL` - Model new sessions start on (default: `claude-opus-5`)
+- `LEGACY_SESSION_MODEL` - Model for sessions created before per-session pinning (default: `claude-opus-4-8`)
+- `AUTOPAUSE_TIMEOUT_SECONDS` - How long `/autopause` waits for Claude to answer with a name before giving up and leaving the session under its id (default: 180)
+- `QUESTION_WATCHDOG_SECONDS` - Silence allowed after AskUserQuestion answers are delivered before the turn is treated as wedged and recovered (default: 120)
+- `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
 
 ## Environment
 

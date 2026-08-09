@@ -25,7 +25,8 @@ export function buildClaudeCommand(
   discordContext?: DiscordContext,
   model: string = "opus",
   imageUrls?: string[],
-  planMode: boolean = false
+  planMode: boolean = false,
+  streamingInput: boolean = false
 ): { command: string; args: string[] } {
   const raw = isRawCommand(prompt);
 
@@ -42,6 +43,12 @@ export function buildClaudeCommand(
   if (raw) {
     // Raw CLI command: pass arguments directly without -p wrapper
     args.push(...prompt.split(/\s+/));
+  } else if (streamingInput) {
+    // Realtime streaming input: the prompt is delivered over stdin as a
+    // stream-json user message (not as a -p argument), which keeps stdin open
+    // so additional messages can be injected mid-turn (/interrupt, /btw).
+    args.push("--print");
+    args.push("--input-format", "stream-json");
   } else {
     // Normal prompt mode
     if (imageUrls && imageUrls.length > 0) {

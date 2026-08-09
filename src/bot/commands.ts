@@ -1,9 +1,17 @@
-import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits } from "discord.js";
+import { SlashCommandBuilder, REST, Routes, ChannelType, PermissionFlagsBits, EmbedBuilder } from "discord.js";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { spawn, execSync } from "child_process";
 import type { ClaudeManager } from '../claude/manager.js';
+import {
+  findTranscriptPath,
+  parseTranscript,
+  planImport,
+  renderTurn,
+  transcriptCwd,
+} from '../claude/transcript.js';
+import { requestSessionName, uniqueSessionName } from '../claude/session-namer.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
 
@@ -28,17 +36,24 @@ export class CommandHandler {
         .setName("kill")
         .setDescription("Kill the currently running Claude Code process"),
       new SlashCommandBuilder()
+        .setName("stop")
+        .setDescription("Gracefully stop Claude's current turn (like pressing Esc), keeping the session"),
+      new SlashCommandBuilder()
         .setName("model")
-        .setDescription("Set the Claude model for this channel")
+        .setDescription("Set the model for this channel (and repin the current session)")
         .addStringOption((option: any) =>
           option
             .setName("name")
             .setDescription("Model to use")
             .setRequired(true)
+            // Explicit versions, not the bare "opus"/"sonnet" aliases: an alias
+            // follows whatever the CLI currently points that tier at, so picking
+            // one moves the channel silently whenever a new model ships.
             .addChoices(
-              { name: "Sonnet", value: "sonnet" },
-              { name: "Opus (default)", value: "opus" },
-              { name: "Haiku", value: "haiku" },
+              { name: "Opus 5 (default)", value: "claude-opus-5" },
+              { name: "Opus 4.8", value: "claude-opus-4-8" },
+              { name: "Sonnet 5", value: "claude-sonnet-5" },
+              { name: "Haiku 4.5", value: "claude-haiku-4-5" },
             )
         ),
       new SlashCommandBuilder()
@@ -60,6 +75,9 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("update")
         .setDescription("Update the bot by pulling latest changes and restarting"),
+      new SlashCommandBuilder()
+        .setName("restart")
+        .setDescription("Restart the bot without updating"),
       new SlashCommandBuilder()
         .setName("init")
         .setDescription("Set this channel's category as the home for startup links"),
@@ -147,14 +165,66 @@ export class CommandHandler {
             .setRequired(true)
         ),
       new SlashCommandBuilder()
+        .setName("autopause")
+        .setDescription("Pause the current session and let Claude name it (name arrives shortly after)"),
+      new SlashCommandBuilder()
         .setName("resume")
-        .setDescription("Resume a previously paused session")
+        .setDescription("Resume a paused session by name, or any session by its id")
         .addStringOption((option: any) =>
           option
             .setName("name")
-            .setDescription("Name of the paused session to resume")
+            .setDescription("Paused session name, or a session id (GUID) to resume directly")
             .setRequired(true)
             .setAutocomplete(true)
+        ),
+      new SlashCommandBuilder()
+        .setName("online")
+        .setDescription("Import offline CLI work from this session's transcript into the channel")
+        .addStringOption((option: any) =>
+          option
+            .setName("session")
+            .setDescription("Session id or paused-session name (default: this channel's session)")
+            .setRequired(false)
+            .setAutocomplete(true)
+        )
+        .addBooleanOption((option: any) =>
+          option
+            .setName("preview")
+            .setDescription("Show what would be imported without posting it")
+            .setRequired(false)
+        )
+        .addBooleanOption((option: any) =>
+          option
+            .setName("all")
+            .setDescription("Import the whole transcript, ignoring what's already in the channel")
+            .setRequired(false)
+        ),
+      new SlashCommandBuilder()
+        .setName("costreview")
+        .setDescription("Review session costs for this channel (and optionally its threads)")
+        .addBooleanOption((option: any) =>
+          option
+            .setName("include_threads")
+            .setDescription("Also include sessions from this channel's threads (default: false)")
+            .setRequired(false)
+        ),
+      new SlashCommandBuilder()
+        .setName("interrupt")
+        .setDescription("Send a message to the running process, like typing while Claude works")
+        .addStringOption((option: any) =>
+          option
+            .setName("prompt")
+            .setDescription("Message to inject into the running session")
+            .setRequired(true)
+        ),
+      new SlashCommandBuilder()
+        .setName("btw")
+        .setDescription("Ask a quick side question without interrupting Claude's current work")
+        .addStringOption((option: any) =>
+          option
+            .setName("prompt")
+            .setDescription("Side question to send to the running session")
+            .setRequired(true)
         ),
       new SlashCommandBuilder()
         .setName("file")
@@ -194,7 +264,7 @@ export class CommandHandler {
         await this.handleAddAutocomplete(interaction);
       } else if (interaction.commandName === "adopt") {
         await this.handleAdoptAutocomplete(interaction);
-      } else if (interaction.commandName === "resume") {
+      } else if (interaction.commandName === "resume" || interaction.commandName === "online") {
         await this.handleResumeAutocomplete(interaction);
       }
       return;
@@ -212,7 +282,7 @@ export class CommandHandler {
 
     // Multi-instance guard: skip if another instance owns this channel
     // Read-only commands bypass this guard — they don't spawn Claude processes
-    const readOnlyCommands = new Set(["status", "todo"]);
+    const readOnlyCommands = new Set(["status", "todo", "costreview"]);
     if (this.instanceRouter && !readOnlyCommands.has(interaction.commandName)) {
       const channel = interaction.channel;
       const isThread = channel?.isThread?.();
@@ -229,6 +299,9 @@ export class CommandHandler {
 
     if (interaction.commandName === "clear") {
       const channelId = interaction.channelId;
+      // Archive the cleared session's cost (non-resumable) before deleting the row,
+      // so it still counts toward the /costreview grand total.
+      this.claudeManager.archiveSessionCost(channelId);
       this.claudeManager.clearSession(channelId);
 
       await interaction.reply(
@@ -243,6 +316,17 @@ export class CommandHandler {
         await interaction.reply("Killed the running Claude Code process. Session preserved — next message will resume.");
       } else {
         await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
+      }
+    }
+
+    if (interaction.commandName === "stop") {
+      const channelId = interaction.channelId;
+      if (!this.claudeManager.hasActiveProcess(channelId)) {
+        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
+      } else if (this.claudeManager.interruptSession(channelId)) {
+        await interaction.reply("🛑 Asked Claude to gracefully stop the current turn. Session preserved — next message continues it.");
+      } else {
+        await interaction.reply({ content: "Couldn't send a graceful stop (process not accepting input). Use `/kill` to force it.", ephemeral: true });
       }
     }
 
@@ -274,6 +358,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "update") {
       await this.handleUpdateCommand(interaction);
+    }
+
+    if (interaction.commandName === "restart") {
+      await this.handleRestartCommand(interaction);
     }
 
     if (interaction.commandName === "shortcut") {
@@ -308,8 +396,24 @@ export class CommandHandler {
       await this.handlePauseCommand(interaction);
     }
 
+    if (interaction.commandName === "autopause") {
+      await this.handleAutoPauseCommand(interaction);
+    }
+
     if (interaction.commandName === "resume") {
       await this.handleResumeCommand(interaction);
+    }
+
+    if (interaction.commandName === "online") {
+      await this.handleOnlineCommand(interaction);
+    }
+
+    if (interaction.commandName === "interrupt" || interaction.commandName === "btw") {
+      await this.handleInjectCommand(interaction);
+    }
+
+    if (interaction.commandName === "costreview") {
+      await this.handleCostReviewCommand(interaction);
     }
 
     if (interaction.commandName === "init") {
@@ -1165,35 +1269,55 @@ export class CommandHandler {
         await interaction.editReply(`✅ Updated successfully!\n\`\`\`\n${output}\n\`\`\`\n🔄 Restarting bot...`);
 
         // Give Discord time to send the message, then restart
-        setTimeout(async () => {
+        setTimeout(() => {
           console.log("Restarting bot after update...");
-
-          const cwd = process.cwd();
-          const vbsPath = path.join(cwd, "restart.vbs");
-
-          // Create a VBS script that launches cmd in a visible window
-          const vbsContent = `
-Set WshShell = CreateObject("WScript.Shell")
-WScript.Sleep 2000
-WshShell.CurrentDirectory = "${cwd.replace(/\\/g, "\\\\")}"
-WshShell.Run "cmd /k bun run start", 1, False
-`;
-          fs.writeFileSync(vbsPath, vbsContent.trim());
-
-          // Run the VBS script with wscript (doesn't block, creates independent process)
-          spawn("wscript.exe", [vbsPath], {
-            detached: true,
-            stdio: "ignore",
-          }).unref();
-
-          console.log("Restart VBS script launched, exiting...");
-          process.exit(0);
+          this.restartBot();
         }, 1000);
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`❌ Update failed: ${msg}`);
     }
+  }
+
+  /**
+   * Handle /restart command - restart the bot without pulling changes.
+   */
+  private async handleRestartCommand(interaction: any): Promise<void> {
+    await interaction.reply("🔄 Restarting bot...");
+
+    // Give Discord time to send the message, then restart
+    setTimeout(() => {
+      console.log("Restarting bot (no update)...");
+      this.restartBot();
+    }, 1000);
+  }
+
+  /**
+   * Relaunch the bot in a fresh process and exit the current one. The new
+   * process is detached so it survives this process exiting.
+   */
+  private restartBot(): void {
+    const cwd = process.cwd();
+    const vbsPath = path.join(cwd, "restart.vbs");
+
+    // Create a VBS script that launches cmd in a visible window
+    const vbsContent = `
+Set WshShell = CreateObject("WScript.Shell")
+WScript.Sleep 2000
+WshShell.CurrentDirectory = "${cwd.replace(/\\/g, "\\\\")}"
+WshShell.Run "cmd /k bun run start", 1, False
+`;
+    fs.writeFileSync(vbsPath, vbsContent.trim());
+
+    // Run the VBS script with wscript (doesn't block, creates independent process)
+    spawn("wscript.exe", [vbsPath], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+
+    console.log("Restart VBS script launched, exiting...");
+    process.exit(0);
   }
 
   private async handlePauseCommand(interaction: any): Promise<void> {
@@ -1219,20 +1343,167 @@ WshShell.Run "cmd /k bun run start", 1, False
     }
   }
 
-  private async handleResumeCommand(interaction: any): Promise<void> {
+  /**
+   * /autopause — park the session now, name it later.
+   *
+   * The pause is immediate and unconditional (under the session id, exactly like
+   * /resume's auto-pause), so the channel is free for a new session the moment
+   * the command returns. Asking Claude for a name is fire-and-forget: it runs
+   * off the queue, and the paused row is renamed whenever the answer lands.
+   * Every failure path is survivable — the session stays parked under its id and
+   * `/resume <id>` still works.
+   */
+  private async handleAutoPauseCommand(interaction: any): Promise<void> {
     const channelId = interaction.channelId;
-    const name = interaction.options.getString("name");
-    const channelName = interaction.channel?.name || channelId;
+    // In a thread the *parent* is the repo — the thread name is the worktree.
+    // Using the thread's own name here points the naming run at a folder that
+    // doesn't exist, which Node reports as a baffling ENOENT on "claude".
+    const channel = interaction.channel;
+    const channelName = channel?.isThread?.()
+      ? channel.parent?.name || "default"
+      : channel?.name || "default";
 
-    const success = this.claudeManager.resumeSession(channelId, name, channelName);
-    if (success) {
-      await interaction.reply(`Resumed session **${name}**. Next message will continue that session.`);
-    } else {
+    if (this.claudeManager.hasActiveProcess(channelId)) {
       await interaction.reply({
-        content: `No paused session named **${name}** in this channel.`,
+        content: "Cannot pause while a process is running. Use `/kill` or `/stop` first.",
         ephemeral: true,
       });
+      return;
     }
+
+    const paused = this.claudeManager.autoPauseSession(channelId, channelName);
+    if (!paused) {
+      await interaction.reply({
+        content: "No active session to pause in this channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (!paused.workingDir) {
+      // Paused fine, but there's nowhere to run the naming turn from.
+      await interaction.reply(
+        `Session paused as \`${paused.sessionId}\`, but this channel's project folder is missing, so it can't be named. \`/resume ${paused.sessionId}\` to pick it back up.`
+      );
+      return;
+    }
+
+    await interaction.reply(
+      `Session paused as \`${paused.sessionId}\`. Next message starts a new session — asking Claude for a shorter name…`
+    );
+
+    // Deliberately not awaited: the user is free to start working immediately.
+    void this.namePausedSession(interaction, channelId, { ...paused, workingDir: paused.workingDir });
+  }
+
+  private async namePausedSession(
+    interaction: any,
+    channelId: string,
+    paused: { sessionId: string; model: string; workingDir: string }
+  ): Promise<void> {
+    let name: string | undefined;
+    try {
+      name = await requestSessionName({
+        sessionId: paused.sessionId,
+        workingDir: paused.workingDir,
+        model: paused.model,
+      });
+    } catch (error) {
+      console.error("Session naming failed:", error);
+    }
+
+    const notify = async (content: string) => {
+      try {
+        await interaction.followUp({ content, ephemeral: false });
+      } catch (error) {
+        console.error("Failed to post autopause result:", error);
+      }
+    };
+
+    if (!name) {
+      await notify(
+        `Couldn't get a name for \`${paused.sessionId}\` — it stays paused under its id. \`/resume ${paused.sessionId}\` to pick it back up.`
+      );
+      return;
+    }
+
+    // The channel moved on while we were asking: dedupe against whatever is
+    // parked here *now*, not against what was there when the pause happened.
+    const taken = this.claudeManager
+      .getPausedSessions(channelId)
+      .map((s: any) => s.name)
+      .filter((n: string) => n !== paused.sessionId);
+    const finalName = uniqueSessionName(name, taken);
+
+    if (!this.claudeManager.renamePausedSession(channelId, paused.sessionId, finalName)) {
+      // The row is gone — the session was resumed (or cleared) before the name
+      // arrived, so there is nothing left to rename.
+      await notify(
+        `Claude named \`${paused.sessionId}\` **${finalName}**, but that session is no longer paused — leaving it alone.`
+      );
+      return;
+    }
+
+    await notify(`Paused session renamed to **${finalName}** — \`/resume ${finalName}\` to pick it back up.`);
+  }
+
+  private async handleResumeCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const input = (interaction.options.getString("name") || "").trim();
+    const channelName = interaction.channel?.name || channelId;
+
+    // Don't switch sessions mid-run — mirror /pause's guard.
+    if (this.claudeManager.hasActiveProcess(channelId)) {
+      await interaction.reply({
+        content: "Cannot switch sessions while a process is running. Use `/kill` or `/stop` first.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Resolve the target BEFORE mutating anything, so a bad input never leaves
+    // the channel without a session. A paused-session name wins over a GUID, so
+    // switching back to a previously auto-paused session (whose name is its id)
+    // goes through resumeSession and restores its cost + cleans up the record.
+    const isPausedName = this.claudeManager
+      .getResumableSessions(channelId)
+      .some((s) => s.name === input);
+    const asGuid = isSessionGuid(input);
+
+    if (!isPausedName && !asGuid) {
+      await interaction.reply({
+        content: `No paused session named **${input}** in this channel, and that's not a valid session id.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const current = this.claudeManager.getSessionId(channelId);
+
+    if (asGuid && !isPausedName && current === input) {
+      await interaction.reply({
+        content: "That session is already active in this channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Auto-pause the current session under its own id so it's always recoverable
+    // via `/resume <that-id>` (previously it was silently overwritten).
+    if (current) {
+      this.claudeManager.pauseSession(channelId, current);
+    }
+
+    if (isPausedName) {
+      this.claudeManager.resumeSession(channelId, input, channelName);
+    } else {
+      this.claudeManager.setSessionFromAdopt(channelId, input, channelName);
+    }
+
+    const back = current
+      ? ` Previous session paused as \`${current}\` — \`/resume ${current}\` to switch back.`
+      : "";
+    await interaction.reply(`Resumed session **${input}**. Next message will continue that session.${back}`);
   }
 
   private async handleResumeAutocomplete(interaction: any): Promise<void> {
@@ -1240,7 +1511,7 @@ WshShell.Run "cmd /k bun run start", 1, False
     const channelId = interaction.channelId;
 
     try {
-      const paused = this.claudeManager.getPausedSessions(channelId);
+      const paused = this.claudeManager.getResumableSessions(channelId);
       const filtered = paused
         .filter(s => s.name.toLowerCase().includes(focused))
         .slice(0, 25);
@@ -1255,6 +1526,280 @@ WshShell.Run "cmd /k bun run start", 1, False
       await interaction.respond([]);
     }
   }
+
+  /**
+   * Handle /online — replay a session's CLI transcript into the channel so work
+   * done outside Discord (bot down, or just working at the terminal) becomes
+   * part of the channel's history.
+   *
+   * Read-only by design: it never talks to the CLI, never answers a question the
+   * transcript recorded, and never touches the live session. It only posts.
+   */
+  private async handleOnlineCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const input = (interaction.options.getString("session") || "").trim();
+    const preview = interaction.options.getBoolean("preview") === true;
+    const all = interaction.options.getBoolean("all") === true;
+
+    // A live run posts to this same channel; interleaving replayed history with
+    // it would produce a transcript that never happened in that order.
+    if (this.claudeManager.hasActiveProcess(channelId)) {
+      await interaction.reply({
+        content: "A Claude process is running in this channel. Wait for it to finish (or `/stop`) before importing history.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    let sessionId: string | undefined;
+    if (input) {
+      const paused = this.claudeManager.getPausedSessions(channelId).find((s) => s.name === input);
+      sessionId = paused?.sessionId ?? (isSessionGuid(input) ? input : undefined);
+      if (!sessionId) {
+        await interaction.reply({
+          content: `No paused session named **${input}** in this channel, and that's not a valid session id.`,
+          ephemeral: true,
+        });
+        return;
+      }
+    } else {
+      sessionId = this.claudeManager.getSessionId(channelId);
+      if (!sessionId) {
+        await interaction.reply({
+          content: "No session in this channel. Pass a session id or paused-session name.",
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    const transcriptPath = findTranscriptPath(sessionId);
+    if (!transcriptPath) {
+      await interaction.reply({
+        content: `No transcript found for session \`${sessionId}\` under \`~/.claude/projects\`.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    let events;
+    let cwd: string | undefined;
+    try {
+      const raw = fs.readFileSync(transcriptPath, "utf-8");
+      events = parseTranscript(raw);
+      cwd = transcriptCwd(raw);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Failed to read transcript: ${msg}`);
+      return;
+    }
+
+    // What's already in the channel, so we only post what's missing.
+    const discordTexts: string[] = [];
+    if (!all) {
+      try {
+        const recent = await interaction.channel.messages.fetch({ limit: 100 });
+        for (const msg of recent.values()) {
+          if (msg.content) discordTexts.push(msg.content);
+          for (const embed of msg.embeds) {
+            if (embed.description) discordTexts.push(embed.description);
+          }
+        }
+      } catch (error) {
+        console.error("Error fetching channel history for /online:", error);
+      }
+    }
+
+    const watermark = this.claudeManager.getImportWatermark(channelId);
+    const plan = planImport(events, {
+      discordTexts,
+      watermarkUuid: watermark?.sessionId === sessionId ? watermark.lastUuid : undefined,
+      all,
+    });
+
+    const anchorLabel: Record<string, string> = {
+      watermark: "resuming after the last import",
+      content: "anchored to the newest message already in this channel",
+      fallback: "no matching message found — falling back to the last 10 turns",
+      all: "importing the entire transcript",
+    };
+    const header =
+      `Session \`${sessionId.slice(0, 8)}…\`${cwd ? ` → \`${cwd}\`` : ""}\n` +
+      `${plan.turns.length} turn(s), ${plan.messages.length} message(s) — ${anchorLabel[plan.anchor]}.` +
+      (plan.droppedTurns > 0 ? `\nSkipped the oldest ${plan.droppedTurns} turn(s) to keep the import manageable.` : "");
+
+    if (plan.messages.length === 0) {
+      await interaction.editReply(`Nothing new to import.\n${header}`);
+      return;
+    }
+
+    if (preview) {
+      const outline = plan.turns
+        .map((t, i) => `${i + 1}. ${(t.prompt || t.texts[0] || "(tool work)").replace(/\s+/g, " ").slice(0, 90)}`)
+        .join("\n")
+        .slice(0, 1500);
+      await interaction.editReply(`**Preview — nothing posted.**\n${header}\n\n${outline}`);
+      return;
+    }
+
+    const channel = interaction.channel;
+    const started = plan.turns[0]?.startedAt;
+    await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("📥 Offline work imported")
+          .setDescription(
+            `Replaying ${plan.turns.length} turn(s) from the CLI session \`${sessionId.slice(0, 8)}…\`` +
+            `${started ? `, starting ${new Date(started).toLocaleString()}` : ""}.\n` +
+            `Condensed view — tool calls are summarized, not replayed.`
+          )
+          .setColor(0x95A5A6),
+      ],
+    });
+
+    // Post turn by turn and advance the watermark as we go, so a failure partway
+    // through (rate limit, permissions) doesn't re-post everything next time.
+    let posted = 0;
+    let lastUuid: string | undefined;
+    try {
+      for (const turn of plan.turns) {
+        for (const message of renderTurn(turn)) {
+          const embed = new EmbedBuilder().setDescription(message.description).setColor(message.color);
+          if (message.title) embed.setTitle(message.title);
+          await channel.send({ embeds: [embed] });
+          posted++;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        lastUuid = turn.lastUuid;
+      }
+    } catch (error) {
+      console.error("Error posting imported transcript:", error);
+      if (lastUuid) this.claudeManager.setImportWatermark(channelId, sessionId, lastUuid);
+      const msg = error instanceof Error ? error.message : String(error);
+      await interaction.editReply(`Posted ${posted} message(s), then failed: ${msg}\nRun \`/online\` again to continue.`);
+      return;
+    }
+
+    if (lastUuid) this.claudeManager.setImportWatermark(channelId, sessionId, lastUuid);
+    await channel.send({
+      embeds: [new EmbedBuilder().setDescription("— end of imported history —").setColor(0x95A5A6)],
+    });
+    await interaction.editReply(`Imported ${posted} message(s).\n${header}`);
+  }
+
+  /**
+   * Handle /interrupt and /btw — inject a message into the running process's
+   * stdin. Only works while a streaming-mode process is actively working.
+   */
+  private async handleInjectCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const prompt = interaction.options.getString("prompt");
+    const mode: "interrupt" | "btw" = interaction.commandName === "btw" ? "btw" : "interrupt";
+
+    const injected = this.claudeManager.injectMessage(channelId, prompt, mode);
+    if (injected) {
+      const label = mode === "btw" ? "Side question" : "Message";
+      await interaction.reply(`📨 ${label} sent to the running session:\n> ${prompt.slice(0, 1500)}`);
+    } else {
+      await interaction.reply({
+        content: "No active Claude process is running in this channel to send to. Send a normal message to start one.",
+        ephemeral: true,
+      });
+    }
+  }
+
+  /**
+   * Handle /costreview — sum and list session costs for this channel (and
+   * optionally its threads). Covers the current session plus any paused ones.
+   */
+  private async handleCostReviewCommand(interaction: any): Promise<void> {
+    await interaction.deferReply();
+
+    const channel = interaction.channel;
+    const isThread = channel?.isThread?.();
+    const includeThreads = interaction.options.getBoolean("include_threads") ?? false;
+
+    // Scope: this channel, plus its threads if requested (threads have no sub-threads).
+    const scopes: { id: string; name: string }[] = [
+      { id: interaction.channelId, name: channel?.name || "this channel" },
+    ];
+
+    if (includeThreads && !isThread && channel && "threads" in channel) {
+      try {
+        const active = await (channel as any).threads.fetchActive();
+        for (const t of active.threads.values()) scopes.push({ id: t.id, name: t.name });
+      } catch (error) {
+        console.error("costreview: failed to fetch active threads:", error);
+      }
+      try {
+        const archived = await (channel as any).threads.fetchArchived();
+        for (const t of archived.threads.values()) scopes.push({ id: t.id, name: t.name });
+      } catch (error) {
+        console.error("costreview: failed to fetch archived threads:", error);
+      }
+    }
+
+    let activeTotal = 0;   // current + resumable (the sessions we list)
+    let clearedTotal = 0;  // archived, non-resumable cleared sessions
+    const sections: string[] = [];
+
+    for (const scope of scopes) {
+      const lines: string[] = [];
+      let subtotal = 0;
+
+      const current = this.claudeManager.getChannelCostInfo(scope.id);
+      if (current) {
+        lines.push(`• current — $${current.totalCostUsd.toFixed(4)}`);
+        subtotal += current.totalCostUsd;
+      }
+
+      for (const p of this.claudeManager.getPausedSessions(scope.id)) {
+        if (p.isResumable) {
+          lines.push(`• paused "${p.name}" — $${p.totalCostUsd.toFixed(4)}`);
+          subtotal += p.totalCostUsd;
+        } else {
+          clearedTotal += p.totalCostUsd; // cleared sessions: counted, not listed
+        }
+      }
+
+      activeTotal += subtotal;
+
+      if (lines.length === 0) continue; // nothing active to list for this scope
+      const header = scopes.length > 1
+        ? `**#${scope.name}** — $${subtotal.toFixed(4)}`
+        : `**#${scope.name}**`;
+      sections.push(`${header}\n${lines.join("\n")}`);
+    }
+
+    const grandTotal = activeTotal + clearedTotal;
+
+    if (sections.length === 0 && grandTotal === 0) {
+      await interaction.editReply("💰 **Cost Review**\n\nNo sessions with recorded cost found here.");
+      return;
+    }
+
+    const summary =
+      `\n\n**Active/resumable subtotal: $${activeTotal.toFixed(4)}**` +
+      `\n**Grand total (incl. cleared): $${grandTotal.toFixed(4)}**`;
+
+    let body = sections.length ? sections.join("\n\n") : "_(no active or resumable sessions)_";
+    const LIMIT = 2000 - 32; // Discord message content limit, with headroom
+    if (`💰 **Cost Review**\n\n${body}${summary}`.length > LIMIT) {
+      body = body.slice(0, LIMIT - summary.length - 60) + "\n… (truncated)";
+    }
+
+    await interaction.editReply(`💰 **Cost Review**\n\n${body}${summary}`);
+  }
+}
+
+// A Claude session id is a v4-style UUID. We only check the shape — if the id
+// doesn't exist (or belongs to another folder), the CLI reports it on the next
+// message, matching `claude --resume <id>` in the console.
+const SESSION_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isSessionGuid(s: string): boolean {
+  return SESSION_GUID_RE.test(s.trim());
 }
 
 function formatAge(timestamp: number): string {
