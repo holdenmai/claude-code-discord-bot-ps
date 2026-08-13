@@ -65,14 +65,31 @@ async function main() {
     isShuttingDown = true;
     console.log('Shutting down gracefully...');
 
-    // Stop MCP server first
+    // A teardown that hangs is worse than an abrupt one: the process keeps the
+    // MCP port bound and every CLI it spawned stays parented to it. Ctrl+C
+    // means stop, so guarantee it stops.
+    const hardExit = setTimeout(() => {
+      console.error('Shutdown took too long — forcing exit');
+      process.exit(1);
+    }, 20_000);
+    hardExit.unref?.();
+
+    // CLI processes first, and gracefully. They outlive their turns now, so a
+    // shutdown normally finds several alive; stdin EOF lets each one drain and
+    // reap its own children (the MCP bridge among them) instead of leaving them
+    // orphaned and still holding a connection to the server we're about to stop.
+    try {
+      await claudeManager.shutdownAll();
+    } catch (error) {
+      console.error('Error retiring Claude processes:', error);
+    }
+
     try {
       await mcpServer.stop();
     } catch (error) {
       console.error('Error stopping MCP server:', error);
     }
 
-    // Stop Claude manager
     try {
       claudeManager.destroy();
     } catch (error) {
@@ -84,6 +101,10 @@ async function main() {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // Windows delivers Ctrl+Break and console-close as their own events; without
+  // these, closing the terminal window skips the teardown entirely.
+  process.on('SIGHUP', shutdown);
+  process.on('SIGBREAK' as NodeJS.Signals, shutdown);
 
   // On Windows, process.exit() doesn't trigger SIGINT/SIGTERM.
   // This ensures the MCP server is cleaned up even on abrupt exits

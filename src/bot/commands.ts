@@ -79,6 +79,9 @@ export class CommandHandler {
         .setName("restart")
         .setDescription("Restart the bot without updating"),
       new SlashCommandBuilder()
+        .setName("shutdown")
+        .setDescription("Stop the bot cleanly, retiring every Claude CLI process first"),
+      new SlashCommandBuilder()
         .setName("init")
         .setDescription("Set this channel's category as the home for startup links"),
       new SlashCommandBuilder()
@@ -378,6 +381,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "restart") {
       await this.handleRestartCommand(interaction);
+    }
+
+    if (interaction.commandName === "shutdown") {
+      await this.handleShutdownCommand(interaction);
     }
 
     if (interaction.commandName === "shortcut") {
@@ -1294,6 +1301,43 @@ export class CommandHandler {
       const msg = error instanceof Error ? error.message : String(error);
       await interaction.editReply(`❌ Update failed: ${msg}`);
     }
+  }
+
+  /**
+   * Handle /shutdown — stop the bot for good, from Discord.
+   *
+   * Ctrl+C in the terminal is a blunter instrument than it used to be: it
+   * arrives while several CLI processes are sitting alive as session hosts, and
+   * whatever doesn't get retired properly is left orphaned, holding the pipes
+   * and the permission-server socket it inherited. This takes the same route the
+   * bot uses to retire an idle process — stdin EOF, escalating only if refused —
+   * for every channel, then exits.
+   */
+  private async handleShutdownCommand(interaction: any): Promise<void> {
+    await interaction.reply("🛑 Shutting down — retiring Claude processes first…");
+
+    let retired = 0;
+    try {
+      retired = await this.claudeManager.shutdownAll("/shutdown");
+    } catch (error) {
+      console.error("Shutdown: failed to retire processes cleanly:", error);
+    }
+
+    const summary = retired === 0
+      ? "🛑 Bot stopped. No Claude processes were running."
+      : `🛑 Bot stopped. Retired ${retired} Claude process${retired === 1 ? "" : "es"}.`;
+    // Best effort: say goodbye before the process goes, but never let a failed
+    // edit be the reason the bot stays up.
+    try {
+      await interaction.editReply(summary);
+    } catch (error) {
+      console.error("Shutdown: failed to post summary:", error);
+    }
+
+    console.log("Shutdown requested from Discord — exiting.");
+    // Let the reply flush. The 'exit' handler frees the port and sweeps up
+    // anything shutdownAll couldn't retire.
+    setTimeout(() => process.exit(0), 1000);
   }
 
   /**

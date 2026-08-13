@@ -96,6 +96,34 @@ Consequences that shape the rest of the design:
   and `/btw` refuse to write into an idle one — that would start a turn nothing is
   tracking.
 
+### Stopping the bot
+
+Once processes outlive their turns, stopping the bot stops being free. A shutdown
+now finds several CLIs alive, and each of them has children of its own — at
+minimum `node mcp-bridge.cjs`, which holds a socket to the permission server.
+
+`child.kill()` reaches exactly one process. On Windows it isn't even a signal
+(Node maps it to `TerminateProcess`) and there's no kill-by-parent, so the
+grandchildren are simply reparented and live on, still holding the pipes and the
+connection they inherited — a phantom with no visible owner, and a port that
+reads as busy after the thing that bound it is gone. Every escalation path
+therefore goes through `killProcessTree` (`taskkill /T /F` on Windows, the plain
+signal elsewhere, where our children share our process group and the CLI reaps
+its own).
+
+Three ways out, in descending order of grace:
+
+- **`/shutdown`** — the good one. Retires every process through the front door
+  (stdin EOF, so each CLI drains and reaps its own children), then exits.
+- **Ctrl+C / SIGTERM** — same graceful retire, under a 20s hard-exit deadline so
+  a wedged teardown can't leave the process up holding the port. `SIGHUP` and
+  Windows' `SIGBREAK` are wired to it too, so closing the terminal window isn't
+  the one path that skips cleanup.
+- **`process.exit`** (`/restart`, `/update`) — the `exit` handler can only do
+  synchronous work, so it tree-kills rather than retires. `/restart` can't wait
+  for a graceful retire anyway: `restart.vbs` relaunches after 2 seconds and the
+  new process would collide with the old one on the MCP port.
+
 ### Model selection
 
 The model is pinned **per session**, not per channel, so a conversation never
@@ -226,6 +254,7 @@ turn never lands.
 - `/add` - Create a channel for a project folder (with autocomplete)
 - `/update` - Pull latest changes and restart the bot
 - `/restart` - Restart the bot without pulling changes
+- `/shutdown` - Stop the bot cleanly, retiring every CLI process first
 - `/shortcut` - Manage custom `!command` prompt shortcuts (global or per-repo)
 - `/sync` - Merge main into all active worktrees for this project
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread

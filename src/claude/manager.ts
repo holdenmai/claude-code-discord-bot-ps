@@ -2309,6 +2309,31 @@ export class ClaudeManager {
     }
   }
 
+  /**
+   * Retire every live CLI process through the front door and wait for them.
+   *
+   * This is the difference between stopping the bot and abandoning it. Each
+   * process gets stdin EOF, which lets the CLI drain, tear down its own
+   * background tasks and reap its own children — so nothing is left holding a
+   * socket to a permission server that's about to disappear. `shutdownProcess`
+   * already owns the escalation ladder (EOF → SIGTERM → tree kill), so the
+   * worst case here is bounded, and they run concurrently rather than one
+   * eight-second grace period after another.
+   */
+  async shutdownAll(reason = "bot shutting down"): Promise<number> {
+    const live = [...this.channelProcesses.entries()].filter(([, e]) => e.process);
+    if (live.length === 0) return 0;
+
+    console.log(`Retiring ${live.length} session process(es): ${reason}`);
+    for (const [channelId] of live) {
+      this.stopTypingIndicator(channelId);
+      this.clearQuestionWatchdog(channelId);
+      this.questionRecovery.delete(channelId);
+    }
+    await Promise.all(live.map(([channelId]) => this.shutdownProcess(channelId, reason)));
+    return live.length;
+  }
+
   // Clean up resources
   destroy(): void {
     // Stop all typing indicators

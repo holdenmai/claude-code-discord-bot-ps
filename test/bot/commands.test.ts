@@ -46,7 +46,7 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(24);
+      expect(commands).toHaveLength(25);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('stop');
@@ -56,21 +56,22 @@ describe('CommandHandler', () => {
       expect(commands[6]!.name).toBe('plan');
       expect(commands[7]!.name).toBe('update');
       expect(commands[8]!.name).toBe('restart');
-      expect(commands[9]!.name).toBe('init');
-      expect(commands[10]!.name).toBe('shortcut');
-      expect(commands[11]!.name).toBe('sync');
-      expect(commands[12]!.name).toBe('end');
-      expect(commands[13]!.name).toBe('adopt');
-      expect(commands[14]!.name).toBe('status');
-      expect(commands[15]!.name).toBe('todo');
-      expect(commands[16]!.name).toBe('pause');
-      expect(commands[17]!.name).toBe('autopause');
-      expect(commands[18]!.name).toBe('resume');
-      expect(commands[19]!.name).toBe('online');
-      expect(commands[20]!.name).toBe('costreview');
-      expect(commands[21]!.name).toBe('interrupt');
-      expect(commands[22]!.name).toBe('btw');
-      expect(commands[23]!.name).toBe('file');
+      expect(commands[9]!.name).toBe('shutdown');
+      expect(commands[10]!.name).toBe('init');
+      expect(commands[11]!.name).toBe('shortcut');
+      expect(commands[12]!.name).toBe('sync');
+      expect(commands[13]!.name).toBe('end');
+      expect(commands[14]!.name).toBe('adopt');
+      expect(commands[15]!.name).toBe('status');
+      expect(commands[16]!.name).toBe('todo');
+      expect(commands[17]!.name).toBe('pause');
+      expect(commands[18]!.name).toBe('autopause');
+      expect(commands[19]!.name).toBe('resume');
+      expect(commands[20]!.name).toBe('online');
+      expect(commands[21]!.name).toBe('costreview');
+      expect(commands[22]!.name).toBe('interrupt');
+      expect(commands[23]!.name).toBe('btw');
+      expect(commands[24]!.name).toBe('file');
     });
   });
 
