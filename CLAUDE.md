@@ -163,6 +163,59 @@ and suffixed `-2`, `-3`… on collision — `paused_sessions` is keyed on
 `(channel_id, name)` and written with `INSERT OR REPLACE`, so reusing a name would
 silently destroy the session already parked under it.
 
+### The at-a-glance dashboard
+
+One DM message, edited in place, lists every channel in the home category with
+its live state and spend. It's posted right after the startup announcement, and
+because the ready handler deletes every old bot DM on boot it's always a fresh
+post — there's no message id to persist and no reattach path.
+
+Per scope (channel or thread): state, the current session's cost, the cost of
+every session it has ever had, and its completed-prompt count. Channel rows also
+carry a rollup over the channel plus all its threads.
+
+State is `Waiting > Processing > Active > Inactive`, in that precedence. Waiting
+means blocked on *you* — an AskUserQuestion or a tool approval — and it outranks
+Processing because both are true at once while the CLI sits on a question, and
+Waiting is the one you can act on. It's read from `PermissionManager`'s in-memory
+pending map, so it doesn't survive a restart; that's accurate rather than stale,
+since the turn that raised the question didn't survive either.
+
+Why a message and not the channel/thread title: Discord caps `name`/`topic` edits
+at 2 per 10 minutes per channel, which a per-turn indicator exhausts immediately
+and then sits wrong, while message edits allow ~5 per 5 seconds. Channel names
+are also load-bearing — they resolve to `BASE_FOLDER/<name>` — so status in a
+title would repoint a channel at a folder that doesn't exist.
+
+Refreshes are event-driven (run start, run complete, approval raised or resolved,
+any slash command) with a 2s coalescing window, plus a 30s backstop tick for state
+that changes with no trigger, like an approval timing out.
+
+Discovery comes from two directions, because neither one alone finds everything:
+
+- **the home category**, for scopes with no history — a channel that has never
+  run anything is exactly the "Inactive" case worth showing, and it has no
+  database row to enumerate from
+- **the database** (`channel_sessions` ∪ `paused_sessions` ∪ `prompt_costs`),
+  for everything that has done work, wherever it lives. Project channels are not
+  required to sit in a category, and a category-only sweep reported `$0` across
+  the board on a server where none of them did. Threads found this way pull their
+  parent channel in with them, so a thread's spend never lands under a project
+  that isn't on screen.
+
+Ids that no longer resolve (deleted channels keep their rows) are remembered as
+missing for 30 minutes rather than re-fetched every tick. Live threads come from
+one guild-wide active-thread call, not one call per channel. Archived threads are
+folded into the channel rollup without a row of their own — listing them would
+grow the message without bound — and only the ones with recorded history are
+folded in at all, since an archived thread that never ran anything contributes
+nothing but a `+1`.
+
+Prompt counts come from `prompt_costs` (one row per prompt, never pruned), not
+`prompt_history` (capped at the last 10 per channel). A row is only written when a
+result arrives, so the count is prompts that *finished* — a `/kill`ed or crashed
+turn never lands.
+
 ### Commands
 - Any message in a channel runs Claude Code with that prompt
 - `/clear` - Reset the current session (starts fresh next time)

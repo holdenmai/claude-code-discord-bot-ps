@@ -173,6 +173,7 @@ export class PermissionManager {
       };
 
       this.pendingApprovals.set(requestId, pending);
+      this.notifyDashboard();
 
       // Send approval message to Discord
       this.sendApprovalMessage(pending).catch((error) => {
@@ -493,6 +494,19 @@ export class PermissionManager {
     if (pendingApproval) {
       clearTimeout(pendingApproval.timeout);
       this.pendingApprovals.delete(requestId);
+      this.notifyDashboard();
+    }
+  }
+
+  /**
+   * Nudge the dashboard — a channel just became (or stopped being) blocked on the
+   * user, and that's state only this class knows about.
+   */
+  private notifyDashboard(): void {
+    try {
+      this.discordBot?.refreshDashboard?.();
+    } catch (error) {
+      console.error('PermissionManager: dashboard refresh failed:', error);
     }
   }
 
@@ -535,6 +549,7 @@ export class PermissionManager {
       };
 
       this.pendingApprovals.set(requestId, pending);
+      this.notifyDashboard();
 
       this.sendQuestionMessage(pending).catch((error) => {
         console.error('PermissionManager: Failed to send question message:', error);

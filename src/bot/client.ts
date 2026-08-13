@@ -18,6 +18,7 @@ import { isBenignInteractionError } from '../utils/discord-errors.js';
 import { exec } from 'child_process';
 import * as path from 'path';
 import { getReactionConfig, getActivityLinkConfig, type ReactionConfig, type ActivityLinkConfig, type CompletionStatus } from '../types/index.js';
+import { DashboardManager } from './dashboard-manager.js';
 
 interface PendingWorktreeConfirmation {
   message: any;
@@ -38,6 +39,7 @@ export class DiscordBot {
   private baseFolder: string;
   private reactionConfig: ReactionConfig;
   private activityLinkConfig: ActivityLinkConfig;
+  private dashboard: DashboardManager;
 
   constructor(
     private claudeManager: ClaudeManager,
@@ -59,8 +61,25 @@ export class DiscordBot {
     this.activityLinkConfig = getActivityLinkConfig();
     this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings, instanceRouter);
     this.messageQueue = new MessageQueue();
+    this.dashboard = new DashboardManager(this.client, allowedUserId, settings, {
+      getChannelCostInfo: (id) => this.claudeManager.getChannelCostInfo(id),
+      getPausedSessions: (id) => this.claudeManager.getPausedSessions(id),
+      getPromptCount: (id) => this.claudeManager.getPromptCount(id),
+      getKnownScopeIds: () => this.claudeManager.getKnownScopeIds(),
+      hasActiveProcess: (id) => this.claudeManager.hasActiveProcess(id),
+      hasActiveWatchers: (id) => this.claudeManager.hasActiveWatchers(id),
+      // Resolved per render, not captured: the MCP server is attached after
+      // login (index.ts), so binding the permission manager here would pin it
+      // to undefined and every channel would read as never waiting.
+      getWaitingKind: (id) => this.mcpServer?.getPermissionManager?.()?.getWaitingKind?.(id),
+    });
     this.setupEventHandlers();
     this.setupCompletionCallback();
+  }
+
+  /** Re-render the dashboard. Coalesced, so callers needn't be careful. */
+  refreshDashboard(): void {
+    this.dashboard.scheduleRefresh();
   }
 
   /**
@@ -75,6 +94,9 @@ export class DiscordBot {
    */
   private setupCompletionCallback(): void {
     this.claudeManager.setOnCompleteCallback(async (channelId, status, originalMessage) => {
+      // Cost, prompt count and state all just moved for this channel.
+      this.refreshDashboard();
+
       // Swap reactions on the original user message
       if (this.reactionConfig.enabled && originalMessage) {
         try {
@@ -169,6 +191,10 @@ export class DiscordBot {
         console.error("Failed to send startup DM:", error);
       }
 
+      // Post the dashboard after the announcement — the DM cleanup above wipes
+      // every previous bot message, so it's always a fresh post, never a reattach.
+      await this.dashboard.start();
+
       // Crash recovery: re-run !oncrash prompt for interrupted sessions
       await this.handleCrashRecovery();
     });
@@ -214,6 +240,11 @@ export class DiscordBot {
       }
 
       await this.commandHandler.handleInteraction(interaction);
+
+      // Blanket refresh after any slash command: /clear, /pause, /resume and
+      // /model all move dashboard state, and catching them here beats threading
+      // a bot reference through CommandHandler for each one.
+      if (interaction.isCommand?.()) this.refreshDashboard();
      } catch (error) {
       // A late/duplicate interaction ack (Discord's 3s window, double-clicks,
       // stale buttons) is expected on a busy bot — log quietly and move on.
@@ -491,6 +522,9 @@ export class DiscordBot {
     try {
       // Track the original message for reaction updates
       this.claudeManager.setOriginalMessage(channelId, message);
+
+      // This channel is about to go Processing.
+      this.refreshDashboard();
 
       // Add processing reaction
       if (this.reactionConfig.enabled) {

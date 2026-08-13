@@ -371,6 +371,37 @@ export class DatabaseManager {
   }
 
   /**
+   * How many prompts this channel has *completed*, across every session it has
+   * ever had. Counts prompt_costs rows, which are written once per prompt when
+   * its result arrives and never pruned — unlike prompt_history, which is capped
+   * at the last 10 per channel and so can't answer this.
+   *
+   * A prompt killed (/kill), interrupted, or lost to a crash never records a row,
+   * so this is "prompts that finished", not "prompts you sent".
+   */
+  getPromptCount(channelId: string): number {
+    const r = this.db.query(
+      "SELECT COUNT(*) AS n FROM prompt_costs WHERE channel_id = ?"
+    ).get(channelId) as { n: number } | null;
+    return r?.n ?? 0;
+  }
+
+  /**
+   * Every channel or thread this database has ever recorded work for: a live
+   * session, a paused or cleared one, or a finished prompt. The dashboard uses
+   * it to find scopes that no Discord listing would hand it — a project channel
+   * outside any category, or a thread that has since been archived.
+   */
+  getKnownScopeIds(): string[] {
+    const rows = this.db.query(`
+      SELECT channel_id FROM channel_sessions
+      UNION SELECT channel_id FROM paused_sessions
+      UNION SELECT channel_id FROM prompt_costs
+    `).all() as { channel_id: string }[];
+    return rows.map(r => r.channel_id);
+  }
+
+  /**
    * Record (or update) a prompt's cost. Keyed by the prompt's message id and
    * upserted, so a duplicate "complete" for the same prompt updates the row
    * instead of crashing or inserting a duplicate.

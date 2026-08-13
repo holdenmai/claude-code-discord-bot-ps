@@ -1185,6 +1185,15 @@ export class ClaudeManager {
     return this.db.getPromptHistory(channelId, limit);
   }
 
+  getPromptCount(channelId: string): number {
+    return this.db.getPromptCount(channelId);
+  }
+
+  /** Every channel/thread with recorded history, for dashboard discovery. */
+  getKnownScopeIds(): string[] {
+    return this.db.getKnownScopeIds();
+  }
+
   setModel(channelId: string, model: string): void {
     this.channelModels.set(channelId, model);
     this.settings?.setModel(channelId, model);
