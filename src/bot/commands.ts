@@ -311,9 +311,17 @@ export class CommandHandler {
 
     if (interaction.commandName === "kill") {
       const channelId = interaction.channelId;
-      if (this.claudeManager.hasActiveProcess(channelId)) {
+      const busy = this.claudeManager.hasActiveProcess(channelId);
+      // A channel's process outlives its turns, so there's a second thing worth
+      // killing: an idle session process still hosting background watchers.
+      const watching = !busy && this.claudeManager.hasLiveProcess(channelId);
+      if (busy || watching) {
         this.claudeManager.killActiveProcess(channelId);
-        await interaction.reply("Killed the running Claude Code process. Session preserved — next message will resume.");
+        await interaction.reply(
+          watching
+            ? "Killed the idle session process (any background watchers go with it). Session preserved — next message will resume."
+            : "Killed the running Claude Code process. Session preserved — next message will resume."
+        );
       } else {
         await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
       }
@@ -321,12 +329,20 @@ export class CommandHandler {
 
     if (interaction.commandName === "stop") {
       const channelId = interaction.channelId;
-      if (!this.claudeManager.hasActiveProcess(channelId)) {
-        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
-      } else if (this.claudeManager.interruptSession(channelId)) {
-        await interaction.reply("🛑 Asked Claude to gracefully stop the current turn. Session preserved — next message continues it.");
+      if (this.claudeManager.hasActiveProcess(channelId)) {
+        if (this.claudeManager.interruptSession(channelId)) {
+          await interaction.reply("🛑 Asked Claude to gracefully stop the current turn. Session preserved — next message continues it.");
+        } else {
+          await interaction.reply({ content: "Couldn't send a graceful stop (process not accepting input). Use `/kill` to force it.", ephemeral: true });
+        }
+      } else if (this.claudeManager.hasLiveProcess(channelId)) {
+        // No turn running, but the process is being held open for a watcher. "Stop"
+        // here means stop waiting on it — otherwise the only way out is /kill.
+        await interaction.deferReply();
+        await this.claudeManager.stopIdleSession(channelId);
+        await interaction.editReply("🛑 Stopped waiting — retired the session process and its background watchers. Session preserved — next message continues it.");
       } else {
-        await interaction.reply({ content: "Couldn't send a graceful stop (process not accepting input). Use `/kill` to force it.", ephemeral: true });
+        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
       }
     }
 
@@ -1316,6 +1332,11 @@ WshShell.Run "cmd /k bun run start", 1, False
       stdio: "ignore",
     }).unref();
 
+    // Take the CLI processes down with us. They now outlive their turns, so on a
+    // quiet restart there can be several sitting idle — and process.exit below
+    // skips the SIGINT/SIGTERM shutdown that would otherwise clean them up.
+    this.claudeManager.killAllProcesses();
+
     console.log("Restart VBS script launched, exiting...");
     process.exit(0);
   }
@@ -1703,8 +1724,13 @@ WshShell.Run "cmd /k bun run start", 1, False
       const label = mode === "btw" ? "Side question" : "Message";
       await interaction.reply(`📨 ${label} sent to the running session:\n> ${prompt.slice(0, 1500)}`);
     } else {
+      // The session process is kept alive between turns now, so "no turn running"
+      // and "no process" look the same from here — say which one it is.
+      const idleWithWatchers = this.claudeManager.hasLiveProcess(channelId);
       await interaction.reply({
-        content: "No active Claude process is running in this channel to send to. Send a normal message to start one.",
+        content: idleWithWatchers
+          ? "Nothing is running right now — the session is just being held open for a background watcher. Send a normal message to start a turn, or `/stop` to stop waiting."
+          : "No active Claude process is running in this channel to send to. Send a normal message to start one.",
         ephemeral: true,
       });
     }

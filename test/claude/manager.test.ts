@@ -227,22 +227,157 @@ describe('ClaudeManager', () => {
       // The sessionId is only set in channelSessions when Claude actually responds
     });
 
-    it('should kill existing process when reserving channel', () => {
+    it('keeps a live process alive and repoints it at the new turn', () => {
+      // The channel's process outlives its turns so background watchers survive.
+      // Killing it here is what used to take them down — runClaudeCode decides
+      // whether to inject into it or retire it deliberately.
       const mockExistingProcess = { kill: vi.fn() };
       const mockMessage = { edit: vi.fn() };
-      
+      const newMessage = { edit: vi.fn() };
+
       manager.reserveChannel('channel-1', undefined, mockMessage);
       const channelProcesses = (manager as any).channelProcesses;
       channelProcesses.get('channel-1').process = mockExistingProcess;
-      
-      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-      
-      manager.reserveChannel('channel-1', 'new-session', mockMessage);
-      
-      expect(mockExistingProcess.kill).toHaveBeenCalledWith('SIGTERM');
-      expect(consoleSpy).toHaveBeenCalledWith('Killing existing process for channel channel-1 before starting new one');
-      
-      consoleSpy.mockRestore();
+
+      manager.reserveChannel('channel-1', 'new-session', newMessage);
+
+      expect(mockExistingProcess.kill).not.toHaveBeenCalled();
+      expect(channelProcesses.get('channel-1').process).toBe(mockExistingProcess);
+      expect(channelProcesses.get('channel-1').sessionId).toBe('new-session');
+      expect(channelProcesses.get('channel-1').discordMessage).toBe(newMessage);
+    });
+  });
+
+  describe('turn vs process liveness', () => {
+    it('reports a live process between turns as not busy', () => {
+      manager.reserveChannel('channel-1', undefined, {});
+      const entry = (manager as any).channelProcesses.get('channel-1');
+      entry.process = { kill: vi.fn() };
+      entry.turnActive = false;
+
+      // A process kept warm for the next prompt (or holding a watcher) is not a
+      // turn in flight — /kill and the dashboard need to tell those apart.
+      expect(manager.hasActiveProcess('channel-1')).toBe(false);
+      expect(manager.hasLiveProcess('channel-1')).toBe(true);
+    });
+
+    it('reports a process mid-turn as busy', () => {
+      manager.reserveChannel('channel-1', undefined, {});
+      const entry = (manager as any).channelProcesses.get('channel-1');
+      entry.process = { kill: vi.fn() };
+      entry.turnActive = true;
+
+      expect(manager.hasActiveProcess('channel-1')).toBe(true);
+      expect(manager.hasLiveProcess('channel-1')).toBe(true);
+    });
+  });
+
+  describe('reusing a live process for the next turn', () => {
+    // `once("close")` resolves immediately: shutdownProcess waits for the real
+    // event, and a mock that never fires it would sit through the SIGTERM
+    // escalation instead of exercising the respawn.
+    const mockProcess = () => ({
+      pid: 999,
+      stdin: { end: vi.fn(), write: vi.fn(), writable: true },
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn(),
+      once: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'close') setImmediate(() => cb(0));
+      }),
+      kill: vi.fn(),
+    });
+
+    /** Park a live, idle process on the channel as a previous turn would leave it. */
+    function parkProcess(overrides: Record<string, any> = {}) {
+      manager.reserveChannel('channel-1', 'session-1', {});
+      const entry = (manager as any).channelProcesses.get('channel-1');
+      Object.assign(entry, {
+        process: mockProcess(),
+        spec: { model: DEFAULT_MODEL, planMode: false, workingDir: path.join(mockBaseFolder, 'test-channel') },
+        runningSessionId: 'session-1',
+        turnActive: false,
+        startedAt: Date.now(),
+        ...overrides,
+      });
+      (manager as any).streamingChannels.add('channel-1');
+      (manager as any).channelNames.set('channel-1', 'test-channel');
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockDb.getSessionModel.mockReturnValue(DEFAULT_MODEL);
+      mockDb.getSession.mockReturnValue('session-1');
+      return entry;
+    }
+
+    it('injects the prompt instead of spawning a second process', async () => {
+      const entry = parkProcess();
+      const { spawn } = await import('child_process');
+      vi.mocked(spawn).mockClear();
+
+      await manager.runClaudeCode('channel-1', 'test-channel', 'next prompt', 'session-1');
+
+      expect(spawn).not.toHaveBeenCalled();
+      expect(entry.process.stdin.write).toHaveBeenCalled();
+      const written = vi.mocked(entry.process.stdin.write).mock.calls[0]![0] as string;
+      expect(written).toContain('next prompt');
+      expect(entry.turnActive).toBe(true);
+    });
+
+    it('refuses to inject into a process running a different session', async () => {
+      // /resume repoints the channel; the parked process still holds the old
+      // conversation, so the prompt must not be written into it.
+      const entry = parkProcess({ runningSessionId: 'session-OLD' });
+      const { spawn } = await import('child_process');
+      vi.mocked(spawn).mockReturnValue(mockProcess() as any);
+
+      await manager.runClaudeCode('channel-1', 'test-channel', 'next prompt', 'session-1');
+
+      expect(entry.process.stdin.write).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalled();
+    });
+
+    it('refuses to inject when the model was repinned under it', async () => {
+      const entry = parkProcess({
+        spec: { model: 'claude-sonnet-5', planMode: false, workingDir: path.join(mockBaseFolder, 'test-channel') },
+      });
+      const { spawn } = await import('child_process');
+      vi.mocked(spawn).mockReturnValue(mockProcess() as any);
+
+      await manager.runClaudeCode('channel-1', 'test-channel', 'next prompt', 'session-1');
+
+      expect(entry.process.stdin.write).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalled();
+    });
+
+    it('refuses to inject a raw CLI command — its content lives in argv', async () => {
+      const entry = parkProcess();
+      const { spawn } = await import('child_process');
+      vi.mocked(spawn).mockReturnValue(mockProcess() as any);
+
+      await manager.runClaudeCode('channel-1', 'test-channel', '--version', 'session-1');
+
+      expect(entry.process.stdin.write).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalled();
+    });
+  });
+
+  describe('hasActiveWatchers', () => {
+    it('is false with no process and false with an empty task list', () => {
+      expect(manager.hasActiveWatchers('channel-1')).toBe(false);
+      manager.reserveChannel('channel-1', undefined, {});
+      expect(manager.hasActiveWatchers('channel-1')).toBe(false);
+    });
+
+    it('tracks the CLI\'s background_tasks_changed snapshot wholesale', () => {
+      manager.reserveChannel('channel-1', undefined, {});
+      const update = (manager as any).updateLiveTasks.bind(manager);
+
+      update('channel-1', [{ task_id: 'a' }, { task_id: 'b' }]);
+      expect(manager.hasActiveWatchers('channel-1')).toBe(true);
+
+      // A snapshot, not a delta: an empty list means nothing is running, however
+      // many terminal statuses we did or didn't recognise along the way.
+      update('channel-1', []);
+      expect(manager.hasActiveWatchers('channel-1')).toBe(false);
     });
   });
 
@@ -306,6 +441,78 @@ describe('ClaudeManager', () => {
       const written = vi.mocked(mockProcess.stdin.write).mock.calls[0]![0] as string;
       expect(written).toContain('"type":"user"');
       expect(written).toContain('test prompt');
+    });
+  });
+
+  describe('mid-turn inactivity reaper', () => {
+    const CHANNEL = 'channel-reaper';
+    let reaped: any;
+
+    // Stand in for a live CLI process mid-turn with nothing to show for itself.
+    function armSilentTurn(overrides: Partial<{ liveTasks: Set<string>; startedAt: number }> = {}) {
+      const entry = {
+        process: { pid: 999, kill: vi.fn(), exitCode: null, signalCode: null, stdin: { end: vi.fn() } },
+        turnActive: true,
+        liveTasks: new Set<string>(),
+        startedAt: Date.now(),
+        inactivityTimer: undefined as any,
+        ...overrides,
+      };
+      (manager as any).channelProcesses.set(CHANNEL, entry);
+      return entry;
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      // The reaper's action, stubbed: we're asserting the decision, not the kill.
+      reaped = vi.spyOn(manager as any, 'handleProcessTimeout').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      (manager as any).channelProcesses.delete(CHANNEL);
+      vi.useRealTimers();
+    });
+
+    it('reaps a turn that has gone silent with nothing outstanding', () => {
+      armSilentTurn();
+      (manager as any).onInactivity(CHANNEL);
+      expect(reaped).toHaveBeenCalledWith(CHANNEL, expect.anything());
+    });
+
+    it('spares a turn blocked on the user — an unanswered question makes no output', () => {
+      manager.setPendingUserPromptProbe((id) => id === CHANNEL);
+      const entry = armSilentTurn();
+
+      (manager as any).onInactivity(CHANNEL);
+
+      expect(reaped).not.toHaveBeenCalled();
+      // …and re-arms, so it reaps later if the wait resolves into a real hang.
+      expect(entry.inactivityTimer).toBeDefined();
+    });
+
+    it('spares a turn blocked on a background task', () => {
+      armSilentTurn({ liveTasks: new Set(['task-1']) });
+      (manager as any).onInactivity(CHANNEL);
+      expect(reaped).not.toHaveBeenCalled();
+    });
+
+    it('reaps once the wait outlives the absolute hold cap', () => {
+      manager.setPendingUserPromptProbe(() => true);
+      armSilentTurn({ startedAt: Date.now() - 7 * 3600 * 1000 }); // past the 6h ceiling
+
+      (manager as any).onInactivity(CHANNEL);
+
+      expect(reaped).toHaveBeenCalled();
+    });
+
+    it('ignores a channel whose turn already ended', () => {
+      manager.setPendingUserPromptProbe(() => false);
+      const entry = armSilentTurn();
+      entry.turnActive = false;
+
+      (manager as any).onInactivity(CHANNEL);
+
+      expect(reaped).not.toHaveBeenCalled();
     });
   });
 

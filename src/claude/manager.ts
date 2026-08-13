@@ -5,6 +5,7 @@ import { EmbedBuilder, AttachmentBuilder } from "discord.js";
 import type { SDKMessage, CompletionStatus, PromptLinkConfig } from "../types/index.js";
 import { getPromptLinkConfig } from "../types/index.js";
 import { buildClaudeCommand, isRawCommand, type DiscordContext } from "../utils/shell.js";
+import { killProcessTree } from "../utils/process-tree.js";
 import { DatabaseManager } from "../db/database.js";
 import type { SettingsStore } from "../settings/settings-store.js";
 
@@ -40,6 +41,80 @@ export function resolveModelAlias(model: string): string {
 // wedged, not slow. Deliberately far below the 10-minute inactivity reaper, which
 // would otherwise sit on a dead turn for the full window and then lose the answers.
 const QUESTION_ANSWER_WATCHDOG_MS = Number(process.env.QUESTION_WATCHDOG_SECONDS || 120) * 1000;
+
+// How long a channel's CLI process is kept alive with nothing to do.
+//
+// This is not an optimisation, it's the feature: the CLI tears down every
+// background task (Monitor, `run_in_background` shells) roughly 5 seconds after a
+// turn's `result` *if stdin has reached EOF*. Hold stdin open and the same task
+// runs to completion, fires its notification, and the CLI wakes itself for a
+// follow-up turn (`result.origin.kind === "task-notification"`). So a watcher
+// lives exactly as long as we're willing to keep its process around.
+//
+// Holding it open also means the next prompt is a stdin injection rather than a
+// `--resume`, which re-reads the whole transcript. That's the cheap part.
+const IDLE_KEEPALIVE_MS = Number(process.env.SESSION_IDLE_SECONDS || 600) * 1000;
+
+// Absolute ceiling on holding a process open for background work, so a watcher
+// that never terminates can't pin a CLI (and its MCP bridge) open forever.
+const MAX_TASK_HOLD_MS = Number(process.env.WATCHER_MAX_HOLD_SECONDS || 6 * 3600) * 1000;
+
+// Silence allowed *within a turn* before the process is treated as hung. Long or
+// slow API turns can go quiet for minutes at a time — especially when Anthropic
+// is overloaded — so keep it generous. It is never armed on an idle process,
+// which is supposed to be silent.
+//
+// Configurable because the CLI's own foreground Bash cap is 600 seconds exactly:
+// a build or test suite run at the top of that range produces no output for the
+// whole window and lands on this timer's default by coincidence.
+const INACTIVITY_MS = Number(process.env.TURN_INACTIVITY_SECONDS || 600) * 1000;
+
+// Grace given to a deliberate shutdown: stdin EOF is the front door (the CLI
+// drains, tears down its own background tasks and exits 0), SIGTERM the
+// escalation if it doesn't take it.
+const SHUTDOWN_GRACE_MS = 8000;
+
+/**
+ * The spawn-time identity of a channel's CLI process. These live in argv, so a
+ * turn that needs different ones can't be injected into an existing process —
+ * it has to respawn.
+ */
+interface ProcessSpec {
+  model: string;
+  planMode: boolean;
+  workingDir: string;
+}
+
+interface ChannelProcess {
+  process: any;
+  sessionId?: string;
+  discordMessage: any;
+  /** Undefined until the process is actually spawned (see reserveChannel). */
+  spec?: ProcessSpec;
+  /**
+   * The session the CLI reports it is actually in, as opposed to the one we asked
+   * for. Anything that repoints a channel at a different session (`/resume`,
+   * `/adopt`, `/clear`) must not have its next prompt injected into a process
+   * still holding the old conversation.
+   */
+  runningSessionId?: string;
+  /** True between handing the CLI a prompt and that prompt's `result`. */
+  turnActive: boolean;
+  /** Background tasks the CLI reports as live, from `background_tasks_changed`. */
+  liveTasks: Set<string>;
+  /** Armed whenever the process is alive with no turn in flight. */
+  idleTimer?: ReturnType<typeof setTimeout>;
+  /** Armed only while a turn is in flight — an idle process is not "hung". */
+  inactivityTimer?: ReturnType<typeof setTimeout>;
+  /** When the process was spawned, for the absolute background-task hold cap. */
+  startedAt: number;
+  /** Set while we're retiring the process, so `close` stays quiet about it. */
+  shuttingDown?: boolean;
+}
+
+function sameSpec(a: ProcessSpec | undefined, b: ProcessSpec): boolean {
+  return !!a && a.model === b.model && a.planMode === b.planMode && a.workingDir === b.workingDir;
+}
 
 // Substrings that mark a Claude/Anthropic API-layer failure (as opposed to a
 // normal task failure). Matched case-insensitively. Kept deliberately specific
@@ -117,14 +192,9 @@ export class ClaudeManager {
   private questionWatchdogs = new Map<string, NodeJS.Timeout>();
   private questionRecovery = new Map<string, string>();
   private questionRecovered = new Set<string>();
-  private channelProcesses = new Map<
-    string,
-    {
-      process: any;
-      sessionId?: string;
-      discordMessage: any;
-    }
-  >();
+  // One long-lived CLI process per channel, reused across turns. It outlives the
+  // turn that spawned it (see IDLE_KEEPALIVE_MS) so background watchers survive.
+  private channelProcesses = new Map<string, ChannelProcess>();
 
   // Original user messages for reaction updates
   private originalMessages = new Map<string, any>();
@@ -134,6 +204,8 @@ export class ClaudeManager {
 
   // Completion callback
   private onCompleteCallback?: OnCompleteCallback;
+  /** Set by index.ts once the MCP server exists. See setPendingUserPromptProbe. */
+  private pendingUserPrompt?: (channelId: string) => boolean;
 
   // Guard: only fire completion once per run
   private completionNotified = new Set<string>();
@@ -157,22 +229,23 @@ export class ClaudeManager {
   private contextWarned = new Set<string>();
 
   // --- Background-task (Monitor/watcher) tracking ---
-  // Active watcher task IDs per channel. A turn's `result` no longer ends the
-  // process while this set is non-empty; the CLI keeps it alive to deliver
-  // watcher notifications.
-  private channelWatchers = new Map<string, Set<string>>();
-  // Channels whose turn produced a `result` while watchers were still running.
-  private resultSeen = new Set<string>();
-  // Completion status deferred until process close (watcher-holding runs), so we
-  // don't advance the queue — and spawn a second process — while a watcher is live.
-  private pendingCompletion = new Map<string, CompletionStatus>();
-  // Watcher notifications already surfaced to Discord (dedupe): channelId -> task IDs.
+  // Live task IDs are held per process (ChannelProcess.liveTasks), sourced from
+  // the CLI's `background_tasks_changed` message — a full list, so it's
+  // authoritative in a way that counting starts against terminal statuses isn't.
+  //
+  // Watcher notifications already surfaced to Discord, deduped per channel by the
+  // notification's own uuid. Keyed on uuid rather than task id because a Monitor
+  // watcher can legitimately fire many times over its life; deduping by task
+  // would silently swallow every fire after the first.
   private notifiedTasks = new Map<string, Set<string>>();
-  // Channels that have already posted an "init" embed (guards duplicate inits).
+  // Channels that have already posted an "init" embed for their current process.
+  // The CLI re-emits `init` per turn once a session is running, and again for
+  // each watcher-driven turn, so this is per process, not per turn.
   private initPosted = new Set<string>();
 
-  // Channels whose process was spawned in streaming-input mode (stdin held open
-  // so messages can be injected mid-turn via /interrupt and /btw).
+  // Channels whose process was spawned in streaming-input mode (stdin held open,
+  // so prompts can be injected rather than respawned and background tasks live
+  // past the turn). Raw `--` commands and image prompts are the exceptions.
   private streamingChannels = new Set<string>();
 
   // --- API-error auto-resume ---
@@ -219,10 +292,23 @@ export class ClaudeManager {
     }
   }
 
+  /**
+   * Is this channel *busy* — a turn in flight, or about to be?
+   *
+   * Deliberately not "does a process exist": a channel's process now outlives its
+   * turns, so process liveness stopped being a proxy for busy. An entry with no
+   * process yet is a reservation (reserveChannel) and counts, and a channel
+   * waiting out an API-error backoff has no process at all but is logically mid-turn.
+   */
   hasActiveProcess(channelId: string): boolean {
-    // A channel awaiting an API-error retry has no live process but is logically
-    // still busy — report it as active so /kill and /stop can cancel the loop.
-    return this.channelProcesses.has(channelId) || this.apiRetryState.has(channelId);
+    const entry = this.channelProcesses.get(channelId);
+    if (entry && (entry.turnActive || !entry.process)) return true;
+    return this.apiRetryState.has(channelId);
+  }
+
+  /** Is a CLI process alive for this channel, busy or merely being kept warm? */
+  hasLiveProcess(channelId: string): boolean {
+    return !!this.channelProcesses.get(channelId)?.process;
   }
 
   killActiveProcess(channelId: string): void {
@@ -235,7 +321,10 @@ export class ClaudeManager {
     if (activeProcess?.process) {
       console.log(`Killing active process for channel ${channelId}`);
       this.stopTypingIndicator(channelId);
-      activeProcess.process.kill("SIGTERM"); // `close` advances the queue
+      this.clearProcessTimers(activeProcess);
+      // Tree kill, not a bare signal: the CLI's own children (the MCP bridge
+      // above all) would otherwise survive it. `close` still advances the queue.
+      killProcessTree(activeProcess.process, "SIGTERM");
     } else if (wasRetrying) {
       // No live process, but we cancelled a pending retry — release the channel.
       console.log(`Cancelled pending API-error retry for channel ${channelId}`);
@@ -253,7 +342,8 @@ export class ClaudeManager {
         this.stopTypingIndicator(channelId);
         this.questionRecovery.delete(channelId);
         this.clearQuestionWatchdog(channelId);
-        entry.process.kill("SIGTERM");
+        this.clearProcessTimers(entry);
+        killProcessTree(entry.process, "SIGTERM");
         count++;
       }
     }
@@ -270,6 +360,10 @@ export class ClaudeManager {
   }
 
   clearSession(channelId: string): void {
+    // Capture before the kill: we drop the process entry below, so `close` won't
+    // be able to tell whether a turn was riding on it and can't release the queue
+    // on our behalf. Clearing mid-turn has to do that release itself.
+    const turnWasActive = this.hasActiveProcess(channelId);
     this.killActiveProcess(channelId);
     this.stopTypingIndicator(channelId);
     this.db.clearSession(channelId);
@@ -281,15 +375,13 @@ export class ClaudeManager {
     this.channelDiscordContexts.delete(channelId);
     this.workingDirOverrides.delete(channelId);
     this.contextWarned.delete(channelId);
-    this.channelWatchers.delete(channelId);
-    this.resultSeen.delete(channelId);
-    this.pendingCompletion.delete(channelId);
     this.notifiedTasks.delete(channelId);
     this.initPosted.delete(channelId);
     this.streamingChannels.delete(channelId);
     this.cancelApiRetry(channelId);
     this.lastRunParams.delete(channelId);
     this.cleanupTaskThreads(channelId);
+    if (turnWasActive) this.notifyComplete(channelId, "failed");
   }
 
   setDiscordMessage(channelId: string, message: any): void {
@@ -313,9 +405,24 @@ export class ClaudeManager {
     this.onCompleteCallback = callback;
   }
 
-  private handleProcessTimeout(channelId: string, process: any): void {
+  /**
+   * Teach the hang reaper what "blocked on the user" looks like.
+   *
+   * A function rather than the PermissionManager itself: the permission side
+   * already holds a reference to this manager (for question-answer recovery),
+   * and handing it back would close the loop into a cycle for the sake of one
+   * boolean. Optional, so the manager still works with no MCP server attached —
+   * as it does in tests.
+   */
+  setPendingUserPromptProbe(probe: (channelId: string) => boolean): void {
+    this.pendingUserPrompt = probe;
+  }
+
+  // `proc`, not `process`: the global is one careless rename away from a tree
+  // kill aimed at the bot itself.
+  private handleProcessTimeout(channelId: string, proc: any): void {
     console.log(`Claude process timed out (inactivity) for channel ${channelId}, killing it`);
-    try { process.kill("SIGTERM"); } catch {}
+    try { proc.kill("SIGTERM"); } catch {}
 
     const channel = this.channelMessages.get(channelId)?.channel;
     if (channel) {
@@ -333,9 +440,7 @@ export class ClaudeManager {
     // force-advance the queue ourselves. notifyComplete is idempotent (guarded
     // by completionNotified), so a normal `close` in this window makes the
     // fallback a harmless no-op.
-    setTimeout(() => {
-      try { process.kill("SIGKILL"); } catch {}
-    }, 10_000);
+    setTimeout(() => killProcessTree(proc, "SIGKILL"), 10_000);
 
     setTimeout(() => {
       if (this.completionNotified.has(channelId)) return; // `close` already advanced us
@@ -345,11 +450,187 @@ export class ClaudeManager {
       );
       this.channelProcesses.delete(channelId);
       this.streamingChannels.delete(channelId);
-      this.channelWatchers.delete(channelId);
-      this.resultSeen.delete(channelId);
-      this.pendingCompletion.delete(channelId);
       this.notifyComplete(channelId, "failed");
     }, 20_000);
+  }
+
+  // --- Turn and process lifecycle ---
+  //
+  // A turn and a process are no longer the same thing. A turn runs from handing
+  // the CLI a prompt to that prompt's `result`; the process outlives it, hosting
+  // the session for the next prompt and — the reason any of this exists — for
+  // background watchers that fire long after the turn ended.
+
+  /** Mark the start of a turn on this channel's (already reserved) process. */
+  private beginTurn(channelId: string, channelName: string): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry) return;
+    if (entry.turnActive) return;
+    entry.turnActive = true;
+    this.clearIdleTimer(entry);
+    this.db.markRunStarted(channelId, channelName);
+    this.startTypingIndicator(channelId);
+    this.armInactivityReaper(channelId);
+  }
+
+  /**
+   * The turn's `result` landed. Release the channel and leave the process up.
+   *
+   * The queue used to be released at process close, precisely so a second process
+   * couldn't be spawned for a channel while the first was still around. Now
+   * "still around" is the normal state, so the release moves to the turn boundary
+   * and the next prompt is injected into the same process instead.
+   */
+  private endTurn(channelId: string, status: CompletionStatus): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (entry) {
+      entry.turnActive = false;
+      this.clearInactivityTimer(entry);
+    }
+    this.notifyComplete(channelId, status);
+    this.armIdleShutdown(channelId);
+  }
+
+  private clearIdleTimer(entry: ChannelProcess): void {
+    if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = undefined; }
+  }
+
+  private clearInactivityTimer(entry: ChannelProcess): void {
+    if (entry.inactivityTimer) { clearTimeout(entry.inactivityTimer); entry.inactivityTimer = undefined; }
+  }
+
+  private clearProcessTimers(entry: ChannelProcess): void {
+    this.clearIdleTimer(entry);
+    this.clearInactivityTimer(entry);
+  }
+
+  /**
+   * Start (or restart) the idle countdown on a process with no turn in flight.
+   * Any output pushes it back, so a watcher-driven turn — which we never "began",
+   * because no prompt of ours started it — isn't cut off half-way through.
+   */
+  private armIdleShutdown(channelId: string): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry?.process || entry.turnActive || entry.shuttingDown) return;
+    this.clearIdleTimer(entry);
+    entry.idleTimer = setTimeout(() => this.onIdleExpiry(channelId), IDLE_KEEPALIVE_MS);
+  }
+
+  private onIdleExpiry(channelId: string): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry?.process) return;
+    if (entry.turnActive) return; // a turn started under us; endTurn re-arms
+
+    const heldFor = Date.now() - entry.startedAt;
+    if (entry.liveTasks.size > 0 && heldFor < MAX_TASK_HOLD_MS) {
+      console.log(
+        `Channel ${channelId} idle but holding ${entry.liveTasks.size} background task(s) — ` +
+        `keeping the session process alive (held ${humanizeMs(heldFor)})`
+      );
+      entry.idleTimer = setTimeout(() => this.onIdleExpiry(channelId), IDLE_KEEPALIVE_MS);
+      return;
+    }
+    if (entry.liveTasks.size > 0) {
+      console.log(
+        `Channel ${channelId} hit the ${humanizeMs(MAX_TASK_HOLD_MS)} background-task hold cap ` +
+        `with ${entry.liveTasks.size} still live — retiring the session process anyway`
+      );
+    }
+    void this.shutdownProcess(channelId, "idle");
+  }
+
+  /**
+   * Retire a channel's process. stdin EOF is the front door: the CLI drains, tears
+   * down its own background tasks and exits 0. SIGTERM is the escalation.
+   *
+   * Resolves once the process is actually gone, so a caller respawning for this
+   * channel can't end up with two CLIs writing the same session transcript.
+   */
+  private shutdownProcess(channelId: string, reason: string): Promise<void> {
+    const entry = this.channelProcesses.get(channelId);
+    const proc = entry?.process;
+    if (!entry || !proc) {
+      if (entry) this.channelProcesses.delete(channelId);
+      return Promise.resolve();
+    }
+
+    entry.shuttingDown = true;
+    this.clearProcessTimers(entry);
+    console.log(`Retiring session process for channel ${channelId} (${reason})`);
+
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      let escalation: ReturnType<typeof setTimeout> | undefined;
+      let hardStop: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (escalation) clearTimeout(escalation);
+        if (hardStop) clearTimeout(hardStop);
+        if (this.channelProcesses.get(channelId)?.process === proc) {
+          this.channelProcesses.delete(channelId);
+        }
+        resolve();
+      };
+
+      proc.once("close", finish);
+      try { proc.stdin.end(); } catch {}
+
+      escalation = setTimeout(() => {
+        console.log(`Channel ${channelId} process ignored stdin EOF — escalating to SIGTERM`);
+        try { proc.kill("SIGTERM"); } catch {}
+        hardStop = setTimeout(() => {
+          // Never resolve on a process that might still be alive: the caller's
+          // next move is usually to spawn a replacement onto the same session.
+          // By here it has declined both EOF and SIGTERM, so take the tree.
+          killProcessTree(proc, "SIGKILL");
+          finish();
+        }, 3000);
+      }, SHUTDOWN_GRACE_MS);
+    });
+  }
+
+  /**
+   * The no-output reaper, armed only while a turn is in flight. An idle process is
+   * *supposed* to be silent, so silence is only evidence of a hang mid-turn.
+   */
+  private armInactivityReaper(channelId: string): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry?.process || !entry.turnActive) return;
+    this.clearInactivityTimer(entry);
+    entry.inactivityTimer = setTimeout(() => this.onInactivity(channelId), INACTIVITY_MS);
+  }
+
+  private onInactivity(channelId: string): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry?.process || !entry.turnActive) return;
+
+    // Silence is only evidence of a hang if nothing is legitimately being waited
+    // on. Two things are, and neither shows up as output:
+    //
+    // - a background task the turn is blocked on (`liveTasks`)
+    // - the user, on a question or a tool approval. A multi-question
+    //   AskUserQuestion hands each question its own fresh window, but the answers
+    //   only reach the CLI once *all* of them are in, so stdout stays silent for
+    //   the whole sitting — long enough, with a few questions, to be reaped while
+    //   the question is still on screen waiting to be clicked.
+    //
+    // Both re-arm rather than reap, bounded by the same absolute hold cap so a
+    // wait that never ends can't pin the process open forever.
+    const waitingOn = entry.liveTasks.size > 0
+      ? `${entry.liveTasks.size} background task(s)`
+      : this.pendingUserPrompt?.(channelId)
+        ? "the user"
+        : undefined;
+
+    if (waitingOn && Date.now() - entry.startedAt < MAX_TASK_HOLD_MS) {
+      console.log(
+        `Inactivity window elapsed in channel ${channelId} but it's waiting on ${waitingOn}; not reaping`
+      );
+      entry.inactivityTimer = setTimeout(() => this.onInactivity(channelId), INACTIVITY_MS);
+      return;
+    }
+    this.handleProcessTimeout(channelId, entry.process);
   }
 
   private notifyComplete(channelId: string, status: CompletionStatus): void {
@@ -644,21 +925,25 @@ export class ClaudeManager {
     sessionId: string | undefined,
     discordMessage: any
   ): void {
-    // Kill any existing process (safety measure)
-    const existingProcess = this.channelProcesses.get(channelId);
-    if (existingProcess?.process) {
-      console.log(
-        `Killing existing process for channel ${channelId} before starting new one`
-      );
-      existingProcess.process.kill("SIGTERM");
+    const existing = this.channelProcesses.get(channelId);
+    if (existing) {
+      // Point the existing process at the new turn rather than killing it. Killing
+      // here is what used to take a session's background watchers down with it —
+      // and it's unnecessary, since runClaudeCode either injects into this process
+      // or retires it deliberately when the spawn args have to change.
+      existing.sessionId = sessionId;
+      existing.discordMessage = discordMessage;
+    } else {
+      // Reserve the channel with a placeholder entry (prevents race conditions).
+      this.channelProcesses.set(channelId, {
+        process: null, // Will be set when the process actually starts
+        sessionId,
+        discordMessage,
+        turnActive: false,
+        liveTasks: new Set(),
+        startedAt: 0,
+      });
     }
-
-    // Reserve the channel by adding a placeholder entry (prevents race conditions)
-    this.channelProcesses.set(channelId, {
-      process: null, // Will be set when process actually starts
-      sessionId,
-      discordMessage,
-    });
 
     // Reset completion guard for new run
     this.completionNotified.delete(channelId);
@@ -691,8 +976,13 @@ export class ClaudeManager {
    */
   injectMessage(channelId: string, text: string, mode: "interrupt" | "btw" = "interrupt"): boolean {
     if (!this.streamingChannels.has(channelId)) return false;
-    const process = this.channelProcesses.get(channelId)?.process;
+    const entry = this.channelProcesses.get(channelId);
+    const process = entry?.process;
     if (!process) return false;
+    // Only mid-turn. The process is now kept alive between turns too, and writing
+    // into an idle one would start a turn nothing is tracking — a plain message
+    // is the way to start work, and it goes through the queue like everything else.
+    if (!entry!.turnActive) return false;
 
     const content = mode === "btw"
       ? `By the way — a quick side question. Answer it briefly and then continue your current task without abandoning it: ${text}`
@@ -740,6 +1030,25 @@ export class ClaudeManager {
       console.error("Error sending interrupt control_request to stdin:", error);
       return false;
     }
+  }
+
+  /**
+   * Stop a session process that has no turn in flight but is being held open for
+   * background watchers — the "I've seen enough, stop waiting" case.
+   *
+   * Sends the interrupt first (in case the CLI is mid-way through a watcher-driven
+   * turn of its own, which we never began and so don't count as active), then
+   * retires the process. stdin EOF is the graceful door: the CLI tears its own
+   * background tasks down and exits 0, and the session is preserved for the next
+   * message, exactly as with a turn-level /stop.
+   */
+  async stopIdleSession(channelId: string): Promise<boolean> {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry?.process || entry.turnActive) return false;
+    console.log(`Stopping idle session process for channel ${channelId} on request`);
+    this.interruptSession(channelId);
+    await this.shutdownProcess(channelId, "stopped by user");
+    return true;
   }
 
   getSessionId(channelId: string): string | undefined {
@@ -983,10 +1292,44 @@ export class ClaudeManager {
     this.channelRunModel.set(channelId, model);
     const planMode = this.isPlanMode(channelId);
 
-    // Use streaming-input mode for normal text prompts so stdin stays open and
-    // /interrupt and /btw can inject messages mid-turn. Raw CLI commands and
-    // image messages keep the legacy -p path (stdin closed).
+    // Use streaming-input mode for normal text prompts so stdin stays open. That
+    // buys three things: /interrupt and /btw can inject mid-turn, later prompts
+    // reuse this process instead of paying for a `--resume`, and — the load-bearing
+    // one — background watchers survive the turn instead of being torn down 5s
+    // after its result. Raw CLI commands and image messages can't do any of it:
+    // their content lives in argv (`--image`, bare CLI args), not in a stream-json
+    // message, so they keep the legacy -p path with stdin closed.
     const streaming = !isRawCommand(prompt) && (!imageUrls || imageUrls.length === 0);
+    const spec: ProcessSpec = { model, planMode, workingDir };
+
+    // Reuse the channel's existing process when it can carry this turn. Anything
+    // baked into argv at spawn — model, plan mode, cwd — has to match, or the turn
+    // would silently run under the previous one's settings; and it has to be in
+    // the session this turn is for, or the prompt lands in the wrong conversation.
+    const live = this.channelProcesses.get(channelId);
+    const canReuse = streaming
+      && !!live?.process
+      && !live.turnActive
+      && !live.shuttingDown
+      && sameSpec(live.spec, spec)
+      && live.runningSessionId === sessionId;
+    if (canReuse) {
+      this.beginTurn(channelId, channelName);
+      if (this.writeUserMessage(live.process, prompt)) {
+        console.log(`Injected prompt into the live session process for channel ${channelId}`);
+        return;
+      }
+      // stdin died under us — fall through and respawn rather than lose the turn.
+      console.error(`Live process for channel ${channelId} refused input; respawning`);
+    }
+
+    // Retire whatever's there before spawning: two CLIs writing the same session
+    // transcript at once would interleave the conversation.
+    if (live?.process) {
+      await this.shutdownProcess(channelId, sameSpec(live.spec, spec) ? "prompt needs a fresh process" : "spawn args changed");
+      this.reserveChannel(channelId, sessionId, this.channelMessages.get(channelId));
+    }
+
     if (streaming) {
       this.streamingChannels.add(channelId);
     } else {
@@ -1004,17 +1347,21 @@ export class ClaudeManager {
 
     console.log(`Claude process spawned with PID: ${claude.pid}`);
 
-    // Track this run for crash recovery
-    this.db.markRunStarted(channelId, channelName);
-
     // Update the channel process tracking with actual process
     const channelProcess = this.channelProcesses.get(channelId);
     if (channelProcess) {
       channelProcess.process = claude;
+      channelProcess.spec = spec;
+      channelProcess.startedAt = Date.now();
+      channelProcess.liveTasks = new Set();
+      channelProcess.shuttingDown = false;
     }
+    // A fresh process gets a fresh "Session Started" embed and a fresh watcher
+    // notification ledger.
+    this.initPosted.delete(channelId);
+    this.notifiedTasks.delete(channelId);
 
-    // Start typing indicator
-    this.startTypingIndicator(channelId);
+    this.beginTurn(channelId, channelName);
 
     if (streaming) {
       // Deliver the initial prompt as a stream-json user message and keep stdin
@@ -1036,32 +1383,14 @@ export class ClaudeManager {
 
     let buffer = "";
 
-    // Inactivity timeout: kill if no stdout for 10 minutes (resets on each output).
-    // Long / slow API turns can go quiet for minutes at a time — especially when
-    // Anthropic is overloaded — so keep this generous to avoid reaping a turn that
-    // is merely slow rather than wedged. While a watcher (Monitor) is running, the
-    // process is *expected* to sit quiet — don't reap it; re-arm instead, bounded
-    // by an absolute hold cap so a stuck watcher can't pin a process open forever.
-    const INACTIVITY_MS = 10 * 60 * 1000;
-    const MAX_WATCHER_HOLD_MS = 30 * 60 * 1000;
-    const runStartedAt = Date.now();
-    const onInactivity = () => {
-      if (this.hasActiveWatchers(channelId) && Date.now() - runStartedAt < MAX_WATCHER_HOLD_MS) {
-        const count = this.channelWatchers.get(channelId)?.size ?? 0;
-        console.log(`Inactivity window elapsed but ${count} watcher(s) active in channel ${channelId}; not reaping`);
-        timeout = setTimeout(onInactivity, INACTIVITY_MS);
-        return;
-      }
-      this.handleProcessTimeout(channelId, claude);
-    };
-    let timeout = setTimeout(onInactivity, INACTIVITY_MS);
-    const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(onInactivity, INACTIVITY_MS);
-    };
-
     claude.stdout.on("data", (data) => {
-      resetTimeout();
+      // Output means the process is alive and doing something: push back whichever
+      // clock is running — the mid-turn hang reaper, or the idle countdown. The
+      // latter matters for watcher-driven turns, which we never "began" and so
+      // would otherwise be racing a shutdown timer armed before they started.
+      const entry = this.channelProcesses.get(channelId);
+      if (entry?.turnActive) this.armInactivityReaper(channelId);
+      else if (entry) this.armIdleShutdown(channelId);
       // Any output at all means the CLI digested the question answers and is
       // moving again — the post-answer watchdog has nothing to catch.
       this.clearQuestionWatchdog(channelId);
@@ -1081,6 +1410,14 @@ export class ClaudeManager {
           try {
             const parsed: SDKMessage = JSON.parse(line);
             console.log("Parsed message type:", parsed.type);
+
+            // Remember the session the CLI says it's actually in. It gates reusing
+            // this process for the next prompt, so a channel repointed at another
+            // session (/resume, /adopt) can't have its turn land in the old one.
+            if (parsed.session_id) {
+              const procEntry = this.channelProcesses.get(channelId);
+              if (procEntry?.process === claude) procEntry.runningSessionId = parsed.session_id;
+            }
 
             // Flag Claude/Anthropic API errors so the turn is auto-resumed on close.
             // Precise on purpose: only CLI-synthesized assistant messages
@@ -1115,50 +1452,39 @@ export class ClaudeManager {
             } else if (parsed.type === "rate_limit_event") {
               this.handleRateLimitEvent(channelId, parsed).catch(console.error);
             } else if (parsed.type === "result") {
-              this.handleResultMessage(channelId, parsed).then(() => {
-                if (this.hasActiveWatchers(channelId)) {
-                  // A turn's `result` is not the end of the process when a Monitor
-                  // watcher is still running — keep it alive to deliver the watcher's
-                  // notification. It exits on its own once watchers finish.
-                  this.resultSeen.add(channelId);
-                  const count = this.channelWatchers.get(channelId)?.size ?? 0;
-                  console.log(`Result received; ${count} watcher(s) active in channel ${channelId} — keeping process alive`);
-                  resetTimeout();
-                } else if (this.streamingChannels.has(channelId)) {
-                  // Streaming input: close stdin (EOF) so the process drains any
-                  // injected messages still queued and exits gracefully. Completion
-                  // was deferred and fires on close. Keep the reaper armed as a backstop.
-                  console.log(`Result received in streaming channel ${channelId}; closing stdin for graceful exit`);
-                  try { claude.stdin.end(); } catch {}
-                  resetTimeout();
-                } else {
-                  clearTimeout(timeout);
-                  claude.kill("SIGTERM");
-                  this.channelProcesses.delete(channelId);
+              // A result whose origin is a task notification belongs to a turn the
+              // CLI started by itself, when a background watcher fired. Nobody is
+              // waiting on it: no queue slot to release, no reaction to flip.
+              const watcherTurn = parsed.origin?.kind === "task-notification";
+              this.handleResultMessage(channelId, parsed, watcherTurn).then(() => {
+                if (this.apiErrorThisRun.has(channelId)) {
+                  // The turn died at the API layer. Retire the process so `close`
+                  // can schedule the resume; the queue stays held until it lands.
+                  const entry = this.channelProcesses.get(channelId);
+                  if (entry) this.clearProcessTimers(entry);
+                  try { claude.kill("SIGTERM"); } catch {}
+                  return;
                 }
+                if (watcherTurn) {
+                  this.armIdleShutdown(channelId);
+                  return;
+                }
+                this.endTurn(channelId, parsed.subtype === "success" ? "success" : "partial");
               }).catch(console.error);
             } else if (parsed.type === "system") {
               console.log("System message:", parsed.subtype);
               if (parsed.subtype === "init") {
                 this.handleInitMessage(channelId, parsed).catch(console.error);
+              } else if (parsed.subtype === "background_tasks_changed") {
+                // The authoritative live-task list. Everything that decides whether
+                // to keep this process alive reads it.
+                this.updateLiveTasks(channelId, parsed.tasks);
               } else if (
                 parsed.subtype === "task_started" ||
                 parsed.subtype === "task_notification" ||
                 parsed.subtype === "task_updated"
               ) {
-                this.handleTaskMessage(channelId, parsed).then(() => {
-                  // If the turn already finished and all watchers have now drained,
-                  // re-arm the (now watcher-less) reaper as a backstop and let the
-                  // process exit. A streaming-input process won't exit until stdin
-                  // closes, so send EOF here.
-                  if (this.resultSeen.has(channelId) && !this.hasActiveWatchers(channelId)) {
-                    console.log(`All watchers drained after result in channel ${channelId}; closing input and awaiting exit`);
-                    if (this.streamingChannels.has(channelId)) {
-                      try { claude.stdin.end(); } catch {}
-                    }
-                    resetTimeout();
-                  }
-                }).catch(console.error);
+                this.handleTaskMessage(channelId, parsed).catch(console.error);
               }
               const channelName = this.channelNames.get(channelId) || "default";
               this.db.setSession(channelId, parsed.session_id, channelName, this.channelRunModel.get(channelId));
@@ -1172,11 +1498,34 @@ export class ClaudeManager {
 
     claude.on("close", (code) => {
       console.log(`Claude process exited with code ${code}`);
-      clearTimeout(timeout);
       this.clearQuestionWatchdog(channelId);
       this.stopTypingIndicator(channelId);
-      // Ensure cleanup on process close
-      this.channelProcesses.delete(channelId);
+
+      // Capture before teardown: whether a turn was riding on this process decides
+      // whether anything downstream is owed a completion at all.
+      const entry = this.channelProcesses.get(channelId);
+      const ours = entry?.process === claude;
+      const turnActive = ours ? entry!.turnActive : false;
+      const deliberate = ours ? !!entry!.shuttingDown : false;
+      // Only tear down channel state if this is still *the* process. A stale exit
+      // (the entry already replaced, or dropped by /clear) must not wipe state
+      // belonging to whatever took its place.
+      if (ours) {
+        this.clearProcessTimers(entry!);
+        this.channelProcesses.delete(channelId);
+        this.notifiedTasks.delete(channelId);
+        this.initPosted.delete(channelId);
+        this.streamingChannels.delete(channelId);
+      }
+
+      if (deliberate) {
+        // We retired this process on purpose (idle, or its spawn args no longer
+        // fit the next turn). Whoever asked for it owns what happens next — in
+        // particular, a respawn is usually already waiting on this `close`, and
+        // failing the turn here would release its queue slot out from under it.
+        console.log(`Channel ${channelId} session process retired cleanly (code ${code})`);
+        return;
+      }
 
       // Question-hang recovery: this run was killed because it went silent after
       // an AskUserQuestion was answered. Resume the session replaying the answers
@@ -1186,28 +1535,15 @@ export class ClaudeManager {
       if (questionAnswers !== undefined) {
         this.questionRecovery.delete(channelId);
         this.apiErrorThisRun.delete(channelId);
-        this.channelWatchers.delete(channelId);
-        this.resultSeen.delete(channelId);
-        this.pendingCompletion.delete(channelId);
-        this.notifiedTasks.delete(channelId);
-        this.initPosted.delete(channelId);
-        this.streamingChannels.delete(channelId);
         this.retryTurn(channelId, this.buildQuestionReplayPrompt(questionAnswers));
         return;
       }
 
       // API-error auto-resume: if this run hit an API error, don't finalize the
-      // turn. Reset the per-run streaming/watcher state (the resumed run rebuilds
-      // it) and schedule the next resume with escalating backoff. We intentionally
+      // turn — schedule the next resume with escalating backoff. We intentionally
       // do NOT call notifyComplete, so the queue stays held and no new turn starts.
       if (this.apiErrorThisRun.has(channelId)) {
         this.apiErrorThisRun.delete(channelId);
-        this.channelWatchers.delete(channelId);
-        this.resultSeen.delete(channelId);
-        this.pendingCompletion.delete(channelId);
-        this.notifiedTasks.delete(channelId);
-        this.initPosted.delete(channelId);
-        this.streamingChannels.delete(channelId);
         this.scheduleApiRetry(channelId);
         return;
       }
@@ -1215,29 +1551,21 @@ export class ClaudeManager {
       // error starts again at 10s.
       this.apiRetryState.delete(channelId);
 
-      // Did the turn already succeed? (completion fired at result, or was deferred
-      // because watchers were holding the process open). Capture before notifying.
-      const deferred = this.pendingCompletion.get(channelId);
-      const turnSucceeded =
-        this.resultSeen.has(channelId) ||
-        deferred !== undefined ||
-        this.completionNotified.has(channelId);
+      if (!turnActive) {
+        // The process was between turns — idle, or hosting only background work.
+        // Its turn already completed and released the queue, so there is nothing
+        // to finalize and nothing to apologise for; the next prompt spawns afresh.
+        if (!deliberate) {
+          console.log(`Channel ${channelId} session process exited between turns (code ${code})`);
+        }
+        return;
+      }
 
-      // Advance the queue. For watcher-holding runs this is where completion
-      // actually fires (deferred from `result`); otherwise it's the crash
-      // fallback. notifyComplete is guarded, so an earlier success wins.
-      this.notifyComplete(channelId, deferred ?? "failed");
+      // A turn was in flight and the process died under it. notifyComplete is
+      // guarded, so if the result had already landed this is a harmless no-op.
+      const turnSucceeded = this.completionNotified.has(channelId);
+      this.notifyComplete(channelId, "failed");
 
-      // Clean up watcher/streaming state for this run
-      this.channelWatchers.delete(channelId);
-      this.resultSeen.delete(channelId);
-      this.pendingCompletion.delete(channelId);
-      this.notifiedTasks.delete(channelId);
-      this.initPosted.delete(channelId);
-      this.streamingChannels.delete(channelId);
-
-      // Only surface an exit-code error if the turn didn't already complete
-      // successfully — a non-zero exit during watcher teardown is not a failure.
       if (code !== 0 && code !== null && !turnSucceeded) {
         const channel = this.channelMessages.get(channelId)?.channel;
         if (channel) {
@@ -1291,11 +1619,14 @@ export class ClaudeManager {
 
     claude.on("error", (error) => {
       console.error("Claude process error:", error);
-      clearTimeout(timeout);
       this.stopTypingIndicator(channelId);
 
       // Clean up process tracking on error
-      this.channelProcesses.delete(channelId);
+      const entry = this.channelProcesses.get(channelId);
+      if (entry?.process === claude) {
+        this.clearProcessTimers(entry);
+        this.channelProcesses.delete(channelId);
+      }
 
       // Notify completion on error
       this.notifyComplete(channelId, "failed");
@@ -1317,8 +1648,9 @@ export class ClaudeManager {
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
 
-    // The CLI can re-emit `init` mid-run (e.g. after watchers tear down). Only
-    // post the "Session Started" embed once per run.
+    // The CLI emits `init` per turn once a session is running, and again for each
+    // watcher-driven turn it starts by itself. Post the "Session Started" embed
+    // once per *process*, which is what the user actually cares about.
     if (this.initPosted.has(channelId)) return;
     this.initPosted.add(channelId);
 
@@ -1374,9 +1706,27 @@ export class ClaudeManager {
     }
   }
 
-  /** True while one or more Monitor/watcher tasks are running for this channel. */
+  /** True while one or more background tasks (Monitor, background shells) run. */
   hasActiveWatchers(channelId: string): boolean {
-    return (this.channelWatchers.get(channelId)?.size ?? 0) > 0;
+    return (this.channelProcesses.get(channelId)?.liveTasks.size ?? 0) > 0;
+  }
+
+  /**
+   * Adopt the CLI's `background_tasks_changed` list wholesale. It's a full
+   * snapshot, which makes it authoritative in a way that counting `task_started`
+   * against terminal statuses never was — a status we don't recognise used to
+   * strand a task in the set forever, holding the process open with it.
+   */
+  private updateLiveTasks(channelId: string, tasks: any): void {
+    const entry = this.channelProcesses.get(channelId);
+    if (!entry) return;
+    const ids = new Set<string>(
+      Array.isArray(tasks) ? tasks.map((t: any) => t?.task_id).filter(Boolean) : []
+    );
+    if (ids.size !== entry.liveTasks.size) {
+      console.log(`Channel ${channelId}: ${ids.size} background task(s) live`);
+    }
+    entry.liveTasks = ids;
   }
 
   private readonly TERMINAL_TASK_STATUSES = new Set([
@@ -1384,53 +1734,53 @@ export class ClaudeManager {
   ]);
 
   /**
-   * Handle a background-task (Monitor) lifecycle event: maintain the per-channel
-   * watcher set and surface notifications to Discord.
+   * Handle a background-task lifecycle event: keep the live set honest (belt and
+   * braces alongside `background_tasks_changed`) and surface notifications.
    */
   private async handleTaskMessage(channelId: string, parsed: any): Promise<void> {
     const taskId = parsed.task_id;
     if (!taskId) return;
 
-    let watchers = this.channelWatchers.get(channelId);
-    if (!watchers) {
-      watchers = new Set<string>();
-      this.channelWatchers.set(channelId, watchers);
-    }
+    const entry = this.channelProcesses.get(channelId);
 
     if (parsed.subtype === "task_started") {
-      watchers.add(taskId);
-      console.log(`Watcher started (task ${taskId}); ${watchers.size} active in channel ${channelId}`);
+      entry?.liveTasks.add(taskId);
+      console.log(`Background task started (${taskId}) in channel ${channelId}`);
       return;
     }
 
-    // A user-facing notification — post it (deduped) to Discord.
+    // A user-facing notification — post it (deduped) to Discord. The CLI then
+    // wakes itself for a follow-up turn, which streams in as normal output; this
+    // embed is just the heads-up that something fired.
     if (parsed.subtype === "task_notification") {
       await this.postWatcherNotification(channelId, parsed);
     }
 
-    // Remove from the active set once the task reaches a terminal status.
     const status: string | undefined = parsed.status || parsed.patch?.status;
-    if (status && this.TERMINAL_TASK_STATUSES.has(status) && watchers.has(taskId)) {
-      watchers.delete(taskId);
-      console.log(`Watcher finished (task ${taskId}, status ${status}); ${watchers.size} remaining in channel ${channelId}`);
+    if (status && this.TERMINAL_TASK_STATUSES.has(status)) {
+      entry?.liveTasks.delete(taskId);
     }
   }
 
   /**
    * Post a watcher's notification to Discord. Reads the task's output file (the
    * CLI hands us a path rather than inline content) and includes its tail.
-   * Deduped per task — in normal operation a watcher fires a single notification.
+   *
+   * Deduped on the notification's own uuid, not the task id: a Monitor watcher
+   * can legitimately fire many times over its life, and keying on the task would
+   * silently swallow every fire after the first.
    */
   private async postWatcherNotification(channelId: string, parsed: any): Promise<void> {
     const taskId = parsed.task_id;
     if (!taskId) return;
+    const notificationKey: string = parsed.uuid || `${taskId}:${parsed.status ?? ""}`;
 
     let notified = this.notifiedTasks.get(channelId);
     if (!notified) {
       notified = new Set<string>();
       this.notifiedTasks.set(channelId, notified);
     }
-    if (notified.has(taskId)) return;
+    if (notified.has(notificationKey)) return;
 
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
@@ -1448,7 +1798,7 @@ export class ClaudeManager {
     // Nothing meaningful to show — wait for a richer notification.
     if (!body && !parsed.summary) return;
 
-    notified.add(taskId);
+    notified.add(notificationKey);
 
     const description = [parsed.summary, body && "```\n" + body + "\n```"]
       .filter(Boolean)
@@ -1678,13 +2028,24 @@ export class ClaudeManager {
     }
   }
 
+  /**
+   * A turn finished. `watcherTurn` marks the ones the CLI started by itself after
+   * a background watcher fired: they carry no prompt of the user's, so they're
+   * reported differently and are never charged against the last prompt.
+   */
   private async handleResultMessage(
     channelId: string,
-    parsed: SDKMessage & { type: "result" }
+    parsed: SDKMessage & { type: "result" },
+    watcherTurn = false
   ): Promise<void> {
     console.log("Result message:", parsed);
     const channelName = this.channelNames.get(channelId) || "default";
     this.db.setSession(channelId, parsed.session_id, channelName, this.channelRunModel.get(channelId));
+
+    if (watcherTurn) {
+      await this.reportWatcherTurn(channelId, parsed);
+      return;
+    }
 
     // Persist summary for /status dashboard
     const summary = parsed.subtype === "success" && "result" in parsed ? parsed.result : `Failed: ${parsed.subtype}`;
@@ -1766,17 +2127,10 @@ export class ClaudeManager {
         .setColor(0xFF0000); // Red for failure
     }
 
-    // Notify completion early so the close handler doesn't race and mark it as
-    // failed. But if a watcher is still running — or the process is in streaming
-    // mode and we're about to close stdin for a graceful exit — defer until the
-    // process actually closes. Advancing the queue now could spawn a second
-    // process for this channel (two writers on the same session).
-    if (this.hasActiveWatchers(channelId) || this.streamingChannels.has(channelId)) {
-      this.pendingCompletion.set(channelId, success ? "success" : "partial");
-      console.log(`Deferring completion for channel ${channelId} until process close (watchers/streaming active)`);
-    } else {
-      this.notifyComplete(channelId, success ? "success" : "partial");
-    }
+    // Completion (and the queue release with it) is the caller's job — see
+    // endTurn. It used to fire from here so the close handler couldn't race it,
+    // but the process no longer closes at the end of a turn, so there's nothing
+    // left to race and the release belongs at the turn boundary proper.
 
     // Add prompt link to result embed
     const originalMsg = this.originalMessages.get(channelId);
@@ -1806,6 +2160,60 @@ export class ClaudeManager {
     }
 
     console.log("Got result message, cleaning up process tracking");
+  }
+
+  /**
+   * Report a turn the CLI ran on its own after a background watcher fired.
+   *
+   * It isn't a prompt, so it gets no `prompt_costs` row (the dashboard's prompt
+   * count means "prompts that finished", and this finished without one) and it
+   * never touches the last prompt's reactions or queue slot. Its spend is real,
+   * though, so it still lands on the session total.
+   *
+   * Frequently there's nothing to say — the CLI acknowledges a notification with
+   * an empty zero-turn result — and a "Session Complete" embed for that is pure
+   * noise, so those are dropped.
+   */
+  private async reportWatcherTurn(
+    channelId: string,
+    parsed: SDKMessage & { type: "result" }
+  ): Promise<void> {
+    const cost = parsed.total_cost_usd ?? 0;
+    if (cost > 0) this.db.addSessionCost(channelId, cost);
+
+    const text = ("result" in parsed && typeof parsed.result === "string" ? parsed.result : "").trim();
+    console.log(`Watcher-driven turn completed in channel ${channelId} (${parsed.num_turns} turns, $${cost.toFixed(4)})`);
+    if (!text) return;
+
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+
+    const EMBED_LIMIT = 4096;
+    const suffix = `\n\n*Watcher follow-up · ${parsed.num_turns} turn${parsed.num_turns === 1 ? "" : "s"} · $${cost.toFixed(4)}*`;
+    let description = text;
+    let fileAttachment: AttachmentBuilder | undefined;
+    if (description.length + suffix.length > EMBED_LIMIT) {
+      fileAttachment = new AttachmentBuilder(Buffer.from(description, "utf-8"), { name: "watcher-response.md" });
+      description = description.slice(0, EMBED_LIMIT - suffix.length - 40) + "\n\n*(truncated — see attached file)*";
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle("🔔 Watcher — Claude followed up")
+      .setDescription(description + suffix)
+      .setColor(0x5865F2);
+
+    // The user isn't necessarily looking at the channel — a watcher firing is
+    // exactly the case where a mention is warranted, unlike the raw notification.
+    const discordContext = this.channelDiscordContexts.get(channelId);
+    try {
+      await channel.send({
+        content: discordContext ? `<@${discordContext.userId}>` : undefined,
+        embeds: [embed],
+        files: fileAttachment ? [fileAttachment] : [],
+      });
+    } catch (error) {
+      console.error("Error sending watcher follow-up message:", error);
+    }
   }
 
   /**

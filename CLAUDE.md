@@ -36,6 +36,66 @@ This bot runs Claude Code sessions on different projects based on Discord channe
 - Shows the last 3 streamed responses in each message
 - Use `/clear` slash command to reset a session
 
+### One process per channel, not one per turn
+
+A channel's Claude CLI process outlives the turn that spawned it. It is a *session
+host*: prompts are written into its stdin as `stream-json` user messages, and it
+stays up between turns.
+
+This is not a caching trick — it's the only way background work survives. **The CLI
+tears down every background task (`Monitor`, `run_in_background` shells) about 5
+seconds after a turn's `result` if stdin has reached EOF.** Hold stdin open and the
+same task runs to completion, fires its `task_notification`, and the CLI wakes
+*itself* for a follow-up turn (`result.origin.kind === "task-notification"`). Before
+this, the bot closed stdin at the result, so the "🔔 Watcher" message you saw was
+the tombstone of a watcher the bot had just killed, never a watcher firing.
+
+Consequences that shape the rest of the design:
+
+- **The queue releases at `result`, not at process close.** Close used to be the
+  release point precisely so a second process couldn't be spawned for a channel
+  while the first lived; now "still alive" is the normal state, so the boundary
+  moves to the turn.
+- **`hasActiveProcess` means "a turn is in flight"**, not "a process exists". The
+  two stopped being the same thing. `hasLiveProcess` is the other question.
+- **A turn respawns instead of injecting when spawn args change** — model, plan
+  mode, or working directory, all of which live in argv. The old process is retired
+  first (stdin EOF, then SIGTERM, then SIGKILL) and the respawn *waits* for it: two
+  CLIs writing one session transcript would interleave the conversation. The MCP
+  config is not in that list — it's keyed on channel, and the message id baked into
+  it isn't used for routing.
+- **Raw `--` commands and image prompts can't be injected.** Their content is argv
+  (`--image`, bare CLI args), not a stream-json message, so they keep the legacy
+  `-p` path with stdin closed — and therefore can't host watchers at all.
+- **Idle processes are retired** after `SESSION_IDLE_SECONDS`, or held up to
+  `WATCHER_MAX_HOLD_SECONDS` while background tasks are live, so a watcher that
+  never terminates can't pin a CLI and its MCP bridge open forever. Any output
+  pushes the idle clock back, which is what keeps a watcher-driven turn — one we
+  never "began" — from racing a shutdown timer armed before it started.
+- **Live tasks come from `background_tasks_changed`**, a full snapshot, rather than
+  counting `task_started` against terminal statuses. A status we didn't recognise
+  used to strand a task in the set forever and hold the process open with it.
+- **Watcher-driven turns are reported, not completed.** They carry no prompt, so
+  they get no `prompt_costs` row (the prompt count means "prompts that finished"),
+  never touch the last prompt's reactions or queue slot, and are dropped entirely
+  when the CLI answers a notification with an empty zero-turn result. Their spend
+  still lands on the session total.
+- **The no-output reaper only runs mid-turn**, and is the only timer here that
+  kills rather than retires. An idle process is supposed to be silent; silence is
+  only evidence of a hang while a turn is in flight — and only then if nothing is
+  legitimately being waited on. Two things are, and neither produces output: a
+  live background task, and *you*, on an unanswered question or tool approval.
+  Both re-arm the window instead of reaping, bounded by the same absolute hold
+  cap. (A multi-question `AskUserQuestion` is the sharp case: each question gets
+  its own answer budget, but nothing reaches the CLI until the last one is in, so
+  the whole sitting is one unbroken silence.) The permission manager's pending map
+  is the source for "waiting on you" — the same one the dashboard reads — passed
+  in as a probe function rather than the object, since it already holds a
+  reference back to the Claude manager.
+- `/kill` will also retire an idle process that's holding watchers, and `/interrupt`
+  and `/btw` refuse to write into an idle one — that would start a turn nothing is
+  tracking.
+
 ### Model selection
 
 The model is pinned **per session**, not per channel, so a conversation never
@@ -141,6 +201,9 @@ Optional (models, timeouts, logging):
 - `LEGACY_SESSION_MODEL` - Model for sessions created before per-session pinning (default: `claude-opus-4-8`)
 - `AUTOPAUSE_TIMEOUT_SECONDS` - How long `/autopause` waits for Claude to answer with a name before giving up and leaving the session under its id (default: 180)
 - `QUESTION_WATCHDOG_SECONDS` - Silence allowed after AskUserQuestion answers are delivered before the turn is treated as wedged and recovered (default: 120)
+- `SESSION_IDLE_SECONDS` - How long a channel's CLI process is kept alive with nothing to do, so the next prompt is an injection rather than a `--resume` (default: 600)
+- `WATCHER_MAX_HOLD_SECONDS` - Ceiling on holding that process open for live background tasks, so a watcher that never finishes can't pin it forever (default: 21600)
+- `TURN_INACTIVITY_SECONDS` - Silence allowed *within a turn* before the process is treated as hung and killed. Raise it if you run foreground builds near the CLI's own 600-second Bash cap (default: 600)
 - `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
 
 ## Environment

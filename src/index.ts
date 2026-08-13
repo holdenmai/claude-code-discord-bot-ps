@@ -51,6 +51,12 @@ async function main() {
   // …and to the Claude manager, so answered questions arm the post-answer
   // watchdog that recovers a turn wedged on its own AskUserQuestion.
   mcpServer.setClaudeManager(claudeManager);
+  // The reverse direction, deliberately narrowed to one question: a turn sitting
+  // on an unanswered question or approval produces no output, and without this
+  // the mid-turn hang reaper can't tell it apart from a wedged process.
+  claudeManager.setPendingUserPromptProbe(
+    (channelId) => mcpServer.getPermissionManager()?.getWaitingKind(channelId) !== undefined,
+  );
 
   // Handle graceful shutdown
   let isShuttingDown = false;
@@ -86,6 +92,16 @@ async function main() {
     // Synchronous cleanup — destroy all connections so the port is freed
     try {
       mcpServer.stopSync();
+    } catch {
+      // Best effort
+    }
+    // Claude CLI processes outlive the turns that spawned them, so an abrupt exit
+    // can leave several running with nothing to talk to. Only synchronous work is
+    // possible here, so this is the tree kill rather than the graceful retire —
+    // it still has to reach the grandchildren, or they outlive us holding pipes
+    // and a socket to the port we just freed.
+    try {
+      claudeManager.killAllProcesses();
     } catch {
       // Best effort
     }
