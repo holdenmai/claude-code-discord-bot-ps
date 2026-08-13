@@ -14,6 +14,7 @@ import {
 import { requestSessionName, uniqueSessionName } from '../claude/session-namer.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
+import { splitForDiscordCapped } from '../utils/discord-text.js';
 
 export class CommandHandler {
   private baseFolder: string;
@@ -895,8 +896,11 @@ export class CommandHandler {
       if (wtLine && branchLine) {
         const wtPath = wtLine.slice("worktree ".length).trim();
         const branch = branchLine.slice("branch refs/heads/".length).trim();
-        // Skip the main worktree (the repo itself)
-        if (wtPath === repoDir || wtPath === repoDir.replace(/\//g, "\\")) continue;
+        // Skip the main worktree (the repo itself). Git reports paths with
+        // forward slashes even on Windows, where repoDir came from path.join and
+        // has backslashes — compare a normalised form or this never matches and
+        // /sync merges main into whatever the main checkout has out.
+        if (samePath(wtPath, repoDir)) continue;
         worktrees.push({ path: wtPath, branch });
       }
     }
@@ -907,10 +911,13 @@ export class CommandHandler {
     }
 
     const results: string[] = [];
+    let merged = 0;
+    let failed = 0;
     for (const wt of worktrees) {
       const name = path.basename(wt.path);
       try {
         const output = execSync("git merge main --no-edit", { cwd: wt.path, stdio: "pipe" }).toString().trim();
+        merged++;
         if (output.includes("Already up to date")) {
           results.push(`✅ **${name}** (\`${wt.branch}\`) — already up to date`);
         } else {
@@ -920,11 +927,28 @@ export class CommandHandler {
         const msg = error instanceof Error ? error.message : String(error);
         // Abort the failed merge so the worktree isn't left in a conflict state
         try { execSync("git merge --abort", { cwd: wt.path, stdio: "pipe" }); } catch {}
+        failed++;
         results.push(`❌ **${name}** (\`${wt.branch}\`) — merge conflict\n\`\`\`\n${msg.slice(0, 200)}\n\`\`\``);
       }
     }
 
-    await interaction.editReply(`🔄 **Sync main → worktrees** (${channelName})\n\n${results.join("\n")}`);
+    // Failures first: with a couple of dozen worktrees the interesting lines
+    // would otherwise be buried under a wall of "already up to date".
+    results.sort((a, b) => Number(a.startsWith("✅")) - Number(b.startsWith("✅")));
+
+    const header =
+      `🔄 **Sync main → worktrees** (${channelName})\n` +
+      `${merged} synced · ${failed} conflict${failed === 1 ? "" : "s"} · ${worktrees.length} worktree${worktrees.length === 1 ? "" : "s"}\n`;
+
+    // This report grows with the number of worktrees, and one conflict adds a
+    // 200-char excerpt of git's output. Past 2000 characters Discord rejects the
+    // whole reply as "Invalid Form Body" and the run is reported as nothing at
+    // all, so spill into follow-ups instead of sending one oversized message.
+    const parts = splitForDiscordCapped(`${header}\n${results.join("\n")}`, 4);
+    await interaction.editReply(parts[0]!);
+    for (const part of parts.slice(1)) {
+      await interaction.followUp(part);
+    }
   }
 
   /**
@@ -1862,6 +1886,23 @@ WshShell.Run "cmd /k bun run start", 1, False
 
     await interaction.editReply(`💰 **Cost Review**\n\n${body}${summary}`);
   }
+}
+
+/**
+ * Compare two filesystem paths for identity.
+ *
+ * `git worktree list --porcelain` prints forward slashes on every platform,
+ * while anything built with `path.join` on Windows has backslashes — so the two
+ * spellings of the same directory never compare equal. Case is folded too:
+ * Windows paths are case-insensitive and git's casing follows whatever the
+ * repository was created with.
+ */
+export function samePath(a: string, b: string): boolean {
+  const normalize = (p: string) => {
+    const slashed = p.trim().replace(/[\\/]+/g, "/").replace(/\/+$/, "");
+    return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return normalize(a) === normalize(b);
 }
 
 // A Claude session id is a v4-style UUID. We only check the shape — if the id

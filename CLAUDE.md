@@ -256,7 +256,9 @@ turn never lands.
 - `/restart` - Restart the bot without pulling changes
 - `/shutdown` - Stop the bot cleanly, retiring every CLI process first
 - `/shortcut` - Manage custom `!command` prompt shortcuts (global or per-repo)
-- `/sync` - Merge main into all active worktrees for this project
+- `/sync` - Merge main into all active worktrees for this project (conflicts
+  listed first; the report spills into follow-up messages rather than being
+  rejected whole once it passes Discord's 2000-character limit)
 - `/end` - End a worktree session: push branch to origin, remove worktree, lock thread
 - `/adopt` - Adopt an external Claude CLI session into a new channel (with autocomplete)
 - `/online` - Import offline CLI work from a session's `.jsonl` transcript into the channel

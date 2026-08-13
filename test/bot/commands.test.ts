@@ -7,7 +7,7 @@ vi.mock('../../src/claude/session-namer.js', async (importOriginal) => {
   return { ...actual, requestSessionName: (...args: any[]) => mockRequestSessionName(...args) };
 });
 
-import { CommandHandler, isSessionGuid } from '../../src/bot/commands.js';
+import { CommandHandler, isSessionGuid, samePath } from '../../src/bot/commands.js';
 
 // Mock ClaudeManager
 const mockClaudeManager = {
@@ -204,6 +204,22 @@ describe('CommandHandler', () => {
       expect(isSessionGuid('6387edd3')).toBe(false); // truncated
       expect(isSessionGuid('6387edd3-cb1a-40c4-8dd4-2b7948df354')).toBe(false); // last group too short
       expect(isSessionGuid('')).toBe(false);
+    });
+  });
+
+  describe('samePath', () => {
+    it('matches git porcelain output against a path.join path', () => {
+      // git prints forward slashes on every platform; path.join on Windows does not.
+      expect(samePath('E:/repos/proj', 'E:\\repos\\proj')).toBe(true);
+    });
+
+    it('ignores a trailing separator and repeated separators', () => {
+      expect(samePath('/repos/proj/', '/repos/proj')).toBe(true);
+      expect(samePath('/repos//proj', '/repos/proj')).toBe(true);
+    });
+
+    it('does not match a different worktree under the same repo', () => {
+      expect(samePath('E:/repos/proj/.claude/worktrees/feature', 'E:\\repos\\proj')).toBe(false);
     });
   });
 
