@@ -11,11 +11,11 @@ const mockAll = vi.fn();
 vi.mock("bun:sqlite", () => ({
   Database: vi.fn().mockImplementation(() => ({
     exec: mockExec,
-    query: vi.fn(() => ({
-      get: mockGet,
-      run: mockRun,
-      all: mockAll
-    })),
+    // Routed through mockQuery so tests can assert on the SQL itself.
+    query: (...args: any[]) => {
+      mockQuery(...args);
+      return { get: mockGet, run: mockRun, all: mockAll };
+    },
     close: mockClose
   }))
 }));
@@ -126,6 +126,42 @@ describe("DatabaseManager", () => {
     });
   });
 
+  describe("resumed-from tracking", () => {
+    it("stamps the name and the time it was resumed", () => {
+      db.setSessionResumedFrom("c", "refactor-queue");
+
+      const [name, at, channelId] = mockRun.mock.calls[0]!;
+      expect(name).toBe("refactor-queue");
+      expect(typeof at).toBe("number");
+      expect(channelId).toBe("c");
+    });
+
+    it("clears the name when a different session lands on the channel", () => {
+      db.setSession("c", "sess-1", "proj");
+      // Unlisted columns survive an upsert, so the name has to be nulled out for
+      // a new session id or it would be inherited from the previous one.
+      const sql = mockQuery.mock.calls.at(-1)![0] as string;
+      expect(sql).toContain("resumed_from = CASE");
+      expect(sql).toContain("WHEN channel_sessions.session_id = excluded.session_id THEN channel_sessions.resumed_from");
+    });
+
+    it("reads the name back on the session row", () => {
+      mockGet.mockReturnValue({
+        channel_id: "c", session_id: "s", channel_name: "proj", last_used: 5,
+        total_cost_usd: 1.5, session_model: "claude-opus-5",
+        resumed_from: "refactor-queue", resumed_at: 42,
+      });
+
+      expect(db.getSessionInfo("c")).toMatchObject({
+        sessionId: "s",
+        resumedFrom: "refactor-queue",
+        resumedAt: 42,
+        totalCostUsd: 1.5,
+        sessionModel: "claude-opus-5",
+      });
+    });
+  });
+
   describe("getAllSessions", () => {
     it("should return all sessions", () => {
       const mockSessions = [
@@ -137,8 +173,8 @@ describe("DatabaseManager", () => {
       const result = db.getAllSessions();
 
       expect(result).toEqual([
-        { channelId: "channel-1", sessionId: "session-1", channelName: "channel-one", lastUsed: 123456, lastSummary: undefined, lastCostUsd: undefined, lastNumTurns: undefined },
-        { channelId: "channel-2", sessionId: "session-2", channelName: "channel-two", lastUsed: 123457, lastSummary: undefined, lastCostUsd: undefined, lastNumTurns: undefined },
+        { channelId: "channel-1", sessionId: "session-1", channelName: "channel-one", lastUsed: 123456, lastSummary: undefined, lastCostUsd: undefined, lastNumTurns: undefined, totalCostUsd: 0, sessionModel: undefined, resumedFrom: undefined, resumedAt: undefined },
+        { channelId: "channel-2", sessionId: "session-2", channelName: "channel-two", lastUsed: 123457, lastSummary: undefined, lastCostUsd: undefined, lastNumTurns: undefined, totalCostUsd: 0, sessionModel: undefined, resumedFrom: undefined, resumedAt: undefined },
       ]);
       expect(mockAll).toHaveBeenCalled();
     });

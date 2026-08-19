@@ -191,6 +191,23 @@ and suffixed `-2`, `-3`… on collision — `paused_sessions` is keyed on
 `(channel_id, name)` and written with `INSERT OR REPLACE`, so reusing a name would
 silently destroy the session already parked under it.
 
+### Asking what's running here
+
+`/session` answers "what am I actually talking to" for one channel: session id,
+model (and whether it's pinned or the legacy fallback), state, spend, last turn,
+working directory, transcript path, and the other sessions parked here. It's
+read-only and never touches the CLI, so it works whether or not a process is
+alive; with no session row it just says "No active session".
+
+The one fact it can't read off existing state is the name a session was resumed
+from. `/resume` *deletes* the paused row it resumed — that's what stops the name
+being handed out twice — so the only human-readable handle a session ever had
+disappears at the moment you use it. `channel_sessions.resumed_from` keeps it,
+and because unlisted columns survive an upsert, `setSession` has to null it
+explicitly whenever a *different* session id lands on the channel; otherwise a
+fresh session would inherit its predecessor's name. Resuming a session parked
+under its own id (auto-pause) records nothing — an id is not a name.
+
 ### The at-a-glance dashboard
 
 One DM message, edited in place, lists every channel in the home category with
@@ -263,6 +280,7 @@ turn never lands.
 - `/adopt` - Adopt an external Claude CLI session into a new channel (with autocomplete)
 - `/online` - Import offline CLI work from a session's `.jsonl` transcript into the channel
 - `/autopause` - Pause the current session and let Claude name it (name lands a bit later)
+- `/session` - Show this channel's session: id, the paused name it was resumed from, model pin, state, spend
 - `/status` - Show summary of recent activity across all project channels
 - `/todo` - Per-channel todo notes (add/list/done/clear)
 - `/init` - Set this channel's category as the home for startup links

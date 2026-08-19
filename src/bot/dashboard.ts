@@ -89,6 +89,19 @@ export interface ThreadRef extends ScopeRef {
  * it) and above "active" (a session with a live watcher is doing more than
  * merely existing).
  */
+export function resolveScopeState(flags: {
+  waitingKind?: WaitingKind;
+  processing: boolean;
+  watching: boolean;
+  /** A session exists here — "active" rather than "inactive" when nothing runs. */
+  hasSession: boolean;
+}): ScopeState {
+  if (flags.waitingKind) return "waiting";
+  if (flags.processing) return "processing";
+  if (flags.watching) return "watching";
+  return flags.hasSession ? "active" : "inactive";
+}
+
 export function buildScopeStats(scope: ScopeRef, source: DashboardDataSource): ScopeStats {
   const current = source.getChannelCostInfo(scope.id);
   const currentSessionCost = current?.totalCostUsd ?? 0;
@@ -101,12 +114,12 @@ export function buildScopeStats(scope: ScopeRef, source: DashboardDataSource): S
     .reduce((sum, p) => sum + (p.totalCostUsd ?? 0), 0);
 
   const waitingKind = source.getWaitingKind(scope.id);
-  let state: ScopeState;
-  if (waitingKind) state = "waiting";
-  else if (source.hasActiveProcess(scope.id)) state = "processing";
-  else if (source.hasActiveWatchers(scope.id)) state = "watching";
-  else if (current) state = "active";
-  else state = "inactive";
+  const state = resolveScopeState({
+    waitingKind,
+    processing: source.hasActiveProcess(scope.id),
+    watching: source.hasActiveWatchers(scope.id),
+    hasSession: !!current,
+  });
 
   return {
     id: scope.id,
@@ -193,9 +206,14 @@ export function formatCost(usd: number): string {
   return `$${usd.toFixed(4)}`;
 }
 
+/** Emoji + label for a state, naming what a "waiting" scope is blocked on. */
+export function formatState(state: ScopeState, waitingKind?: WaitingKind): string {
+  const label = STATE_LABEL[state];
+  return state === "waiting" && waitingKind ? `${label} (${waitingKind})` : label;
+}
+
 function describeState(s: ScopeStats): string {
-  const label = STATE_LABEL[s.state];
-  return s.state === "waiting" && s.waitingKind ? `${label} (${s.waitingKind})` : label;
+  return formatState(s.state, s.waitingKind);
 }
 
 function statsSuffix(s: ScopeStats): string {

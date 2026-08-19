@@ -1055,6 +1055,25 @@ export class ClaudeManager {
     return this.db.getSession(channelId);
   }
 
+  /** The full current-session row for a channel — everything /session reports. */
+  getSessionInfo(channelId: string) {
+    return this.db.getSessionInfo(channelId);
+  }
+
+  /** How many background tasks are live on this channel's process right now. */
+  getLiveTaskCount(channelId: string): number {
+    return this.channelProcesses.get(channelId)?.liveTasks.size ?? 0;
+  }
+
+  /**
+   * The directory this channel's runs use, as far as the manager knows: a
+   * worktree override, else BASE_FOLDER/<channel name> once a run has named it.
+   * Undefined before the first run of the process's life.
+   */
+  getSessionWorkingDir(channelId: string): string | undefined {
+    return this.getWorkingDir(channelId);
+  }
+
   setSessionFromAdopt(channelId: string, sessionId: string, channelName: string): void {
     this.db.setSession(channelId, sessionId, channelName);
   }
@@ -1110,6 +1129,11 @@ export class ClaudeManager {
     const paused = this.db.getPausedSession(channelId, name);
     if (!paused || !paused.isResumable) return false;
     this.db.setSession(channelId, paused.sessionId, channelName, paused.sessionModel);
+    // Keep the name: the paused row is about to be deleted, and a session parked
+    // under its own id (auto-pause) never had a name worth reporting.
+    if (name !== paused.sessionId) {
+      this.db.setSessionResumedFrom(channelId, name);
+    }
     // Restore the cost that accrued before pausing so the running total continues.
     if (paused.totalCostUsd > 0) {
       this.db.addSessionCost(channelId, paused.totalCostUsd);

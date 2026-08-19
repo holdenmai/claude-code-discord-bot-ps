@@ -102,6 +102,10 @@ describe('ClaudeManager', () => {
       clearCompletedTodos: vi.fn().mockReturnValue(0),
       addPromptHistory: vi.fn(),
       getPromptHistory: vi.fn().mockReturnValue([]),
+      getPausedSession: vi.fn(),
+      deletePausedSession: vi.fn(),
+      addSessionCost: vi.fn(),
+      setSessionResumedFrom: vi.fn(),
       close: vi.fn()
     };
     vi.mocked(DatabaseManager).mockImplementation(() => mockDb);
@@ -154,6 +158,28 @@ describe('ClaudeManager', () => {
       mockDb.getSession.mockReturnValue(undefined);
       manager.setModel('channel-1', 'claude-opus-4-8');
       expect(mockDb.setSessionModel).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('resumeSession', () => {
+    it('remembers the name it was resumed from', () => {
+      mockDb.getPausedSession.mockReturnValue({
+        channelId: 'channel-1', name: 'refactor-queue', sessionId: 'sess-1',
+        pausedAt: 1, totalCostUsd: 0, isResumable: true,
+      });
+
+      expect(manager.resumeSession('channel-1', 'refactor-queue', 'proj')).toBe(true);
+      expect(mockDb.setSessionResumedFrom).toHaveBeenCalledWith('channel-1', 'refactor-queue');
+    });
+
+    it('records no name for a session parked under its own id', () => {
+      mockDb.getPausedSession.mockReturnValue({
+        channelId: 'channel-1', name: 'sess-1', sessionId: 'sess-1',
+        pausedAt: 1, totalCostUsd: 0, isResumable: true,
+      });
+
+      manager.resumeSession('channel-1', 'sess-1', 'proj');
+      expect(mockDb.setSessionResumedFrom).not.toHaveBeenCalled();
     });
   });
 

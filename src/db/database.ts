@@ -9,6 +9,11 @@ export interface ChannelSession {
   lastSummary?: string;
   lastCostUsd?: number;
   lastNumTurns?: number;
+  totalCostUsd?: number;
+  sessionModel?: string;
+  /** The paused-session name this session was picked back up from, if any. */
+  resumedFrom?: string;
+  resumedAt?: number;
 }
 
 export interface PausedSession {
@@ -70,6 +75,11 @@ export class DatabaseManager {
     // Model pinned to this session at creation. NULL on rows written before
     // pinning existed — those resume on LEGACY_SESSION_MODEL (see ClaudeManager).
     try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN session_model TEXT"); } catch {}
+    // The paused-session name /resume picked this session up from. The paused row
+    // is deleted on resume, so without this the name is gone the moment it's used
+    // — and it's the only human-readable handle the session ever had (/session).
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN resumed_from TEXT"); } catch {}
+    try { this.db.exec("ALTER TABLE channel_sessions ADD COLUMN resumed_at INTEGER"); } catch {}
 
     // Track actively running processes — rows left after crash = interrupted runs
     this.db.exec(`
@@ -191,6 +201,15 @@ export class DatabaseManager {
           WHEN channel_sessions.session_id = excluded.session_id
             THEN COALESCE(channel_sessions.session_model, excluded.session_model)
           ELSE excluded.session_model
+        END,
+        -- The resume name belongs to one session id. Unlisted columns survive an
+        -- upsert, so a *different* session landing here has to clear it explicitly
+        -- or it would inherit the previous session's name.
+        resumed_from = CASE
+          WHEN channel_sessions.session_id = excluded.session_id THEN channel_sessions.resumed_from
+        END,
+        resumed_at = CASE
+          WHEN channel_sessions.session_id = excluded.session_id THEN channel_sessions.resumed_at
         END
     `);
     stmt.run(channelId, sessionId, channelName, Date.now(), model ?? null);
@@ -205,14 +224,24 @@ export class DatabaseManager {
     stmt.run(model, channelId);
   }
 
+  /**
+   * Remember which paused-session name this channel's session was resumed from.
+   * Written after setSession, which clears it for a session id it hasn't seen.
+   */
+  setSessionResumedFrom(channelId: string, name: string): void {
+    const stmt = this.db.query(
+      "UPDATE channel_sessions SET resumed_from = ?, resumed_at = ? WHERE channel_id = ?"
+    );
+    stmt.run(name, Date.now(), channelId);
+  }
+
   clearSession(channelId: string): void {
     const stmt = this.db.query("DELETE FROM channel_sessions WHERE channel_id = ?");
     stmt.run(channelId);
   }
 
-  getAllSessions(): ChannelSession[] {
-    const stmt = this.db.query("SELECT * FROM channel_sessions ORDER BY last_used DESC");
-    return (stmt.all() as any[]).map(r => ({
+  private mapSessionRow(r: any): ChannelSession {
+    return {
       channelId: r.channel_id,
       sessionId: r.session_id,
       channelName: r.channel_name,
@@ -220,7 +249,24 @@ export class DatabaseManager {
       lastSummary: r.last_summary ?? undefined,
       lastCostUsd: r.last_cost_usd ?? undefined,
       lastNumTurns: r.last_num_turns ?? undefined,
-    }));
+      totalCostUsd: r.total_cost_usd ?? 0,
+      sessionModel: r.session_model ?? undefined,
+      resumedFrom: r.resumed_from ?? undefined,
+      resumedAt: r.resumed_at ?? undefined,
+    };
+  }
+
+  /** The whole current-session row for one channel (/session). */
+  getSessionInfo(channelId: string): ChannelSession | undefined {
+    const r = this.db
+      .query("SELECT * FROM channel_sessions WHERE channel_id = ?")
+      .get(channelId) as any | null;
+    return r ? this.mapSessionRow(r) : undefined;
+  }
+
+  getAllSessions(): ChannelSession[] {
+    const stmt = this.db.query("SELECT * FROM channel_sessions ORDER BY last_used DESC");
+    return (stmt.all() as any[]).map(r => this.mapSessionRow(r));
   }
 
   updateSessionSummary(channelId: string, summary: string, costUsd: number, numTurns: number): void {

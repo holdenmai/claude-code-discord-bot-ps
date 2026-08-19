@@ -60,6 +60,10 @@ export class DiscordBot {
     this.reactionConfig = getReactionConfig();
     this.activityLinkConfig = getActivityLinkConfig();
     this.commandHandler = new CommandHandler(claudeManager, allowedUserId, settings, instanceRouter);
+    // Resolved per call, not captured — the MCP server is attached after login.
+    this.commandHandler.setWaitingKindProbe(
+      (id) => this.mcpServer?.getPermissionManager?.()?.getWaitingKind?.(id),
+    );
     this.messageQueue = new MessageQueue();
     this.dashboard = new DashboardManager(this.client, allowedUserId, settings, {
       getChannelCostInfo: (id) => this.claudeManager.getChannelCostInfo(id),
