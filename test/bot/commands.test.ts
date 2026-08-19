@@ -7,7 +7,13 @@ vi.mock('../../src/claude/session-namer.js', async (importOriginal) => {
   return { ...actual, requestSessionName: (...args: any[]) => mockRequestSessionName(...args) };
 });
 
-import { CommandHandler, isSessionGuid } from '../../src/bot/commands.js';
+import {
+  CommandHandler,
+  isSessionGuid,
+  renderSessionReport,
+  samePath,
+  type SessionReport,
+} from '../../src/bot/commands.js';
 
 // Mock ClaudeManager
 const mockClaudeManager = {
@@ -28,6 +34,14 @@ const mockClaudeManager = {
   autoPauseSession: vi.fn(),
   getPausedSessions: vi.fn().mockReturnValue([]),
   renamePausedSession: vi.fn().mockReturnValue(true),
+  // /session surface
+  getSessionInfo: vi.fn(),
+  getSessionWorkingDir: vi.fn(),
+  getLiveTaskCount: vi.fn().mockReturnValue(0),
+  getModelForRun: vi.fn().mockReturnValue('claude-opus-5'),
+  isPlanMode: vi.fn().mockReturnValue(false),
+  hasActiveWatchers: vi.fn().mockReturnValue(false),
+  getPromptCount: vi.fn().mockReturnValue(0),
 };
 
 const mockSettings = {
@@ -46,7 +60,7 @@ describe('CommandHandler', () => {
   describe('getCommands', () => {
     it('should return array of slash commands', () => {
       const commands = commandHandler.getCommands();
-      expect(commands).toHaveLength(24);
+      expect(commands).toHaveLength(26);
       expect(commands[0]!.name).toBe('clear');
       expect(commands[1]!.name).toBe('kill');
       expect(commands[2]!.name).toBe('stop');
@@ -56,21 +70,23 @@ describe('CommandHandler', () => {
       expect(commands[6]!.name).toBe('plan');
       expect(commands[7]!.name).toBe('update');
       expect(commands[8]!.name).toBe('restart');
-      expect(commands[9]!.name).toBe('init');
-      expect(commands[10]!.name).toBe('shortcut');
-      expect(commands[11]!.name).toBe('sync');
-      expect(commands[12]!.name).toBe('end');
-      expect(commands[13]!.name).toBe('adopt');
-      expect(commands[14]!.name).toBe('status');
-      expect(commands[15]!.name).toBe('todo');
-      expect(commands[16]!.name).toBe('pause');
-      expect(commands[17]!.name).toBe('autopause');
-      expect(commands[18]!.name).toBe('resume');
-      expect(commands[19]!.name).toBe('online');
-      expect(commands[20]!.name).toBe('costreview');
-      expect(commands[21]!.name).toBe('interrupt');
-      expect(commands[22]!.name).toBe('btw');
-      expect(commands[23]!.name).toBe('file');
+      expect(commands[9]!.name).toBe('shutdown');
+      expect(commands[10]!.name).toBe('init');
+      expect(commands[11]!.name).toBe('shortcut');
+      expect(commands[12]!.name).toBe('sync');
+      expect(commands[13]!.name).toBe('end');
+      expect(commands[14]!.name).toBe('adopt');
+      expect(commands[15]!.name).toBe('status');
+      expect(commands[16]!.name).toBe('todo');
+      expect(commands[17]!.name).toBe('session');
+      expect(commands[18]!.name).toBe('pause');
+      expect(commands[19]!.name).toBe('autopause');
+      expect(commands[20]!.name).toBe('resume');
+      expect(commands[21]!.name).toBe('online');
+      expect(commands[22]!.name).toBe('costreview');
+      expect(commands[23]!.name).toBe('interrupt');
+      expect(commands[24]!.name).toBe('btw');
+      expect(commands[25]!.name).toBe('file');
     });
   });
 
@@ -203,6 +219,22 @@ describe('CommandHandler', () => {
       expect(isSessionGuid('6387edd3')).toBe(false); // truncated
       expect(isSessionGuid('6387edd3-cb1a-40c4-8dd4-2b7948df354')).toBe(false); // last group too short
       expect(isSessionGuid('')).toBe(false);
+    });
+  });
+
+  describe('samePath', () => {
+    it('matches git porcelain output against a path.join path', () => {
+      // git prints forward slashes on every platform; path.join on Windows does not.
+      expect(samePath('E:/repos/proj', 'E:\\repos\\proj')).toBe(true);
+    });
+
+    it('ignores a trailing separator and repeated separators', () => {
+      expect(samePath('/repos/proj/', '/repos/proj')).toBe(true);
+      expect(samePath('/repos//proj', '/repos/proj')).toBe(true);
+    });
+
+    it('does not match a different worktree under the same repo', () => {
+      expect(samePath('E:/repos/proj/.claude/worktrees/feature', 'E:\\repos\\proj')).toBe(false);
     });
   });
 
@@ -341,6 +373,125 @@ describe('CommandHandler', () => {
       expect(interaction.reply).toHaveBeenCalledWith(
         expect.objectContaining({ content: expect.stringContaining('No active session') })
       );
+    });
+  });
+
+  describe('session command', () => {
+    function sessionInteraction() {
+      return {
+        isChatInputCommand: () => true,
+        user: { id: allowedUserId },
+        channelId: 'channel-123',
+        commandName: 'session',
+        channel: { name: 'my-chan' },
+        options: { getString: () => null },
+        reply: vi.fn(),
+      };
+    }
+
+    it('reports no active session when the channel has none', async () => {
+      mockClaudeManager.getSessionInfo.mockReturnValue(undefined);
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+
+      const interaction = sessionInteraction();
+      await commandHandler.handleInteraction(interaction);
+
+      expect(interaction.reply).toHaveBeenCalledWith({ content: 'No active session', ephemeral: true });
+    });
+
+    it('says a first turn is still starting rather than "no session"', async () => {
+      mockClaudeManager.getSessionInfo.mockReturnValue(undefined);
+      mockClaudeManager.hasActiveProcess.mockReturnValue(true);
+
+      const interaction = sessionInteraction();
+      await commandHandler.handleInteraction(interaction);
+
+      expect(interaction.reply).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining('first turn is running') }),
+      );
+    });
+
+    it('reports the id, the resumed-from name and the spend', async () => {
+      mockClaudeManager.getSessionInfo.mockReturnValue({
+        channelId: 'channel-123',
+        sessionId: 'sess-1',
+        channelName: 'my-chan',
+        lastUsed: Date.now(),
+        totalCostUsd: 1.5,
+        sessionModel: 'claude-opus-5',
+        resumedFrom: 'refactor-queue',
+        resumedAt: Date.now(),
+      });
+      mockClaudeManager.hasActiveProcess.mockReturnValue(false);
+      mockClaudeManager.getResumableSessions.mockReturnValue([{ name: 'other-work' }]);
+      // A cleared session's archived spend still counts toward "all sessions".
+      mockClaudeManager.getPausedSessions.mockReturnValue([{ totalCostUsd: 0.5 }]);
+      mockClaudeManager.getPromptCount.mockReturnValue(7);
+
+      const interaction = sessionInteraction();
+      await commandHandler.handleInteraction(interaction);
+
+      const content = interaction.reply.mock.calls[0]![0].content as string;
+      expect(content).toContain('sess-1');
+      expect(content).toContain('Resumed from **refactor-queue**');
+      expect(content).toContain('$1.5000 this session');
+      expect(content).toContain('$2.0000 all sessions here');
+      expect(content).toContain('7 prompts');
+      expect(content).toContain('other-work');
+    });
+  });
+
+  describe('renderSessionReport', () => {
+    const base: SessionReport = {
+      sessionId: 'sess-1',
+      state: 'active',
+      liveTasks: 0,
+      model: 'claude-opus-5',
+      modelPinned: true,
+      channelDefaultModel: 'claude-opus-5',
+      planMode: false,
+      currentSessionCost: 0,
+      allSessionsCost: 0,
+      promptCount: 1,
+      lastUsed: Date.now(),
+      pausedNames: [],
+    };
+
+    it('omits the resumed-from line for a session that was never named', () => {
+      expect(renderSessionReport(base)).not.toContain('Resumed from');
+    });
+
+    it('names what a waiting session is blocked on', () => {
+      const text = renderSessionReport({ ...base, state: 'waiting', waitingKind: 'approval' });
+      expect(text).toContain('Waiting (approval)');
+    });
+
+    it('counts live background tasks alongside the state', () => {
+      expect(renderSessionReport({ ...base, state: 'watching', liveTasks: 2 }))
+        .toContain('2 background tasks');
+    });
+
+    it('flags a session pinned to a model the channel no longer defaults to', () => {
+      const text = renderSessionReport({ ...base, channelDefaultModel: 'claude-sonnet-5' });
+      expect(text).toContain('new sessions here use **claude-sonnet-5**');
+    });
+
+    it('says nothing about the channel default when it matches', () => {
+      expect(renderSessionReport(base)).not.toContain('new sessions here');
+    });
+
+    it('marks a session created before pinning as a legacy default', () => {
+      expect(renderSessionReport({ ...base, modelPinned: false })).toContain('legacy default');
+    });
+
+    it('stays inside a Discord message', () => {
+      const text = renderSessionReport({
+        ...base,
+        lastSummary: 'x'.repeat(4000),
+        pausedNames: Array.from({ length: 40 }, (_, i) => `paused-${i}`),
+      });
+      expect(text.length).toBeLessThanOrEqual(2000);
+      expect(text).toContain('+32 more');
     });
   });
 

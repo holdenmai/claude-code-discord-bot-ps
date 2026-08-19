@@ -14,9 +14,23 @@ import {
 import { requestSessionName, uniqueSessionName } from '../claude/session-namer.js';
 import type { SettingsStore } from '../settings/settings-store.js';
 import type { InstanceRouter } from '../routing/instance-router.js';
+import { splitForDiscordCapped } from '../utils/discord-text.js';
+import {
+  formatCost,
+  formatState,
+  resolveScopeState,
+  type ScopeState,
+  type WaitingKind,
+} from './dashboard.js';
 
 export class CommandHandler {
   private baseFolder: string;
+  /**
+   * "Is this channel blocked on you?", same source the dashboard reads. Wired in
+   * after login rather than injected: the MCP server that owns the pending map
+   * doesn't exist yet when the handler is constructed.
+   */
+  private waitingKindProbe?: (channelId: string) => WaitingKind | undefined;
 
   constructor(
     private claudeManager: ClaudeManager,
@@ -78,6 +92,9 @@ export class CommandHandler {
       new SlashCommandBuilder()
         .setName("restart")
         .setDescription("Restart the bot without updating"),
+      new SlashCommandBuilder()
+        .setName("shutdown")
+        .setDescription("Stop the bot cleanly, retiring every Claude CLI process first"),
       new SlashCommandBuilder()
         .setName("init")
         .setDescription("Set this channel's category as the home for startup links"),
@@ -155,6 +172,9 @@ export class CommandHandler {
             .setName("clear")
             .setDescription("Remove completed todos")
         ),
+      new SlashCommandBuilder()
+        .setName("session")
+        .setDescription("Show this channel's current session: id, resumed-from name, model, state and spend"),
       new SlashCommandBuilder()
         .setName("pause")
         .setDescription("Pause the current session with a name (next message starts fresh)")
@@ -244,6 +264,10 @@ export class CommandHandler {
     ];
   }
 
+  setWaitingKindProbe(probe: (channelId: string) => WaitingKind | undefined): void {
+    this.waitingKindProbe = probe;
+  }
+
   async registerCommands(token: string, clientId: string): Promise<void> {
     const rest = new REST().setToken(token);
 
@@ -282,7 +306,7 @@ export class CommandHandler {
 
     // Multi-instance guard: skip if another instance owns this channel
     // Read-only commands bypass this guard — they don't spawn Claude processes
-    const readOnlyCommands = new Set(["status", "todo", "costreview"]);
+    const readOnlyCommands = new Set(["status", "todo", "costreview", "session"]);
     if (this.instanceRouter && !readOnlyCommands.has(interaction.commandName)) {
       const channel = interaction.channel;
       const isThread = channel?.isThread?.();
@@ -311,9 +335,17 @@ export class CommandHandler {
 
     if (interaction.commandName === "kill") {
       const channelId = interaction.channelId;
-      if (this.claudeManager.hasActiveProcess(channelId)) {
+      const busy = this.claudeManager.hasActiveProcess(channelId);
+      // A channel's process outlives its turns, so there's a second thing worth
+      // killing: an idle session process still hosting background watchers.
+      const watching = !busy && this.claudeManager.hasLiveProcess(channelId);
+      if (busy || watching) {
         this.claudeManager.killActiveProcess(channelId);
-        await interaction.reply("Killed the running Claude Code process. Session preserved — next message will resume.");
+        await interaction.reply(
+          watching
+            ? "Killed the idle session process (any background watchers go with it). Session preserved — next message will resume."
+            : "Killed the running Claude Code process. Session preserved — next message will resume."
+        );
       } else {
         await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
       }
@@ -321,12 +353,20 @@ export class CommandHandler {
 
     if (interaction.commandName === "stop") {
       const channelId = interaction.channelId;
-      if (!this.claudeManager.hasActiveProcess(channelId)) {
-        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
-      } else if (this.claudeManager.interruptSession(channelId)) {
-        await interaction.reply("🛑 Asked Claude to gracefully stop the current turn. Session preserved — next message continues it.");
+      if (this.claudeManager.hasActiveProcess(channelId)) {
+        if (this.claudeManager.interruptSession(channelId)) {
+          await interaction.reply("🛑 Asked Claude to gracefully stop the current turn. Session preserved — next message continues it.");
+        } else {
+          await interaction.reply({ content: "Couldn't send a graceful stop (process not accepting input). Use `/kill` to force it.", ephemeral: true });
+        }
+      } else if (this.claudeManager.hasLiveProcess(channelId)) {
+        // No turn running, but the process is being held open for a watcher. "Stop"
+        // here means stop waiting on it — otherwise the only way out is /kill.
+        await interaction.deferReply();
+        await this.claudeManager.stopIdleSession(channelId);
+        await interaction.editReply("🛑 Stopped waiting — retired the session process and its background watchers. Session preserved — next message continues it.");
       } else {
-        await interaction.reply({ content: "Couldn't send a graceful stop (process not accepting input). Use `/kill` to force it.", ephemeral: true });
+        await interaction.reply({ content: "No active process in this channel.", ephemeral: true });
       }
     }
 
@@ -364,6 +404,10 @@ export class CommandHandler {
       await this.handleRestartCommand(interaction);
     }
 
+    if (interaction.commandName === "shutdown") {
+      await this.handleShutdownCommand(interaction);
+    }
+
     if (interaction.commandName === "shortcut") {
       await this.handleShortcutCommand(interaction);
     }
@@ -390,6 +434,10 @@ export class CommandHandler {
 
     if (interaction.commandName === "adopt") {
       await this.handleAdoptCommand(interaction);
+    }
+
+    if (interaction.commandName === "session") {
+      await this.handleSessionCommand(interaction);
     }
 
     if (interaction.commandName === "pause") {
@@ -872,8 +920,11 @@ export class CommandHandler {
       if (wtLine && branchLine) {
         const wtPath = wtLine.slice("worktree ".length).trim();
         const branch = branchLine.slice("branch refs/heads/".length).trim();
-        // Skip the main worktree (the repo itself)
-        if (wtPath === repoDir || wtPath === repoDir.replace(/\//g, "\\")) continue;
+        // Skip the main worktree (the repo itself). Git reports paths with
+        // forward slashes even on Windows, where repoDir came from path.join and
+        // has backslashes — compare a normalised form or this never matches and
+        // /sync merges main into whatever the main checkout has out.
+        if (samePath(wtPath, repoDir)) continue;
         worktrees.push({ path: wtPath, branch });
       }
     }
@@ -884,10 +935,13 @@ export class CommandHandler {
     }
 
     const results: string[] = [];
+    let merged = 0;
+    let failed = 0;
     for (const wt of worktrees) {
       const name = path.basename(wt.path);
       try {
         const output = execSync("git merge main --no-edit", { cwd: wt.path, stdio: "pipe" }).toString().trim();
+        merged++;
         if (output.includes("Already up to date")) {
           results.push(`✅ **${name}** (\`${wt.branch}\`) — already up to date`);
         } else {
@@ -897,11 +951,28 @@ export class CommandHandler {
         const msg = error instanceof Error ? error.message : String(error);
         // Abort the failed merge so the worktree isn't left in a conflict state
         try { execSync("git merge --abort", { cwd: wt.path, stdio: "pipe" }); } catch {}
+        failed++;
         results.push(`❌ **${name}** (\`${wt.branch}\`) — merge conflict\n\`\`\`\n${msg.slice(0, 200)}\n\`\`\``);
       }
     }
 
-    await interaction.editReply(`🔄 **Sync main → worktrees** (${channelName})\n\n${results.join("\n")}`);
+    // Failures first: with a couple of dozen worktrees the interesting lines
+    // would otherwise be buried under a wall of "already up to date".
+    results.sort((a, b) => Number(a.startsWith("✅")) - Number(b.startsWith("✅")));
+
+    const header =
+      `🔄 **Sync main → worktrees** (${channelName})\n` +
+      `${merged} synced · ${failed} conflict${failed === 1 ? "" : "s"} · ${worktrees.length} worktree${worktrees.length === 1 ? "" : "s"}\n`;
+
+    // This report grows with the number of worktrees, and one conflict adds a
+    // 200-char excerpt of git's output. Past 2000 characters Discord rejects the
+    // whole reply as "Invalid Form Body" and the run is reported as nothing at
+    // all, so spill into follow-ups instead of sending one oversized message.
+    const parts = splitForDiscordCapped(`${header}\n${results.join("\n")}`, 4);
+    await interaction.editReply(parts[0]!);
+    for (const part of parts.slice(1)) {
+      await interaction.followUp(part);
+    }
   }
 
   /**
@@ -1281,6 +1352,43 @@ export class CommandHandler {
   }
 
   /**
+   * Handle /shutdown — stop the bot for good, from Discord.
+   *
+   * Ctrl+C in the terminal is a blunter instrument than it used to be: it
+   * arrives while several CLI processes are sitting alive as session hosts, and
+   * whatever doesn't get retired properly is left orphaned, holding the pipes
+   * and the permission-server socket it inherited. This takes the same route the
+   * bot uses to retire an idle process — stdin EOF, escalating only if refused —
+   * for every channel, then exits.
+   */
+  private async handleShutdownCommand(interaction: any): Promise<void> {
+    await interaction.reply("🛑 Shutting down — retiring Claude processes first…");
+
+    let retired = 0;
+    try {
+      retired = await this.claudeManager.shutdownAll("/shutdown");
+    } catch (error) {
+      console.error("Shutdown: failed to retire processes cleanly:", error);
+    }
+
+    const summary = retired === 0
+      ? "🛑 Bot stopped. No Claude processes were running."
+      : `🛑 Bot stopped. Retired ${retired} Claude process${retired === 1 ? "" : "es"}.`;
+    // Best effort: say goodbye before the process goes, but never let a failed
+    // edit be the reason the bot stays up.
+    try {
+      await interaction.editReply(summary);
+    } catch (error) {
+      console.error("Shutdown: failed to post summary:", error);
+    }
+
+    console.log("Shutdown requested from Discord — exiting.");
+    // Let the reply flush. The 'exit' handler frees the port and sweeps up
+    // anything shutdownAll couldn't retire.
+    setTimeout(() => process.exit(0), 1000);
+  }
+
+  /**
    * Handle /restart command - restart the bot without pulling changes.
    */
   private async handleRestartCommand(interaction: any): Promise<void> {
@@ -1316,8 +1424,79 @@ WshShell.Run "cmd /k bun run start", 1, False
       stdio: "ignore",
     }).unref();
 
+    // Take the CLI processes down with us. They now outlive their turns, so on a
+    // quiet restart there can be several sitting idle — and process.exit below
+    // skips the SIGINT/SIGTERM shutdown that would otherwise clean them up.
+    this.claudeManager.killAllProcesses();
+
     console.log("Restart VBS script launched, exiting...");
     process.exit(0);
+  }
+
+  /**
+   * /session — what is this channel talking to right now.
+   *
+   * Everything here is read from state the bot already keeps; nothing is
+   * computed by asking the CLI, so it works whether or not a process is alive.
+   */
+  private async handleSessionCommand(interaction: any): Promise<void> {
+    const channelId = interaction.channelId;
+    const info = this.claudeManager.getSessionInfo(channelId);
+
+    if (!info) {
+      // A first turn that hasn't reported its id yet is the one case where
+      // "no session" would be misleading — there's a conversation, it just
+      // isn't named yet.
+      const starting = this.claudeManager.hasActiveProcess(channelId);
+      await interaction.reply({
+        content: starting
+          ? "No active session yet — a first turn is running; its id lands once Claude reports it."
+          : "No active session",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const pausedHere = this.claudeManager.getResumableSessions(channelId);
+    const workingDir =
+      this.claudeManager.getSessionWorkingDir?.(channelId) ||
+      (this.baseFolder ? path.join(this.baseFolder, info.channelName) : undefined);
+
+    const report: SessionReport = {
+      sessionId: info.sessionId,
+      resumedFrom: info.resumedFrom,
+      resumedAt: info.resumedAt,
+      state: resolveScopeState({
+        waitingKind: this.waitingKindProbe?.(channelId),
+        processing: this.claudeManager.hasActiveProcess(channelId),
+        watching: this.claudeManager.hasActiveWatchers(channelId),
+        hasSession: true,
+      }),
+      waitingKind: this.waitingKindProbe?.(channelId),
+      liveTasks: this.claudeManager.getLiveTaskCount?.(channelId) ?? 0,
+      model: this.claudeManager.getModelForRun(channelId),
+      modelPinned: !!info.sessionModel,
+      channelDefaultModel: this.claudeManager.getModel(channelId),
+      planMode: this.claudeManager.isPlanMode(channelId),
+      workingDir,
+      transcriptPath: findTranscriptPath(info.sessionId),
+      currentSessionCost: info.totalCostUsd ?? 0,
+      // Same arithmetic as the dashboard: paused rows (including /clear's
+      // non-resumable archives) carry the spend of every earlier session here.
+      allSessionsCost:
+        (info.totalCostUsd ?? 0) +
+        this.claudeManager
+          .getPausedSessions(channelId)
+          .reduce((sum: number, p: any) => sum + (p.totalCostUsd ?? 0), 0),
+      promptCount: this.claudeManager.getPromptCount(channelId),
+      lastUsed: info.lastUsed,
+      lastCostUsd: info.lastCostUsd,
+      lastNumTurns: info.lastNumTurns,
+      lastSummary: info.lastSummary,
+      pausedNames: pausedHere.map((p: any) => p.name),
+    };
+
+    await interaction.reply({ content: renderSessionReport(report), ephemeral: true });
   }
 
   private async handlePauseCommand(interaction: any): Promise<void> {
@@ -1703,8 +1882,13 @@ WshShell.Run "cmd /k bun run start", 1, False
       const label = mode === "btw" ? "Side question" : "Message";
       await interaction.reply(`📨 ${label} sent to the running session:\n> ${prompt.slice(0, 1500)}`);
     } else {
+      // The session process is kept alive between turns now, so "no turn running"
+      // and "no process" look the same from here — say which one it is.
+      const idleWithWatchers = this.claudeManager.hasLiveProcess(channelId);
       await interaction.reply({
-        content: "No active Claude process is running in this channel to send to. Send a normal message to start one.",
+        content: idleWithWatchers
+          ? "Nothing is running right now — the session is just being held open for a background watcher. Send a normal message to start a turn, or `/stop` to stop waiting."
+          : "No active Claude process is running in this channel to send to. Send a normal message to start one.",
         ephemeral: true,
       });
     }
@@ -1794,12 +1978,108 @@ WshShell.Run "cmd /k bun run start", 1, False
   }
 }
 
+/**
+ * Compare two filesystem paths for identity.
+ *
+ * `git worktree list --porcelain` prints forward slashes on every platform,
+ * while anything built with `path.join` on Windows has backslashes — so the two
+ * spellings of the same directory never compare equal. Case is folded too:
+ * Windows paths are case-insensitive and git's casing follows whatever the
+ * repository was created with.
+ */
+export function samePath(a: string, b: string): boolean {
+  const normalize = (p: string) => {
+    const slashed = p.trim().replace(/[\\/]+/g, "/").replace(/\/+$/, "");
+    return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return normalize(a) === normalize(b);
+}
+
 // A Claude session id is a v4-style UUID. We only check the shape — if the id
 // doesn't exist (or belongs to another folder), the CLI reports it on the next
 // message, matching `claude --resume <id>` in the console.
 const SESSION_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isSessionGuid(s: string): boolean {
   return SESSION_GUID_RE.test(s.trim());
+}
+
+/** Everything /session reports, gathered so the rendering can be tested alone. */
+export interface SessionReport {
+  sessionId: string;
+  resumedFrom?: string;
+  resumedAt?: number;
+  state: ScopeState;
+  waitingKind?: WaitingKind;
+  liveTasks: number;
+  model: string;
+  /** False means the session predates per-session pinning (LEGACY_SESSION_MODEL). */
+  modelPinned: boolean;
+  channelDefaultModel: string;
+  planMode: boolean;
+  workingDir?: string;
+  transcriptPath?: string;
+  currentSessionCost: number;
+  allSessionsCost: number;
+  promptCount: number;
+  lastUsed: number;
+  lastCostUsd?: number;
+  lastNumTurns?: number;
+  lastSummary?: string;
+  /** Other sessions parked in this channel, for /resume. */
+  pausedNames: string[];
+}
+
+const MAX_PAUSED_NAMES_SHOWN = 8;
+
+export function renderSessionReport(r: SessionReport): string {
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const lines: string[] = [`🧠 **Session** \`${r.sessionId}\``];
+
+  if (r.resumedFrom) {
+    const when = r.resumedAt ? ` · resumed ${formatAge(r.resumedAt)}` : "";
+    lines.push(`Resumed from **${r.resumedFrom}**${when}`);
+  }
+
+  const tasks = r.liveTasks > 0 ? ` · ${plural(r.liveTasks, "background task")}` : "";
+  lines.push(`${formatState(r.state, r.waitingKind)}${tasks}`);
+
+  const modelParts = [`Model **${r.model}** (${r.modelPinned ? "pinned" : "legacy default"})`];
+  // Only worth saying when the channel would start a *new* session elsewhere —
+  // that gap is the whole point of pinning, and the usual source of "why is this
+  // still on the old model?".
+  if (r.channelDefaultModel !== r.model) {
+    modelParts.push(`new sessions here use **${r.channelDefaultModel}**`);
+  }
+  if (r.planMode) modelParts.push("📋 plan mode on");
+  lines.push(modelParts.join(" · "));
+
+  if (r.workingDir) lines.push(`Folder \`${r.workingDir}\``);
+
+  lines.push(
+    `Cost ${formatCost(r.currentSessionCost)} this session · ` +
+      `${formatCost(r.allSessionsCost)} all sessions here · ${plural(r.promptCount, "prompt")}`,
+  );
+
+  const lastBits: string[] = [];
+  if (r.lastNumTurns) lastBits.push(plural(r.lastNumTurns, "turn"));
+  if (r.lastCostUsd) lastBits.push(formatCost(r.lastCostUsd));
+  lines.push(`Last activity ${formatAge(r.lastUsed)}${lastBits.length ? ` — ${lastBits.join(", ")}` : ""}`);
+
+  if (r.lastSummary) {
+    const summary = r.lastSummary.replace(/\n/g, " ").trim();
+    lines.push(`> ${summary.length > 180 ? `${summary.slice(0, 180)}…` : summary}`);
+  }
+
+  if (r.pausedNames.length > 0) {
+    const shown = r.pausedNames.slice(0, MAX_PAUSED_NAMES_SHOWN).map(n => `\`${n}\``).join(", ");
+    const rest = r.pausedNames.length - MAX_PAUSED_NAMES_SHOWN;
+    lines.push(`Also paused here: ${shown}${rest > 0 ? ` (+${rest} more)` : ""}`);
+  }
+
+  if (r.transcriptPath) lines.push(`Transcript \`${r.transcriptPath}\``);
+
+  const body = lines.join("\n");
+  return body.length > 1990 ? `${body.slice(0, 1989)}…` : body;
 }
 
 function formatAge(timestamp: number): string {

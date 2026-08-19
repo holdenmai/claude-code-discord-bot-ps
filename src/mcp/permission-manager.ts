@@ -53,6 +53,28 @@ export class PermissionManager {
   }
 
   /**
+   * Whether a channel is currently blocked on the user, and on what — a question
+   * it asked, or a tool approval. Used by the dashboard to distinguish "busy" from
+   * "needs you", which is the distinction actually worth glancing at.
+   *
+   * A question outranks an approval when both are outstanding: it's the one that
+   * needs a considered answer rather than a yes/no.
+   *
+   * This is in-memory only. Pending approvals don't survive a restart — but
+   * neither does the CLI turn that raised them, so a channel reading as merely
+   * active after a restart is accurate, not stale.
+   */
+  getWaitingKind(channelId: string): 'question' | 'approval' | undefined {
+    let found: 'question' | 'approval' | undefined;
+    for (const pending of this.pendingApprovals.values()) {
+      if (pending.discordContext?.channelId !== channelId) continue;
+      if (pending.pendingQuestion) return 'question';
+      found = 'approval';
+    }
+    return found;
+  }
+
+  /**
    * Main entry point for permission requests from MCP server
    */
   async requestApproval(
@@ -151,6 +173,7 @@ export class PermissionManager {
       };
 
       this.pendingApprovals.set(requestId, pending);
+      this.notifyDashboard();
 
       // Send approval message to Discord
       this.sendApprovalMessage(pending).catch((error) => {
@@ -471,6 +494,19 @@ export class PermissionManager {
     if (pendingApproval) {
       clearTimeout(pendingApproval.timeout);
       this.pendingApprovals.delete(requestId);
+      this.notifyDashboard();
+    }
+  }
+
+  /**
+   * Nudge the dashboard — a channel just became (or stopped being) blocked on the
+   * user, and that's state only this class knows about.
+   */
+  private notifyDashboard(): void {
+    try {
+      this.discordBot?.refreshDashboard?.();
+    } catch (error) {
+      console.error('PermissionManager: dashboard refresh failed:', error);
     }
   }
 
@@ -513,6 +549,7 @@ export class PermissionManager {
       };
 
       this.pendingApprovals.set(requestId, pending);
+      this.notifyDashboard();
 
       this.sendQuestionMessage(pending).catch((error) => {
         console.error('PermissionManager: Failed to send question message:', error);

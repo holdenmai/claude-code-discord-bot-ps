@@ -51,6 +51,12 @@ async function main() {
   // …and to the Claude manager, so answered questions arm the post-answer
   // watchdog that recovers a turn wedged on its own AskUserQuestion.
   mcpServer.setClaudeManager(claudeManager);
+  // The reverse direction, deliberately narrowed to one question: a turn sitting
+  // on an unanswered question or approval produces no output, and without this
+  // the mid-turn hang reaper can't tell it apart from a wedged process.
+  claudeManager.setPendingUserPromptProbe(
+    (channelId) => mcpServer.getPermissionManager()?.getWaitingKind(channelId) !== undefined,
+  );
 
   // Handle graceful shutdown
   let isShuttingDown = false;
@@ -59,14 +65,31 @@ async function main() {
     isShuttingDown = true;
     console.log('Shutting down gracefully...');
 
-    // Stop MCP server first
+    // A teardown that hangs is worse than an abrupt one: the process keeps the
+    // MCP port bound and every CLI it spawned stays parented to it. Ctrl+C
+    // means stop, so guarantee it stops.
+    const hardExit = setTimeout(() => {
+      console.error('Shutdown took too long — forcing exit');
+      process.exit(1);
+    }, 20_000);
+    hardExit.unref?.();
+
+    // CLI processes first, and gracefully. They outlive their turns now, so a
+    // shutdown normally finds several alive; stdin EOF lets each one drain and
+    // reap its own children (the MCP bridge among them) instead of leaving them
+    // orphaned and still holding a connection to the server we're about to stop.
+    try {
+      await claudeManager.shutdownAll();
+    } catch (error) {
+      console.error('Error retiring Claude processes:', error);
+    }
+
     try {
       await mcpServer.stop();
     } catch (error) {
       console.error('Error stopping MCP server:', error);
     }
 
-    // Stop Claude manager
     try {
       claudeManager.destroy();
     } catch (error) {
@@ -78,6 +101,10 @@ async function main() {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // Windows delivers Ctrl+Break and console-close as their own events; without
+  // these, closing the terminal window skips the teardown entirely.
+  process.on('SIGHUP', shutdown);
+  process.on('SIGBREAK' as NodeJS.Signals, shutdown);
 
   // On Windows, process.exit() doesn't trigger SIGINT/SIGTERM.
   // This ensures the MCP server is cleaned up even on abrupt exits
@@ -86,6 +113,16 @@ async function main() {
     // Synchronous cleanup — destroy all connections so the port is freed
     try {
       mcpServer.stopSync();
+    } catch {
+      // Best effort
+    }
+    // Claude CLI processes outlive the turns that spawned them, so an abrupt exit
+    // can leave several running with nothing to talk to. Only synchronous work is
+    // possible here, so this is the tree kill rather than the graceful retire —
+    // it still has to reach the grandchildren, or they outlive us holding pipes
+    // and a socket to the port we just freed.
+    try {
+      claudeManager.killAllProcesses();
     } catch {
       // Best effort
     }

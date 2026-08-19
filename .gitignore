@@ -34,6 +34,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 sessions.db
+# SQLite's rollback journal / WAL sidecars — they appear and vanish while the
+# bot is running, so `git add -A` picks them up on whatever it catches mid-write.
+sessions.db-*
 settings.json
 log.txt
 log.txt.*

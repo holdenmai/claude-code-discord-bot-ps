@@ -1,3 +1,11 @@
+/**
+ * Why a turn ran. `task-notification` means the CLI woke itself when a background
+ * watcher fired — nobody prompted it, so nothing in the bot is waiting on it.
+ */
+export interface ResultOrigin {
+  kind?: "task-notification" | string;
+}
+
 export type SDKMessage =
   | {
       type: "assistant";
@@ -19,6 +27,8 @@ export type SDKMessage =
       result: string;
       session_id: string;
       total_cost_usd: number;
+      /** What started this turn. Absent for a turn we prompted. */
+      origin?: ResultOrigin;
     }
   | {
       type: "result";
@@ -29,6 +39,7 @@ export type SDKMessage =
       num_turns: number;
       session_id: string;
       total_cost_usd: number;
+      origin?: ResultOrigin;
     }
   | {
       type: "system";
@@ -57,8 +68,9 @@ export type SDKMessage =
       session_id: string;
     }
   | {
-      // Background-task (Monitor/watcher) lifecycle events. The CLI keeps the
-      // process alive past a turn's `result` to deliver these.
+      // Background-task (Monitor/watcher) lifecycle events. The CLI only delivers
+      // these while stdin is open — at EOF it tears every background task down
+      // about 5 seconds after the turn's `result`.
       type: "system";
       subtype: "task_started" | "task_notification" | "task_updated";
       session_id: string;
@@ -69,7 +81,17 @@ export type SDKMessage =
       status?: string;
       output_file?: string;
       summary?: string;
+      /** Unique per notification. A watcher can fire repeatedly under one task id. */
+      uuid?: string;
       patch?: { status?: string; end_time?: number };
+    }
+  | {
+      // The full list of live background tasks, re-sent whenever it changes. Being
+      // a snapshot rather than a delta makes it the authority on what's running.
+      type: "system";
+      subtype: "background_tasks_changed";
+      session_id: string;
+      tasks: { task_id: string; task_type?: string; description?: string }[];
     };
 
 export interface ChannelProcess {
