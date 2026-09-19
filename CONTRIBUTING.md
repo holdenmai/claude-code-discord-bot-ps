@@ -36,13 +36,13 @@ bun test
 ### Bot doesn't respond
 
 - Check that the bot has proper permissions in the channel
-- Verify your `ALLOWED_USER_ID` is correct
+- Verify your `ALLOWED_USER_ID` is correct (`bun run config` shows the current value)
 - Check the console for error messages
 
 ### "Working directory does not exist" error
 
 - Ensure the folder exists: `/path/to/repos/channel-name`
-- Check that `BASE_FOLDER` in `.env` is correct
+- Check that `BASE_FOLDER` is correct — `bun run config` shows what's in effect and warns if the folder is missing
 - Verify folder names match Discord channel names exactly
 
 ### Session not persisting

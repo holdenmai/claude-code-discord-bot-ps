@@ -23,6 +23,7 @@ That's it. To go back and change anything later, `bun run config`.
 
 ## Features
 
+- **No config file to write**: The bot asks for what it needs on first run and writes `.env` for you — `-help` at any question explains the setting
 - **Channel-based project mapping**: Each Discord channel corresponds to a folder (e.g., `#my-project` → `/path/to/repos/my-project`)
 - **Persistent sessions**: Sessions are maintained per channel and automatically resume
 - **Real-time streaming**: See Claude Code's tool usage and responses as they happen
@@ -146,6 +147,72 @@ ALLOWED_USER_ID=your_discord_user_id_here
 # The bot will operate in /Users/you/repos/my-project
 BASE_FOLDER=/path/to/your/repos
 ```
+
+#### All settings
+
+Every setting below is offered by the wizard, and every one has a longer
+explanation behind `-help`. You only ever need the first three.
+
+**Connection** — required, asked on first run:
+
+| Setting | What it does |
+|---|---|
+| `DISCORD_TOKEN` | Bot token from the Developer Portal (step 2) |
+| `ALLOWED_USER_ID` | The only Discord account the bot answers (step 4) |
+| `BASE_FOLDER` | Folder holding your repos; each channel maps to a subfolder |
+
+**Models:**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `DEFAULT_MODEL` | `claude-opus-5` | Model new sessions start on. A session pins its model for life, so this never moves a conversation already in flight — use `/model` for that |
+| `LEGACY_SESSION_MODEL` | `claude-opus-4-8` | Model for sessions recorded before pinning existed. Never comes up on a fresh install |
+
+**Tool approvals:**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MCP_SERVER_PORT` | `3001` | Local port for the approval server. Two instances on one machine need different ports |
+| `MCP_APPROVAL_TIMEOUT` | `30` | Seconds an approval waits in Discord before giving up |
+| `MCP_DEFAULT_ON_TIMEOUT` | `deny` | What an unanswered approval does. `allow` lets the bot work unattended — only if you trust every folder it can reach |
+
+**Timeouts:**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `SESSION_IDLE_SECONDS` | `600` | How long an idle CLI process is kept alive so the next prompt skips a `--resume` |
+| `TURN_INACTIVITY_SECONDS` | `600` | Silence *within a turn* before it's treated as hung. Raise it if you run long foreground builds |
+| `WATCHER_MAX_HOLD_SECONDS` | `21600` | Ceiling on holding a process open for live background tasks (6 hours) |
+| `QUESTION_WATCHDOG_SECONDS` | `120` | Silence allowed after you answer a question before the turn is recovered |
+| `AUTOPAUSE_TIMEOUT_SECONDS` | `180` | How long `/autopause` waits for Claude to name the session |
+
+**Discord presentation:**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `ENABLE_REACTIONS` | `false` | Add progress emoji to your prompt messages (required for multi-instance) |
+| `REACTION_PROCESSING` | 🤝 | Emoji while a turn is running |
+| `REACTION_SUCCESS` | 👍 | Emoji when a turn finishes cleanly |
+| `REACTION_PARTIAL` | 🤞 | Emoji when a turn ends early |
+| `REACTION_FAILED` | 👎 | Emoji when a turn errors out |
+| `PROMPT_LINK_STYLE` | `link` | "Jump to prompt" link style: `link`, `plaintext`, `embed`, `none` |
+| `ACTIVITY_LINKS` | `false` | Post activity links to the home category's `#general` |
+| `ACTIVITY_LINK_STYLE` | `plaintext` | How those links are posted: `plaintext`, `embed`, `link` |
+
+Emoji are set as actual characters (🤝), not Discord's `:shortcode:` form.
+
+**Multi-instance** — see [Multi-Instance (Teleport)](#multi-instance-teleport):
+
+| Setting | Default | What it does |
+|---|---|---|
+| `BOT_INSTANCE_ID` | *(off)* | Name for this machine. Leave empty for a single-machine setup |
+| `BOT_PRIORITY` | `1` | Lowest number wins; higher numbers act as fallbacks |
+
+**Logging:**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `LOG_MAX_MB` | `256` | Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` |
 
 ### 7. Prepare Your Repository Structure
 
@@ -299,7 +366,8 @@ Run multiple bot instances on different machines (e.g., Linux and Windows) in th
 ### Setup
 
 1. Create **two Discord bot applications** and invite both to your server
-2. On each machine, set the instance env vars:
+2. On each machine, run `bun run config` and answer `y` at the **Multi-instance**
+   and **Discord presentation** groups — or set the values directly in `.env`:
 
 ```env
 # Machine 1 (primary)
@@ -312,6 +380,8 @@ BOT_PRIORITY=2
 ```
 
 `ENABLE_REACTIONS=true` is required for multi-instance mode (the processing reaction acts as a distributed lock).
+
+Leaving `BOT_INSTANCE_ID` empty switches multi-instance routing off entirely, which is the single-machine default.
 
 ### How routing works
 
