@@ -14,13 +14,12 @@ A Discord bot that runs Claude Code sessions on different projects based on Disc
    cd claude-code-discord
    bun install
    ```
-4. Create `.env` file:
-   ```env
-   DISCORD_TOKEN=your_discord_bot_token_here
-   ALLOWED_USER_ID=your_discord_user_id_here
-   BASE_FOLDER=/path/to/your/repos
-   ```
-5. Run: `bun start`
+4. Run `bun start` and answer the setup questions. The first launch asks for
+   your bot token, your Discord user ID and the folder holding your repos, then
+   writes them to `.env` for you. Type `-help` at any question for a full
+   explanation of that setting.
+
+That's it. To go back and change anything later, `bun run config`.
 
 ## Features
 
@@ -81,9 +80,58 @@ cd claude-code-discord
 bun install
 ```
 
-### 6. Configure Environment Variables
+### 6. Configure the Bot
 
-Create a `.env` file in the project root:
+You don't need to write a `.env` by hand. Start the bot and it will ask for
+anything it's missing:
+
+```bash
+bun start
+```
+
+```
+DISCORD_TOKEN — Discord bot token
+  [required, e.g. MTIzNDU2Nzg5MDEyMzQ1Njc4.GaBcDe.<the-rest-of-your-token>]  -help
+>
+```
+
+Each question is one line. Answer `-help` and it explains the setting in full —
+what it does, what the default is, and what it's stored as. Other answers you
+can give at any prompt:
+
+| Answer | What it does |
+|---|---|
+| *(Enter)* | Keep the current value, or take the default |
+| `-help` | Explain this setting properly |
+| `-clear` | Reset it to the default |
+| `-skip` | Leave the rest of this section alone |
+| `-done` | Stop here, saving what you've answered |
+| `-abort` | Quit without saving anything |
+
+The first run asks only for the three settings the bot can't start without, then
+offers the rest. Answers are validated as you go — a user ID that isn't digits,
+a port out of range or a folder that doesn't exist are caught at the prompt
+rather than at startup.
+
+**Changing settings later:**
+
+```bash
+bun run config      # walk through every setting, then exit
+bun start -config   # walk through every setting, then start the bot
+```
+
+The full pass groups settings (Models, Tool approvals, Timeouts, Discord
+presentation, …), shows you what each group is currently set to, and only asks
+about a group if you say yes — so it's a handful of keystrokes unless you're
+actually changing something.
+
+Everything is written to `.env` in the project root, so you can still edit it by
+hand; the wizard rewrites values in place and keeps your comments. See
+[`.env.example`](.env.example) for the full list with documentation. A real
+environment variable always wins over the file, which is what you want for
+containers and launcher scripts.
+
+If you'd rather write the file yourself, the three required settings are:
 
 ```env
 # Discord bot token from step 2
@@ -130,6 +178,15 @@ bun run src/index.ts
 # Or use the npm script
 bun start
 ```
+
+Command-line options:
+
+| Option | What it does |
+|---|---|
+| *(none)* | Start normally, asking about configuration only if something required is missing |
+| `-config` | Walk through every setting, then start |
+| `-configonly` | Walk through every setting and exit (same as `bun run config`) |
+| `-help` | Print usage |
 
 **Important**: Do not use hot reload (`bun --hot`) as it can cause issues with process management and spawn multiple Claude processes.
 

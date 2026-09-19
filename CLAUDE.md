@@ -13,7 +13,13 @@ This project uses **Bun** as the JavaScript runtime instead of Node.js. Always u
 
 This is a TypeScript project with strict type checking enabled.
 
-- `src/index.ts` - Entry point, wires up all subsystems
+- `src/index.ts` - Entry point: bootstrap, then a *dynamic* import of the app
+- `src/app.ts` - Wires up all subsystems and owns shutdown
+- `src/config/bootstrap.ts` - Loads `.env`, runs the setup wizard when needed
+- `src/config/settings-schema.ts` - Every environment setting, declared once
+- `src/config/env-file.ts` - Parse/patch `.env` without losing comments
+- `src/config/wizard.ts` - The interactive Q&A (pure; IO is injected)
+- `src/config/cli-args.ts` - `-config` / `-configonly` / `-help`
 - `src/bot/client.ts` - Discord bot client, event handlers, message routing
 - `src/bot/commands.ts` - Slash command definitions and handlers
 - `src/claude/manager.ts` - Claude Code process lifecycle and streaming
@@ -286,13 +292,66 @@ turn never lands.
 - `/init` - Set this channel's category as the home for startup links
 - `!oncrash` shortcut - If configured, auto-runs on startup for any session interrupted by a crash
 
+## Configuration
+
+Nobody should have to write a `.env` to get started. `bun start` with a missing
+required setting drops into a wizard that asks for it; `-config` walks
+everything; `-configonly` (aka `bun run config`) walks everything and exits.
+
+`src/config/settings-schema.ts` is the single source of truth — every setting's
+type, default, validation, one-line label and long `-help` text. The wizard
+walks it, a fresh `.env` is generated from it, and `.env.example` is asserted
+against it by a test. A `process.env.X` read added anywhere in `src/` without a
+matching entry fails that test, because a setting the schema doesn't know about
+is one the wizard can't offer, which is the whole problem this replaces.
+
+Three things shape the rest of it:
+
+- **The wizard has to finish before the app is imported.** Several modules read
+  `process.env` at *module load* — `claude/manager.ts` freezes every timeout as
+  a top-level const, `DEFAULT_MODEL` likewise. A wizard inside `main()` would
+  write values that nothing read until the next restart. So `index.ts` runs the
+  bootstrap and *then* `await import('./app.js')`, and `main()` moved to
+  `app.ts` to make that import dynamic. A static import at the top of `index.ts`
+  silently breaks this.
+- **`.env` is patched, not rewritten.** Existing assignments are rewritten in
+  place so surrounding comments survive, and a setting being enabled for the
+  first time replaces its commented-out placeholder rather than landing at the
+  bottom away from the comment explaining it. Every duplicate of a key is
+  rewritten, not just the first: the parser takes the last assignment, so
+  updating one and leaving the other would silently discard the answer. Only a
+  file that doesn't exist yet is generated whole.
+- **A real environment variable beats the file**, on load and in what the wizard
+  displays — otherwise a shadowed setting shows its file value and "changing" it
+  does nothing visible. Answers override, since the user just typed them.
+  Clearing a setting comments its line out; the bootstrap also has to `delete`
+  it from `process.env`, because "absent from the file" and "empty in the file"
+  reach the code as different things.
+
+The wizard talks through an injected `{ask, write}` pair rather than stdin, so
+the whole flow — validation loops, `-help`, group gates, `-abort` — is driven by
+scripted answers in tests with no terminal involved. `createTerminalIo()` is the
+only part that touches readline. A non-interactive stdin never prompts; it
+reports what's missing and points at `bun run config`.
+
+Optional settings are gated per group rather than asked one by one. Two dozen
+unconditional questions is the difference between a wizard people finish and one
+they Ctrl+C out of.
+
 ## Environment Variables
+
+Everything below can be set with the wizard (`bun run config`) instead of by
+hand; `.env.example` carries the same documentation.
 
 Required environment variables:
 - `DISCORD_TOKEN` - Bot token from Discord Developer Portal
 - `ALLOWED_USER_ID` - Discord user ID who can use the bot
 - `BASE_FOLDER` - Base path where Claude Code operates (e.g., `/Users/tim/repos`)
+
+Optional (tool approvals):
 - `MCP_SERVER_PORT` - Port for MCP permission server (default: 3001)
+- `MCP_APPROVAL_TIMEOUT` - Seconds an approval waits in Discord (default: 30)
+- `MCP_DEFAULT_ON_TIMEOUT` - `deny` or `allow` for an unanswered approval (default: `deny`)
 
 Optional (multi-instance):
 - `BOT_INSTANCE_ID` - Instance name (e.g., "linux", "windows"). Enables multi-instance routing
@@ -307,6 +366,13 @@ Optional (models, timeouts, logging):
 - `WATCHER_MAX_HOLD_SECONDS` - Ceiling on holding that process open for live background tasks, so a watcher that never finishes can't pin it forever (default: 21600)
 - `TURN_INACTIVITY_SECONDS` - Silence allowed *within a turn* before the process is treated as hung and killed. Raise it if you run foreground builds near the CLI's own 600-second Bash cap (default: 600)
 - `LOG_MAX_MB` - Rotate `log.txt` past this size, keeping one previous generation as `log.txt.1` (default: 256)
+
+Optional (Discord presentation):
+- `ENABLE_REACTIONS` - Add progress emoji to your prompt messages (default: false)
+- `REACTION_PROCESSING` / `REACTION_SUCCESS` / `REACTION_PARTIAL` / `REACTION_FAILED` - The four emoji used, as characters rather than `:shortcodes:` (defaults: 🤝 👍 🤞 👎)
+- `PROMPT_LINK_STYLE` - "Jump to prompt" link in the completion embed: `link`, `plaintext`, `embed`, `none` (default: `link`)
+- `ACTIVITY_LINKS` - Post activity links to the home category's `general` (default: false)
+- `ACTIVITY_LINK_STYLE` - `plaintext`, `embed` or `link` (default: `plaintext`)
 
 ## Environment
 

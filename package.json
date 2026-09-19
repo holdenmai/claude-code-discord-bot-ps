@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "bun run src/index.ts",
+    "config": "bun run src/index.ts -configonly",
     "test": "vitest",
     "test:run": "vitest run"
   },
