@@ -542,6 +542,197 @@ describe('ClaudeManager', () => {
     });
   });
 
+  /**
+   * Plan limits and a dead login.
+   *
+   * Both arrive looking like an ordinary API error, so the thing worth
+   * asserting is that they *don't* go down the backoff path: the prompt is
+   * parked rather than failed, the whole account is held rather than one
+   * channel, and whatever releases it releases the parked work with it.
+   */
+  describe('account-level holds', () => {
+    const A = 'channel-a';
+    const B = 'channel-b';
+
+    /** Pretend both channels have a turn in flight that we could relaunch. */
+    function armTurns() {
+      for (const id of [A, B]) {
+        (manager as any).lastRunParams.set(id, { channelName: 'proj', prompt: 'do the thing' });
+      }
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      armTurns();
+      // The relaunch itself is the API-retry machinery, already covered; here we
+      // only care about *which* channels get relaunched and when.
+      vi.spyOn(manager as any, 'retryTurn').mockImplementation(() => {});
+      vi.spyOn(manager as any, 'announceHold').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const limitAt = (msFromNow: number) => ({
+      resumeAt: Date.now() + msFromNow,
+      label: '5-hour limit',
+    });
+
+    it('parks the prompt instead of failing it', () => {
+      const completed = vi.fn();
+      manager.setOnCompleteCallback(completed);
+
+      (manager as any).holdForLimit(A, limitAt(60_000));
+
+      expect((manager as any).heldChannels.has(A)).toBe(true);
+      // Not calling notifyComplete is what keeps the queue slot held, so the
+      // prompt is waiting rather than lost.
+      expect(completed).not.toHaveBeenCalled();
+    });
+
+    it('holds every channel, not just the one that hit the limit', async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      const { spawn } = await import('child_process');
+      vi.mocked(spawn).mockClear();
+
+      (manager as any).holdForLimit(A, limitAt(60_000));
+      await manager.runClaudeCode(B, 'proj', 'another prompt');
+
+      // B never spawns: the limit is on the account, so a CLI here would buy
+      // one more rejection and nothing else.
+      expect(spawn).not.toHaveBeenCalled();
+      expect((manager as any).heldChannels.has(B)).toBe(true);
+    });
+
+    it('releases one channel as a probe when the window passes, not all of them', () => {
+      (manager as any).holdForLimit(A, limitAt(60_000));
+      (manager as any).holdForLimit(B, limitAt(60_000));
+      const retry = vi.mocked((manager as any).retryTurn);
+      retry.mockClear();
+
+      vi.advanceTimersByTime(61_000);
+
+      // If the reset time was optimistic, letting both out would spend the
+      // whole held queue rediscovering the same limit.
+      expect(retry).toHaveBeenCalledTimes(1);
+      expect(retry).toHaveBeenCalledWith(A);
+    });
+
+    it('re-arms rather than stacking when the probe finds the limit still on', () => {
+      (manager as any).holdForLimit(A, limitAt(60_000));
+      vi.advanceTimersByTime(61_000);
+      expect((manager as any).limitProbe).toBe(A);
+
+      (manager as any).holdForLimit(A, limitAt(300_000));
+
+      expect((manager as any).limitProbe).toBeUndefined();
+      expect((manager as any).heldChannels.has(A)).toBe(true);
+    });
+
+    it('lets a successful turn clear the hold and release the parked work', () => {
+      (manager as any).holdForLimit(A, limitAt(3_600_000));
+      (manager as any).holdForLimit(B, limitAt(3_600_000));
+      const retry = vi.mocked((manager as any).retryTurn);
+      retry.mockClear();
+
+      // Work going through right now outranks anything we concluded earlier.
+      (manager as any).clearAccountHolds('test');
+
+      expect((manager as any).accountLimit).toBeUndefined();
+      expect(retry).toHaveBeenCalledTimes(2);
+      expect((manager as any).heldChannels.size).toBe(0);
+    });
+
+    it('announces a limit once per window, not once per channel', () => {
+      const announce = vi.mocked((manager as any).announceHold);
+
+      (manager as any).holdForLimit(A, limitAt(60_000));
+      (manager as any).holdForLimit(B, limitAt(60_000));
+
+      expect(announce).toHaveBeenCalledTimes(1);
+    });
+
+    it('stays quiet when the rate-limit event already announced the window', () => {
+      const announce = vi.mocked((manager as any).announceHold);
+
+      (manager as any).holdForLimit(A, { ...limitAt(60_000), announced: true });
+
+      expect(announce).not.toHaveBeenCalled();
+    });
+
+    it('holds an auth failure without a deadline, since nothing lifts it by itself', () => {
+      (manager as any).holdForAuth(A, 'the OAuth token has expired');
+
+      expect((manager as any).authHold?.detail).toBe('the OAuth token has expired');
+      expect((manager as any).heldChannels.has(A)).toBe(true);
+    });
+
+    it('rechecks a dead login on a timer, using the held turn as the probe', () => {
+      (manager as any).holdForAuth(A, 'the OAuth token has expired');
+      const retry = vi.mocked((manager as any).retryTurn);
+      retry.mockClear();
+
+      vi.advanceTimersByTime(120_000);
+
+      expect(retry).toHaveBeenCalledWith(A);
+    });
+
+    it('tells the user to run claude login, once', () => {
+      const announce = vi.mocked((manager as any).announceHold);
+
+      (manager as any).holdForAuth(A, 'the OAuth token has expired');
+      (manager as any).holdForAuth(B, 'the OAuth token has expired');
+
+      expect(announce).toHaveBeenCalledTimes(1);
+      expect(announce.mock.calls[0]![2]).toContain('claude login');
+    });
+
+    it('lets /kill release a parked channel without lifting the hold', () => {
+      (manager as any).holdForLimit(A, limitAt(60_000));
+      (manager as any).holdForLimit(B, limitAt(60_000));
+
+      // A parked channel owns a queue slot exactly as one mid-retry does, so
+      // stopping it has to hand that back — but the limit isn't its to lift.
+      const released = (manager as any).cancelApiRetry(A);
+
+      expect(released).toBe(true);
+      expect((manager as any).heldChannels.has(A)).toBe(false);
+      expect((manager as any).heldChannels.has(B)).toBe(true);
+      expect((manager as any).accountLimit).toBeDefined();
+    });
+
+    it('classifies a 401 as auth rather than as a limit or a plain API error', () => {
+      (manager as any).classifyFailure(A, 'API Error: 401 {"type":"authentication_error"}');
+
+      expect((manager as any).authFailThisRun.get(A)).toBeDefined();
+      expect((manager as any).limitThisRun.has(A)).toBe(false);
+    });
+
+    it('classifies a 429 as a limit and schedules from the time it quotes', () => {
+      (manager as any).classifyFailure(A, "API Error: 429 session limit resets 11:00 (UTC)");
+
+      expect((manager as any).limitThisRun.get(A)).toBeDefined();
+      expect((manager as any).authFailThisRun.has(A)).toBe(false);
+    });
+
+    it('never lets prose override the exact time from a rate_limit_event', () => {
+      const exact = { resumeAt: Date.now() + 999_000, label: '5-hour limit', resetsAtEpochSec: 1 };
+      (manager as any).limitThisRun.set(A, exact);
+
+      (manager as any).classifyFailure(A, 'session limit resets 11:00 (UTC)');
+
+      expect((manager as any).limitThisRun.get(A)).toBe(exact);
+    });
+
+    it('leaves an ordinary API error to the existing backoff', () => {
+      (manager as any).classifyFailure(A, 'API Error: Connection closed mid-response.');
+
+      expect((manager as any).authFailThisRun.has(A)).toBe(false);
+      expect((manager as any).limitThisRun.has(A)).toBe(false);
+    });
+  });
+
   describe('database integration', () => {
     it('should initialize database and cleanup old sessions on construction', () => {
       // The cleanupOldSessions call happens during construction, so we need to check

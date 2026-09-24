@@ -184,6 +184,8 @@ explanation behind `-help`. You only ever need the first three.
 | `TURN_INACTIVITY_SECONDS` | `600` | Silence *within a turn* before it's treated as hung. Raise it if you run long foreground builds |
 | `WATCHER_MAX_HOLD_SECONDS` | `21600` | Ceiling on holding a process open for live background tasks (6 hours) |
 | `QUESTION_WATCHDOG_SECONDS` | `120` | Silence allowed after you answer a question before the turn is recovered |
+| `AUTH_RETRY_SECONDS` | `120` | How often a held login is rechecked after an expired-token failure |
+| `LIMIT_BLIND_WAIT_MINUTES` | `15` | Wait used when a plan limit gives no reset time at all |
 | `AUTOPAUSE_TIMEOUT_SECONDS` | `180` | How long `/autopause` waits for Claude to name the session |
 
 **Discord presentation:**
@@ -358,6 +360,49 @@ Shell commands run in the channel's project directory (or worktree for threads).
 ```
 
 The bot auto-injects `--resume` into `claude` shell commands so they target the current session.
+
+## Plan Limits and Logins
+
+Two things can stop Claude Code that have nothing to do with what you asked for,
+and the bot handles both without losing your prompt.
+
+**You hit your plan limit.** The bot reads the reset time the CLI reports, holds
+your prompt, and runs it automatically when the limit lifts:
+
+```
+🚫 Rate Limit Hit
+The 5-hour limit was hit.
+Resets: 20 September 2026 17:20 (in 4 hours)
+
+Your prompt is held, not failed — I'll run it automatically when the
+limit lifts. Other channels wait too, since the limit is on the account.
+```
+
+Nothing is retyped and nothing is lost. Because the limit is on your *account*,
+other channels are held too rather than each burning a session to discover the
+same thing. When the window ends, one channel goes first to check the limit
+really lifted — if it hasn't, everything keeps waiting instead of spending the
+whole backlog on a reset time that was optimistic.
+
+**Your login has expired.** This one can't fix itself, so the bot says so
+plainly and keeps your work:
+
+```
+🔒 Not logged in
+Claude Code can't authenticate — the OAuth token has expired.
+
+Run `claude login` on the machine running this bot.
+
+Your prompt is held, not failed; I'm rechecking every 2 minutes and
+will pick it up as soon as the login works again.
+```
+
+Run `claude login` on the bot's machine and the held work resumes on its own
+within a couple of minutes — no restart, no retyping.
+
+In both cases `/kill` releases just that channel if you'd rather not wait, and
+`/killall` clears the hold entirely. Any turn that completes successfully also
+clears it, so a hold can never get stuck.
 
 ## Multi-Instance (Teleport)
 

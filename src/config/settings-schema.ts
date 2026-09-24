@@ -263,6 +263,30 @@ export const SETTINGS: readonly Setting[] = [
     min: 1,
   },
   {
+    key: 'AUTH_RETRY_SECONDS',
+    group: 'Timeouts',
+    label: 'Seconds between rechecks when the login has stopped working',
+    help:
+      "An expired OAuth token can't fix itself -- it needs `claude login` on this machine. Rather than " +
+      'failing your prompt, the bot holds it and retries on this interval; the retry is the held turn ' +
+      'itself, so a recheck costs one CLI spawn. Lower means work resumes sooner after you log in.',
+    kind: 'integer',
+    default: '120',
+    min: 10,
+  },
+  {
+    key: 'LIMIT_BLIND_WAIT_MINUTES',
+    group: 'Timeouts',
+    label: 'Minutes to wait when a plan limit gives no reset time',
+    help:
+      'A usage limit normally says when it lifts, and the bot schedules your held prompt for exactly ' +
+      'then. When the message carries no time at all, it waits this long before trying again. Too short ' +
+      'and the whole window is spent rediscovering the same limit one spawn at a time.',
+    kind: 'integer',
+    default: '15',
+    min: 1,
+  },
+  {
     key: 'AUTOPAUSE_TIMEOUT_SECONDS',
     group: 'Timeouts',
     label: 'Seconds /autopause waits for Claude to name the session',

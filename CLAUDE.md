@@ -23,6 +23,8 @@ This is a TypeScript project with strict type checking enabled.
 - `src/bot/client.ts` - Discord bot client, event handlers, message routing
 - `src/bot/commands.ts` - Slash command definitions and handlers
 - `src/claude/manager.ts` - Claude Code process lifecycle and streaming
+- `src/claude/limits.ts` - Reading a plan limit and when it lifts (pure)
+- `src/claude/auth.ts` - Recognising a login that has stopped working (pure)
 - `src/claude/transcript.ts` - Reads CLI session `.jsonl` transcripts for `/online` (pure, no Discord)
 - `src/mcp/server.ts` - MCP permission server for tool approvals
 - `src/mcp/permission-manager.ts` - Interactive approval/denial via Discord
@@ -101,6 +103,65 @@ Consequences that shape the rest of the design:
 - `/kill` will also retire an idle process that's holding watchers, and `/interrupt`
   and `/btw` refuse to write into an idle one — that would start a turn nothing is
   tracking.
+
+### When the account says no
+
+Two failures are not the work's fault and not each other's: a plan limit is the
+account saying "not now", an expired OAuth token is it saying "not you". Both
+reach the bot as `API Error: …`, which the `API_ERROR_MARKERS` list already
+matches — so before this, both fell into the generic auto-resume: escalating
+backoff, capped at 10 minutes, retrying *forever*, with the queue held. For a
+five-hour limit that is ~30 spawns and ~30 embeds spent rediscovering the same
+answer. For a dead token it is a loop that can never succeed, wedging the
+channel until someone notices.
+
+Both are now classified *before* the generic API error, in `classifyFailure`,
+and each gets the answer it actually needs. The detectors are ported from the
+neighbouring `aiontheloose` project (`src/core/limits.ts`, `src/core/auth.ts`).
+
+- **A limit knows when it lifts, and the CLI usually says so outright.**
+  `rate_limit_event` carries `resetsAt` as unix seconds — exact. The bot already
+  received that event and only announced it; `limitFromRateLimitEvent` turns the
+  announcement into a schedule. Text parsing (`detectSessionLimit`, reading
+  "resets 5:20 pm (America/Denver)" off an error string) is the fallback for
+  when no event arrives, and it compares clock *faces* via `Intl` rather than
+  doing date arithmetic, so offsets, DST and the date rolling over all cancel
+  out of the subtraction. A reset with no time at all gets a blind wait.
+- **A dead login never lifts by itself** — the fix is a human running
+  `claude login`. So there is no clock to schedule against, and the retry
+  *is* the probe: the held turn is relaunched every `AUTH_RETRY_SECONDS`, and
+  either it goes through (proving the login is back) or it fails the same way
+  and re-arms. One cheap spawn every couple of minutes, and no separate health
+  check to maintain.
+
+Shaping details:
+
+- **Holds are account-wide, not per channel.** Both conditions are properties of
+  the account: once one channel is refused, every other channel would be too, so
+  spawning them buys one rejection each. `runClaudeCode` gates on the hold and
+  parks instead. The parked prompt is *held, not failed* — `notifyComplete` is
+  deliberately not called, which is the same trick the API-retry path uses to
+  keep the queue slot.
+- **Exactly one channel probes when a window ends.** Releasing all of them would
+  spend the whole held queue rediscovering the limit if the reset time was
+  optimistic. A probe that finds the limit still on re-arms the window rather
+  than stacking a second one.
+- **A successful turn anywhere clears every hold.** That is the only evidence
+  that actually settles the question, and it makes a stale or misparsed hold
+  self-healing rather than something you have to restart out of.
+- **Announced-ness belongs to the window, not to the report.** A second channel
+  hitting the same limit arrives with its own fresh `announced: false`; reading
+  that instead of the window's posts the notice once per channel.
+- **Detection only ever reads text already established to be a failure** — a
+  synthetic assistant message, an error result, or stderr. It shares the
+  existing synthetic/error-result guard precisely so that Claude *writing about*
+  a rate limit in ordinary prose can't park the whole account. stderr is read
+  too, because an expired token usually exits before there is a result to report
+  and the only evidence is the last thing the CLI wrote.
+- **`/kill` releases a parked channel without lifting the hold.** A parked
+  channel owns a queue slot exactly as one mid-retry does, so stopping it has to
+  hand that back — but the limit is not that channel's to lift. `/killall`
+  clears the holds outright, since it is the "start clean" gesture.
 
 ### Stopping the bot
 
@@ -362,6 +423,8 @@ Optional (models, timeouts, logging):
 - `LEGACY_SESSION_MODEL` - Model for sessions created before per-session pinning (default: `claude-opus-4-8`)
 - `AUTOPAUSE_TIMEOUT_SECONDS` - How long `/autopause` waits for Claude to answer with a name before giving up and leaving the session under its id (default: 180)
 - `QUESTION_WATCHDOG_SECONDS` - Silence allowed after AskUserQuestion answers are delivered before the turn is treated as wedged and recovered (default: 120)
+- `AUTH_RETRY_SECONDS` - How often a held login is rechecked by relaunching the held turn, after an expired-token failure (default: 120)
+- `LIMIT_BLIND_WAIT_MINUTES` - How long to wait when a plan limit gives no reset time at all (default: 15)
 - `SESSION_IDLE_SECONDS` - How long a channel's CLI process is kept alive with nothing to do, so the next prompt is an injection rather than a `--resume` (default: 600)
 - `WATCHER_MAX_HOLD_SECONDS` - Ceiling on holding that process open for live background tasks, so a watcher that never finishes can't pin it forever (default: 21600)
 - `TURN_INACTIVITY_SECONDS` - Silence allowed *within a turn* before the process is treated as hung and killed. Raise it if you run foreground builds near the CLI's own 600-second Bash cap (default: 600)

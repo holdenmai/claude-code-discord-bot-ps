@@ -8,6 +8,8 @@ import { buildClaudeCommand, isRawCommand, type DiscordContext } from "../utils/
 import { killProcessTree } from "../utils/process-tree.js";
 import { DatabaseManager } from "../db/database.js";
 import type { SettingsStore } from "../settings/settings-store.js";
+import { detectSessionLimit, limitFromRateLimitEvent, type SessionLimit } from "./limits.js";
+import { detectAuthFailure } from "./auth.js";
 
 export type OnCompleteCallback = (channelId: string, status: CompletionStatus, originalMessage: any) => void;
 
@@ -147,6 +149,11 @@ export function apiRetryDelayMs(attempt: number): number {
   return sec * 1000;
 }
 
+// How often a held login is rechecked. The recheck is the held turn itself, so
+// this is the cost of one CLI spawn — cheap enough to be frequent, and frequent
+// enough that work resumes on its own shortly after `claude login`.
+const AUTH_RETRY_MS = Number(process.env.AUTH_RETRY_SECONDS || 120) * 1000;
+
 // Raw stream log. It records every byte of every turn's stdout, so it grows
 // without bound — roll it at LOG_MAX_MB and keep one previous generation, which
 // is enough to debug the run that just happened without ever eating the disk.
@@ -265,6 +272,27 @@ export class ClaudeManager {
     imageUrls?: string[];
   }>();
 
+  // --- Account-level holds: plan limits and a dead login ---
+  // Both arrive looking like an API error ("API Error: 429", "API Error: 401"),
+  // so without this they fall into the backoff above — which is the wrong
+  // interval for a limit that already told us when it lifts, and an unwinnable
+  // loop for a login only a human can fix.
+  //
+  // They are held per *account*, not per channel, because that is what they are:
+  // once one channel is refused, every other channel would be refused too, and
+  // spawning them just burns a CLI each to rediscover the same answer.
+  //   limitThisRun/authFailThisRun — this run's classification (checked at close).
+  //   accountLimit                 — the current window, shared by every channel.
+  //   authHold                     — set while the login is known to be broken.
+  //   heldChannels                 — channels parked mid-turn, waiting on a hold.
+  //   limitProbe                   — the one channel allowed out when a window ends.
+  private limitThisRun = new Map<string, SessionLimit>();
+  private authFailThisRun = new Map<string, string>();
+  private accountLimit?: SessionLimit;
+  private authHold?: { detail: string; since: number };
+  private heldChannels = new Set<string>();
+  private limitProbe?: string;
+
   private settings?: SettingsStore;
   private promptLinkConfig: PromptLinkConfig;
 
@@ -347,8 +375,11 @@ export class ClaudeManager {
         count++;
       }
     }
-    // Also cancel channels waiting on an API-error retry (no live process).
-    for (const channelId of [...this.apiRetryState.keys()]) {
+    // Also cancel channels with no live process that are nonetheless mid-turn:
+    // waiting on an API-error retry, or parked behind an account hold. Both own
+    // a queue slot that only a completion releases.
+    const waiting = new Set([...this.apiRetryState.keys(), ...this.heldChannels]);
+    for (const channelId of waiting) {
       if (!this.channelProcesses.get(channelId)?.process && this.cancelApiRetry(channelId)) {
         this.stopTypingIndicator(channelId);
         this.channelProcesses.delete(channelId);
@@ -356,6 +387,15 @@ export class ClaudeManager {
         count++;
       }
     }
+    // Nothing is left to release a hold, and the timers would fire into an empty
+    // set. A killall is also the natural "start clean" gesture.
+    if (this.limitTimer) clearTimeout(this.limitTimer);
+    if (this.authTimer) clearTimeout(this.authTimer);
+    this.limitTimer = undefined;
+    this.authTimer = undefined;
+    this.accountLimit = undefined;
+    this.authHold = undefined;
+    this.limitProbe = undefined;
     return count;
   }
 
@@ -663,7 +703,17 @@ export class ClaudeManager {
   private cancelApiRetry(channelId: string): boolean {
     const state = this.apiRetryState.get(channelId);
     this.apiErrorThisRun.delete(channelId);
-    if (!state) return false;
+    this.limitThisRun.delete(channelId);
+    this.authFailThisRun.delete(channelId);
+
+    // A channel parked behind an account hold is waiting in exactly the same
+    // sense as one between retries: no process, a held queue slot, and a run it
+    // is owed. Stopping it has to release that too, or the slot never comes
+    // back. The hold itself stays — it isn't this channel's to lift.
+    const wasHeld = this.heldChannels.delete(channelId);
+    if (this.limitProbe === channelId) this.limitProbe = undefined;
+
+    if (!state) return wasHeld;
     if (state.timer) clearTimeout(state.timer);
     this.apiRetryState.delete(channelId);
     return true;
@@ -723,6 +773,211 @@ export class ClaudeManager {
       this.channelProcesses.delete(channelId);
       this.scheduleApiRetry(channelId);
     });
+  }
+
+  // --- Account-level holds: plan limits and a dead login ---
+
+  /**
+   * Read a piece of failure output for the two things that are not the work's
+   * fault. Auth wins over a limit, which wins over the generic API error,
+   * because a 401 body can mention both and only the narrowest reading leads
+   * anywhere useful.
+   *
+   * Callers must only pass text already established to be a failure — a
+   * synthetic assistant message, an error result, or stderr. Handing this
+   * ordinary model prose would let Claude park the account by describing a rate
+   * limit in a sentence.
+   */
+  private classifyFailure(channelId: string, text: string | undefined): void {
+    if (!text) return;
+
+    if (!this.authFailThisRun.has(channelId)) {
+      const detail = detectAuthFailure(text);
+      if (detail) {
+        console.log(`Detected auth failure in channel ${channelId}: ${detail}`);
+        this.authFailThisRun.set(channelId, detail);
+        return;
+      }
+    }
+
+    // A `rate_limit_event` already recorded for this run is exact; nothing read
+    // out of prose should overwrite it.
+    if (this.limitThisRun.has(channelId)) return;
+    const limit = detectSessionLimit(text, Date.now());
+    if (limit) {
+      console.log(
+        `Detected plan limit in channel ${channelId} (${limit.label}); ` +
+        `resuming in ${humanizeMs(limit.resumeAt - Date.now())}`
+      );
+      this.limitThisRun.set(channelId, limit);
+    }
+  }
+
+  /** Is the account inside a plan-limit window right now? */
+  private limitActive(): boolean {
+    if (!this.accountLimit) return false;
+    if (Date.now() < this.accountLimit.resumeAt) return true;
+    // The window has passed but nothing has proved it: leave it to the probe.
+    return this.limitProbe !== undefined;
+  }
+
+  /**
+   * Drop every account-level hold. Called when something proves the account is
+   * fine — a turn completing is the only evidence that actually settles it.
+   */
+  private clearAccountHolds(why: string): void {
+    if (!this.accountLimit && !this.authHold) return;
+    console.log(`Clearing account holds (${why})`);
+    this.accountLimit = undefined;
+    this.authHold = undefined;
+    this.limitProbe = undefined;
+    // Anything parked behind the hold goes now. Released one at a time in the
+    // order they were held, so a dozen channels don't all spawn at once.
+    const waiting = [...this.heldChannels];
+    this.heldChannels.clear();
+    for (const held of waiting) this.retryTurn(held);
+  }
+
+  /**
+   * A plan limit. Park this channel's turn and schedule it for the reset.
+   *
+   * The queue stays held — `notifyComplete` is deliberately not called — so the
+   * prompt is waiting, not failed, and nothing new starts underneath it.
+   */
+  private holdForLimit(channelId: string, limit: SessionLimit): void {
+    // Re-arming during a probe is expected: it means the limit had not really
+    // lifted. Take the newer time rather than stacking windows.
+    const first = this.accountLimit === undefined;
+    if (this.limitProbe === channelId) this.limitProbe = undefined;
+    // Announced-ness belongs to the *window*, not to the report that arrived.
+    // A second channel hitting the same limit carries its own fresh
+    // `announced: false`, and reading that would re-post the notice per channel.
+    const announced = limit.announced === true || this.accountLimit?.announced === true;
+    this.accountLimit = { ...limit, announced };
+
+    const waitMs = Math.max(0, limit.resumeAt - Date.now());
+    console.log(
+      `Plan limit hit in channel ${channelId} (${limit.label}); ` +
+      `holding every channel for ${humanizeMs(waitMs)}`
+    );
+
+    if (!announced) {
+      this.announceHold(
+        channelId,
+        "⏳ Plan limit reached",
+        `The account's **${limit.label}** is in effect. ` +
+        (limit.resetsAtEpochSec ? `Resets <t:${limit.resetsAtEpochSec}:R>.` : `Retrying in ${humanizeMs(waitMs)}.`) +
+        "\n\nYour prompt is held, not failed — I'll run it automatically then.",
+        0xE74C3C,
+      );
+      this.accountLimit.announced = true;
+    }
+
+    this.parkChannel(channelId);
+    if (first || !this.limitTimer) this.armLimitTimer();
+  }
+
+  /** One timer for the whole account, re-armed whenever the window moves. */
+  private limitTimer?: ReturnType<typeof setTimeout>;
+
+  private armLimitTimer(): void {
+    if (this.limitTimer) clearTimeout(this.limitTimer);
+    const limit = this.accountLimit;
+    if (!limit) return;
+
+    this.limitTimer = setTimeout(() => {
+      this.limitTimer = undefined;
+      if (!this.accountLimit) return;
+
+      // One channel goes out first to find out whether the limit really lifted.
+      // Releasing all of them would spend the entire held queue rediscovering
+      // the same limit if the reset time was optimistic.
+      const next = [...this.heldChannels][0];
+      if (next === undefined) {
+        this.accountLimit = undefined;
+        return;
+      }
+      this.heldChannels.delete(next);
+      this.limitProbe = next;
+      console.log(`Plan limit window passed; probing with channel ${next}`);
+      this.retryTurn(next);
+    }, Math.max(0, limit.resumeAt - Date.now()));
+  }
+
+  /**
+   * A login that has stopped working. Nothing here clears itself: the fix is a
+   * human running `claude login` on this machine.
+   *
+   * So the prompt is held rather than failed, and the retry doubles as the
+   * probe — a resumed turn either goes through, which proves the login is back,
+   * or fails the same way and re-arms. That costs one cheap spawn every couple
+   * of minutes and needs no separate health check.
+   */
+  private holdForAuth(channelId: string, detail: string): void {
+    const first = this.authHold === undefined;
+    this.authHold = { detail, since: this.authHold?.since ?? Date.now() };
+
+    console.log(
+      `Auth failure in channel ${channelId}: ${detail}; ` +
+      `holding every channel, rechecking every ${humanizeMs(AUTH_RETRY_MS)}`
+    );
+
+    if (first) {
+      this.announceHold(
+        channelId,
+        "🔒 Not logged in",
+        `Claude Code can't authenticate — ${detail}.\n\n` +
+        "**Run `claude login` on the machine running this bot.**\n\n" +
+        `Your prompt is held, not failed; I'm rechecking every ${humanizeMs(AUTH_RETRY_MS)} ` +
+        "and will pick it up as soon as the login works again.",
+        0xE74C3C,
+      );
+    }
+
+    this.parkChannel(channelId);
+    if (!this.authTimer) this.armAuthTimer();
+  }
+
+  private authTimer?: ReturnType<typeof setTimeout>;
+
+  private armAuthTimer(): void {
+    if (this.authTimer) clearTimeout(this.authTimer);
+    this.authTimer = setTimeout(() => {
+      this.authTimer = undefined;
+      if (!this.authHold) return;
+
+      // Same single-probe shape as the limit: one channel tries, and either it
+      // works (clearing the hold and releasing the rest) or it re-arms.
+      const next = [...this.heldChannels][0];
+      if (next === undefined) {
+        this.authHold = undefined;
+        return;
+      }
+      this.heldChannels.delete(next);
+      console.log(`Rechecking login with channel ${next}`);
+      this.retryTurn(next);
+    }, AUTH_RETRY_MS);
+  }
+
+  /**
+   * Park a channel whose turn is waiting on an account hold. Its queue slot and
+   * `lastRunParams` are already held; this only records that it is owed a run.
+   *
+   * Deliberately does not touch `channelProcesses`. On the close path the entry
+   * is already gone, and on the gate path the channel may still have a perfectly
+   * good idle process from an earlier turn — dropping the entry there would
+   * orphan it, leaving a CLI alive with nothing tracking it. Its own idle timer
+   * retires it if the hold outlasts it.
+   */
+  private parkChannel(channelId: string): void {
+    this.heldChannels.add(channelId);
+  }
+
+  private announceHold(channelId: string, title: string, description: string, color: number): void {
+    const channel = this.channelMessages.get(channelId)?.channel;
+    if (!channel) return;
+    const embed = new EmbedBuilder().setTitle(title).setDescription(description).setColor(color);
+    channel.send({ embeds: [embed] }).catch(console.error);
   }
 
   // --- AskUserQuestion hang recovery ---
@@ -1305,6 +1560,40 @@ export class ClaudeManager {
     // replay it verbatim. Start the run with a clean API-error flag.
     this.lastRunParams.set(channelId, { channelName, prompt, discordContext, imageUrls });
     this.apiErrorThisRun.delete(channelId);
+    this.limitThisRun.delete(channelId);
+    this.authFailThisRun.delete(channelId);
+
+    // The account is refusing work, and it refuses it for every channel at once.
+    // Spawning here would buy one more rejection and one more CLI; park instead.
+    // The probe channel is exempt — finding out whether the hold has lifted is
+    // the whole reason it was let through.
+    const heldBy = this.authHold ? "auth" : this.limitActive() ? "limit" : undefined;
+    if (heldBy && this.limitProbe !== channelId && !this.heldChannels.has(channelId)) {
+      if (heldBy === "auth") {
+        this.announceHold(
+          channelId,
+          "🔒 Not logged in",
+          `Claude Code can't authenticate — ${this.authHold!.detail}. ` +
+          "**Run `claude login` on the machine running this bot.**\n\n" +
+          "This prompt is held and will run once the login works again.",
+          0xE74C3C,
+        );
+      } else {
+        const limit = this.accountLimit!;
+        this.announceHold(
+          channelId,
+          "⏳ Plan limit reached",
+          `The account's **${limit.label}** is still in effect. ` +
+          (limit.resetsAtEpochSec
+            ? `Resets <t:${limit.resetsAtEpochSec}:R>.`
+            : `Retrying in ${humanizeMs(Math.max(0, limit.resumeAt - Date.now()))}.`) +
+          "\n\nThis prompt is held and will run automatically then.",
+          0xE74C3C,
+        );
+      }
+      this.parkChannel(channelId);
+      return;
+    }
 
     // Store the channel name for path replacement
     this.channelNames.set(channelId, channelName);
@@ -1469,12 +1758,22 @@ export class ClaudeManager {
                   console.log(`Detected API error in channel ${channelId} (${p.type}) — will auto-resume on close`);
                 }
                 this.apiErrorThisRun.add(channelId);
+                // Same text, read again for the two failures that need a
+                // different answer than "retry soon". Deliberately inside this
+                // branch: it inherits the synthetic/error-result guard, so a
+                // model *writing about* rate limits or expired tokens in
+                // ordinary prose can never park the whole account.
+                this.classifyFailure(channelId, JSON.stringify(p));
               } else if (p.type === "result" && p.subtype === "success" && p.is_error !== true) {
                 // The turn finished cleanly. The CLI does its own transient retries
                 // (e.g. "Unable to connect… Retrying" on stderr) and may recover on
                 // its own — a success result means any earlier blip is moot, so don't
                 // resume.
                 this.apiErrorThisRun.delete(channelId);
+                // Stronger evidence than anything a hold was built on: work is
+                // going through right now, so the account is neither limited nor
+                // logged out, whatever we concluded earlier.
+                this.clearAccountHolds("a turn completed successfully");
               }
             }
 
@@ -1572,6 +1871,27 @@ export class ClaudeManager {
         return;
       }
 
+      // Both account-level failures are checked before the generic API error,
+      // because both also *look* like one and the generic handling is wrong for
+      // each: a limit knows when it lifts, and a dead login never does.
+      // Each keeps the queue held, exactly as the API-error path does.
+      const authFailure = this.authFailThisRun.get(channelId);
+      if (authFailure) {
+        this.authFailThisRun.delete(channelId);
+        this.apiErrorThisRun.delete(channelId);
+        this.limitThisRun.delete(channelId);
+        this.holdForAuth(channelId, authFailure);
+        return;
+      }
+
+      const limit = this.limitThisRun.get(channelId);
+      if (limit) {
+        this.limitThisRun.delete(channelId);
+        this.apiErrorThisRun.delete(channelId);
+        this.holdForLimit(channelId, limit);
+        return;
+      }
+
       // API-error auto-resume: if this run hit an API error, don't finalize the
       // turn — schedule the next resume with escalating backoff. We intentionally
       // do NOT call notifyComplete, so the queue stays held and no new turn starts.
@@ -1621,6 +1941,11 @@ export class ClaudeManager {
       if (isApiErrorText(stderrOutput)) {
         this.apiErrorThisRun.add(channelId);
       }
+
+      // An expired token in particular usually never reaches a tidy result: the
+      // CLI exits before it has one, so the only evidence is the last thing it
+      // wrote here. Checking only the stream was the version that never fired.
+      this.classifyFailure(channelId, stderrOutput);
 
       // If there's significant stderr output, send warning to Discord
       if (
@@ -1707,6 +2032,12 @@ export class ClaudeManager {
     // Only surface actual rejections (hitting the limit), not informational events.
     if (info.status !== "rejected") return;
 
+    // The authoritative source: `resetsAt` is an exact instant, where the text
+    // parsing in limits.ts is reading a clock face out of prose. Record it
+    // before the embed, so the schedule survives a channel we can't post to.
+    const limit = limitFromRateLimitEvent(parsed, Date.now());
+    if (limit) this.limitThisRun.set(channelId, limit);
+
     const channel = this.channelMessages.get(channelId)?.channel;
     if (!channel) return;
 
@@ -1729,8 +2060,19 @@ export class ClaudeManager {
 
     const embed = new EmbedBuilder()
       .setTitle("🚫 Rate Limit Hit")
-      .setDescription(`The **${limitLabel}** limit was hit.\n**Resets:** ${resetText}`)
+      .setDescription(
+        `The **${limitLabel}** limit was hit.\n**Resets:** ${resetText}` +
+        (limit
+          ? "\n\nYour prompt is held, not failed — I'll run it automatically when the " +
+            "limit lifts. Other channels wait too, since the limit is on the account."
+          : "")
+      )
       .setColor(0xE74C3C);
+
+    // This fires the moment the limit bites, which is well before the turn
+    // closes. Claiming the announcement here keeps `noteLimit` from posting a
+    // near-duplicate seconds later; the text-fallback path still gets one.
+    if (limit) limit.announced = true;
 
     try {
       await channel.send({ content: mention, embeds: [embed] });
@@ -2374,6 +2716,14 @@ export class ClaudeManager {
     for (const channelId of [...this.apiRetryState.keys()]) {
       this.cancelApiRetry(channelId);
     }
+
+    // Account holds outlive every process by design, so their timers are the one
+    // thing left that could keep the event loop alive after everything else is
+    // torn down.
+    if (this.limitTimer) clearTimeout(this.limitTimer);
+    if (this.authTimer) clearTimeout(this.authTimer);
+    this.limitTimer = undefined;
+    this.authTimer = undefined;
 
     // Close database connection
     this.db.close();
